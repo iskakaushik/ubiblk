@@ -4,7 +4,10 @@ use std::{
 };
 
 use crate::{
-    block_device::{BlockDevice, IoChannel, SharedSnapshotState, SnapshotRequest, UbiMetadata},
+    block_device::{
+        BlockDevice, IoChannel, SharedMetadataState, SharedSnapshotState, SnapshotRequest,
+        UbiMetadata,
+    },
     stripe_source::{StripeSource, StripeSourceBuilder},
     Result,
 };
@@ -47,6 +50,10 @@ pub struct StripeServer {
     /// use it to hand their stream over as a snapshot destination.
     snapshot_ch: Option<Sender<SnapshotRequest>>,
     snapshot_state: Option<SharedSnapshotState>,
+    /// The device's live written/fetched bits. The metadata this server was
+    /// built with is a snapshot of the file at startup, so a device that is
+    /// being written to needs this to answer "does this stripe hold data?".
+    live_state: Option<SharedMetadataState>,
     /// Ids handed to destinations, so the worker can be told to drop one.
     next_destination_id: Arc<AtomicU64>,
     // A stripe source builder, so each session can build its own source (the
@@ -62,6 +69,7 @@ pub struct StripeServerSession {
     source: Option<Box<dyn StripeSource>>,
     snapshot_ch: Option<Sender<SnapshotRequest>>,
     snapshot_state: Option<SharedSnapshotState>,
+    live_state: Option<SharedMetadataState>,
     next_destination_id: Arc<AtomicU64>,
 }
 
@@ -87,12 +95,20 @@ impl StripeServer {
             source_builder,
             snapshot_ch: None,
             snapshot_state: None,
+            live_state: None,
             next_destination_id: Arc::new(AtomicU64::new(1)),
         }
     }
 
     /// Let sessions subscribe to snapshots taken on the device this server
     /// serves.
+    /// Serve what the device actually holds right now, rather than what its
+    /// metadata said when this server started.
+    pub fn with_live_state(mut self, live_state: SharedMetadataState) -> Self {
+        self.live_state = Some(live_state);
+        self
+    }
+
     pub fn with_snapshot(
         mut self,
         snapshot_ch: Sender<SnapshotRequest>,
@@ -117,6 +133,7 @@ impl StripeServer {
             source,
             snapshot_ch: self.snapshot_ch.clone(),
             snapshot_state: self.snapshot_state.clone(),
+            live_state: self.live_state.clone(),
             next_destination_id: self.next_destination_id.clone(),
         })
     }

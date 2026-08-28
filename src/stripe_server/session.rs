@@ -132,12 +132,37 @@ impl StripeServerSession {
         Ok(())
     }
 
+    /// The metadata to hand a client: the file's, with the device's live
+    /// written bits merged in, so a client learns which stripes actually hold
+    /// data instead of what was on disk when this server started.
+    fn served_metadata(&self) -> UbiMetadata {
+        let mut metadata = (*self.metadata).clone();
+        if let Some(live) = self.live_state.as_ref() {
+            for (stripe_id, header) in metadata.stripe_headers.iter_mut().enumerate() {
+                if live.stripe_written(stripe_id) {
+                    *header |= metadata_flags::WRITTEN;
+                }
+            }
+        }
+        metadata
+    }
+
+    fn stripe_written(&self, stripe_id: u64) -> bool {
+        if let Some(live) = self.live_state.as_ref() {
+            if live.stripe_written(stripe_id as usize) {
+                return true;
+            }
+        }
+        self.metadata.stripe_headers[stripe_id as usize] & metadata_flags::WRITTEN != 0
+    }
+
     fn handle_metadata_request(&mut self) -> Result<()> {
         info!("Handling metadata request");
 
-        let metadata_size = self.metadata.metadata_size();
+        let served = self.served_metadata();
+        let metadata_size = served.metadata_size();
         let mut metadata_buf = vec![0u8; metadata_size];
-        self.metadata.write_to_buf(&mut metadata_buf)?;
+        served.write_to_buf(&mut metadata_buf)?;
 
         self.stream_mut().write_all(&[STATUS_OK])?;
         let metadata_size_bytes = (metadata_size as u64).to_le_bytes();
@@ -160,10 +185,9 @@ impl StripeServerSession {
 
     fn stripe_has_data(&self, stripe_id: u64) -> bool {
         let stripe_header = self.metadata.stripe_headers[stripe_id as usize];
-        let written = stripe_header & metadata_flags::WRITTEN != 0;
         let has_source = stripe_header & metadata_flags::HAS_SOURCE != 0;
         let fetched = stripe_header & metadata_flags::FETCHED != 0;
-        written || (has_source && fetched)
+        self.stripe_written(stripe_id) || (has_source && fetched)
     }
 
     fn handle_read_stripe_request(&mut self, stripe_id: u64) -> Result<()> {

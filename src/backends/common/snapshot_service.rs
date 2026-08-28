@@ -17,7 +17,9 @@ use log::{error, info, warn};
 
 use crate::{
     block_device::BlockDevice,
-    block_device::{BgWorkerRequest, SharedSnapshotState, SnapshotRequest, UbiMetadata},
+    block_device::{
+        BgWorkerRequest, SharedMetadataState, SharedSnapshotState, SnapshotRequest, UbiMetadata,
+    },
     stripe_server::{PushedFrame, SnapshotSubscriber, StripeServer},
     Result,
 };
@@ -30,6 +32,7 @@ pub fn spawn_snapshot_server(
     address: &str,
     stripe_device: Box<dyn BlockDevice>,
     metadata: Arc<UbiMetadata>,
+    live_state: SharedMetadataState,
     snapshot_ch: Sender<SnapshotRequest>,
     snapshot_state: SharedSnapshotState,
 ) -> Result<()> {
@@ -43,6 +46,7 @@ pub fn spawn_snapshot_server(
 
     let server = Arc::new(
         StripeServer::new(Arc::from(stripe_device), metadata, None)
+            .with_live_state(live_state)
             .with_snapshot(snapshot_ch, snapshot_state),
     );
 
