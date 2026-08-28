@@ -37,6 +37,10 @@ pub struct StripeFetcher {
     stripe_states: HashMap<usize, FetchState>,
     stripe_fetch_retries: HashMap<usize, u8>,
     allocated_buffers: HashMap<usize, SharedBuffer>,
+    /// Stripes the snapshot server pushed while a pull for them was in flight.
+    /// Applied once that pull finishes: after a copy-out the server refuses to
+    /// serve the stripe, so the pushed copy is the only correct one.
+    pending_pushes: HashMap<usize, Vec<u8>>,
     finished_fetches: Vec<(usize, bool)>,
     autofetch: bool,
     disconnected: bool,
@@ -93,6 +97,7 @@ impl StripeFetcher {
             stripe_states: HashMap::new(),
             stripe_fetch_retries: HashMap::new(),
             allocated_buffers: HashMap::new(),
+            pending_pushes: HashMap::new(),
             finished_fetches: Vec::new(),
             autofetch,
             autofetch_queue,
@@ -141,18 +146,31 @@ impl StripeFetcher {
             return;
         }
 
-        if self.stripe_states.contains_key(&stripe_id) {
-            // A pull is already in flight for this stripe. It reads the same
-            // point-in-time content, because prod cannot overwrite a stripe
-            // before its copy-out finishes, so let the pull finish.
-            debug!("Stripe {stripe_id} is already being fetched, ignoring the pushed copy");
+        if self.fetch_in_flight(stripe_id) {
+            // Once prod has copied a stripe out it stops serving it, so a pull
+            // racing with this push cannot succeed. Hold the pushed copy and
+            // apply it when that pull gives up.
+            debug!("Stripe {stripe_id} has a fetch in flight, holding the pushed copy");
+            self.pending_pushes.insert(stripe_id, data.to_vec());
             return;
         }
 
+        self.write_pushed_stripe(stripe_id, data);
+    }
+
+    fn fetch_in_flight(&self, stripe_id: usize) -> bool {
+        matches!(
+            self.stripe_states.get(&stripe_id),
+            Some(FetchState::Queued) | Some(FetchState::Fetching) | Some(FetchState::Flushing)
+        )
+    }
+
+    fn write_pushed_stripe(&mut self, stripe_id: usize, data: &[u8]) {
         let Some(buf) = self.buffer_pool.get_buffer() else {
-            // Every buffer is busy fetching. Dropping the push is safe: the
-            // stripe is not marked fetched, so it will be pulled on demand.
-            warn!("No buffer available for pushed stripe {stripe_id}, dropping it");
+            // Every buffer is busy. Keep the copy: this stripe cannot be pulled
+            // any more, so dropping it would lose it for good.
+            debug!("No buffer for pushed stripe {stripe_id} yet, keeping it for later");
+            self.pending_pushes.insert(stripe_id, data.to_vec());
             return;
         };
 
@@ -170,10 +188,42 @@ impl StripeFetcher {
         }
     }
 
+    /// Write out pushed stripes whose racing pull has finished.
+    fn apply_pending_pushes(&mut self) {
+        if self.pending_pushes.is_empty() {
+            return;
+        }
+
+        let ready: Vec<usize> = self
+            .pending_pushes
+            .keys()
+            .copied()
+            .filter(|stripe_id| !self.fetch_in_flight(*stripe_id))
+            .collect();
+
+        for stripe_id in ready {
+            let Some(data) = self.pending_pushes.remove(&stripe_id) else {
+                continue;
+            };
+            if self
+                .shared_metadata_state
+                .stripe_fetched_if_needed(stripe_id)
+            {
+                continue;
+            }
+            // The pull failed or was never going to succeed; this is the copy.
+            self.stripe_fetch_retries.remove(&stripe_id);
+            self.fetch_queue.retain(|queued| *queued != stripe_id);
+            self.write_pushed_stripe(stripe_id, &data);
+        }
+    }
+
     pub fn update(&mut self) {
         self.update_autofetch();
+        self.apply_pending_pushes();
         self.start_fetches();
         self.poll_fetches();
+        self.apply_pending_pushes();
     }
 
     pub fn disconnect_from_source_if_all_fetched(&mut self) {

@@ -148,6 +148,11 @@ impl SharedSnapshotState {
             .is_ok()
     }
 
+    /// Put a claimed stripe back: its copy-out is waiting for a destination.
+    pub fn defer_copy(&self, stripe_id: usize) {
+        self.stripe_states[stripe_id].store(LOCKED, Ordering::Release);
+    }
+
     pub fn finish_copy(&self, stripe_id: usize) {
         self.stripe_states[stripe_id].store(COPIED, Ordering::Release);
     }
@@ -158,6 +163,14 @@ impl SharedSnapshotState {
         for state in self.stripe_states.iter() {
             state.store(FREE, Ordering::Release);
         }
+    }
+
+    /// End the snapshot: stripes are released and the generation goes back to
+    /// zero, so a fork that subscribes afterwards is told there is no snapshot
+    /// rather than being served a half-preserved one.
+    pub fn end_snapshot(&self) {
+        self.release_all();
+        self.generation.store(0, Ordering::Release);
     }
 
     /// Mark every stripe as needed by a snapshot and return the new generation.

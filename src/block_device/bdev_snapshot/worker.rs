@@ -1,9 +1,9 @@
 use std::{
-    sync::mpsc::{Receiver, TryRecvError},
-    time::Duration,
+    sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError},
+    time::{Duration, Instant},
 };
 
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 
 use crate::{
     block_device::{shared_buffer, wait_for_completion, BlockDevice, IoChannel},
@@ -21,6 +21,14 @@ const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The most destinations one snapshot may serve at a time.
 pub const MAX_DESTINATIONS: usize = 8;
+
+/// How long a fresh snapshot waits for its first subscriber before giving up.
+///
+/// A copy-out with nowhere to send has to either lose the stripe or hold the
+/// write. Holding it briefly is what makes "snapshot, then start the fork" work
+/// at all: prod would otherwise overwrite the snapshot in the seconds it takes
+/// the fork to come up.
+const SUBSCRIBER_GRACE: Duration = Duration::from_secs(60);
 
 pub enum SnapshotRequest {
     /// A write is waiting on this stripe, or a destination asked for it.
@@ -44,6 +52,10 @@ pub struct SnapshotWorker {
     destinations: Vec<Box<dyn SnapshotDestination>>,
     requests: Receiver<SnapshotRequest>,
     next_request_id: usize,
+    /// Stripes whose copy-out is waiting for the first subscriber. The writes
+    /// that triggered them are blocked until then.
+    deferred: Vec<usize>,
+    frozen_at: Option<Instant>,
     done: bool,
 }
 
@@ -59,6 +71,8 @@ impl SnapshotWorker {
             destinations: Vec::new(),
             requests,
             next_request_id: 0,
+            deferred: Vec::new(),
+            frozen_at: None,
             done: false,
         })
     }
@@ -79,6 +93,36 @@ impl SnapshotWorker {
         info!("Snapshot destination {} added", destination.id());
         self.destinations.push(destination);
         self.publish_destination_count();
+        self.run_deferred_copy_outs();
+    }
+
+    /// Copy out the stripes that were waiting for someone to send them to.
+    fn run_deferred_copy_outs(&mut self) {
+        for stripe_id in std::mem::take(&mut self.deferred) {
+            self.copy_out(stripe_id);
+        }
+    }
+
+    /// Give up on a snapshot nobody ever subscribed to, releasing the writes it
+    /// was holding.
+    fn expire_grace_if_needed(&mut self) {
+        if self.deferred.is_empty() || !self.destinations.is_empty() {
+            return;
+        }
+        let Some(frozen_at) = self.frozen_at else {
+            return;
+        };
+        if frozen_at.elapsed() < SUBSCRIBER_GRACE {
+            return;
+        }
+
+        warn!(
+            "No snapshot subscriber after {}s; ending the snapshot and releasing {} held stripes",
+            SUBSCRIBER_GRACE.as_secs(),
+            self.deferred.len()
+        );
+        self.deferred.clear();
+        self.state.end_snapshot();
     }
 
     fn publish_destination_count(&self) {
@@ -97,6 +141,32 @@ impl SnapshotWorker {
         if self.destinations.is_empty() && self.state.generation() > 0 {
             info!("Last snapshot destination is gone, releasing all stripes");
             self.state.release_all();
+        }
+    }
+
+    /// A destination that wants the whole snapshot — an exporter writing it to
+    /// an archive, rather than a fork pulling what it needs — gets every stripe
+    /// copied out, not just the ones prod overwrites.
+    ///
+    /// The sweep runs inline after the freeze, one stripe at a time, so it
+    /// interleaves with the copy-outs that prod writes are waiting on rather
+    /// than blocking them behind a full pass over the device.
+    fn sweep_for_exporters(&mut self) {
+        if !self.destinations.iter().any(|d| d.wants_all_stripes()) {
+            return;
+        }
+
+        info!("Sweeping every stripe for a snapshot exporter");
+        for stripe_id in 0..self.state.stripe_count() {
+            self.receive_requests(false);
+            if self.done || self.destinations.is_empty() {
+                return;
+            }
+            self.copy_out(stripe_id);
+        }
+
+        for destination in self.destinations.iter_mut() {
+            destination.finish();
         }
     }
 
@@ -128,7 +198,25 @@ impl SnapshotWorker {
         }
 
         if self.destinations.is_empty() {
+            if self.state.generation() > 0
+                && self
+                    .frozen_at
+                    .is_some_and(|frozen_at| frozen_at.elapsed() < SUBSCRIBER_GRACE)
+            {
+                // The fork is still coming up. Put the stripe back and leave the
+                // write waiting rather than losing the snapshot's copy of it.
+                debug!("Deferring copy-out of stripe {stripe_id} until a fork subscribes");
+                self.state.defer_copy(stripe_id);
+                self.deferred.push(stripe_id);
+                return;
+            }
+
+            // Nobody is listening and nobody is coming: this stripe's content is
+            // about to be overwritten with no copy anywhere. Serving the rest of
+            // the snapshot after that would hand a fork a torn image, so end it.
+            warn!("Copy-out of stripe {stripe_id} with no destinations; ending the snapshot");
             self.state.finish_copy(stripe_id);
+            self.state.end_snapshot();
             return;
         }
 
@@ -176,7 +264,9 @@ impl SnapshotWorker {
             SnapshotRequest::RemoveDestination(id) => self.remove_destination(id),
             SnapshotRequest::Freeze => {
                 let generation = self.state.lock_all();
+                self.frozen_at = Some(Instant::now());
                 info!("Snapshot generation {generation} frozen");
+                self.sweep_for_exporters();
             }
             SnapshotRequest::Shutdown => {
                 info!("Snapshot worker shutting down");
@@ -187,10 +277,19 @@ impl SnapshotWorker {
 
     pub fn receive_requests(&mut self, block: bool) {
         if block {
-            match self.requests.recv() {
+            // With stripes held for a subscriber, wake up regularly so the
+            // grace period can expire even if no request arrives.
+            let blocking_recv = if self.deferred.is_empty() {
+                self.requests.recv().map_err(RecvTimeoutError::from)
+            } else {
+                self.requests.recv_timeout(Duration::from_secs(1))
+            };
+
+            match blocking_recv {
                 Ok(request) => self.process_request(request),
-                Err(e) => {
-                    error!("Snapshot worker request channel closed: {e}");
+                Err(RecvTimeoutError::Timeout) => self.expire_grace_if_needed(),
+                Err(RecvTimeoutError::Disconnected) => {
+                    error!("Snapshot worker request channel closed");
                     self.done = true;
                     return;
                 }

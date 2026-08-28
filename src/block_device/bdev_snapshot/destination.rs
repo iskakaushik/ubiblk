@@ -20,6 +20,19 @@ pub trait SnapshotDestination: Send {
 
     /// False once the peer is gone; checked before and after every offer.
     fn is_alive(&self) -> bool;
+
+    /// True for a destination that wants the whole snapshot rather than only
+    /// the stripes prod happens to overwrite. A remote fork pulls what it needs
+    /// on demand and answers false; an exporter writing the snapshot somewhere
+    /// (an S3 archive, say) answers true, and the worker sweeps every stripe
+    /// through it.
+    fn wants_all_stripes(&self) -> bool {
+        false
+    }
+
+    /// The snapshot is over: no more stripes are coming. A destination that
+    /// writes a container finalises it here.
+    fn finish(&mut self) {}
 }
 
 #[cfg(test)]
@@ -41,6 +54,8 @@ pub mod test_destination {
         pub offered: OfferLog,
         pub alive: Arc<AtomicBool>,
         pub fail_next_offer: Arc<AtomicBool>,
+        pub wants_everything: Arc<AtomicBool>,
+        pub finished: Arc<AtomicBool>,
     }
 
     impl TestDestination {
@@ -50,6 +65,8 @@ pub mod test_destination {
                 offered: Arc::new(Mutex::new(Vec::new())),
                 alive: Arc::new(AtomicBool::new(true)),
                 fail_next_offer: Arc::new(AtomicBool::new(false)),
+                wants_everything: Arc::new(AtomicBool::new(false)),
+                finished: Arc::new(AtomicBool::new(false)),
             }
         }
 
@@ -83,6 +100,14 @@ pub mod test_destination {
 
         fn is_alive(&self) -> bool {
             self.alive.load(Ordering::SeqCst)
+        }
+
+        fn wants_all_stripes(&self) -> bool {
+            self.wants_everything.load(Ordering::SeqCst)
+        }
+
+        fn finish(&mut self) {
+            self.finished.store(true, Ordering::SeqCst);
         }
     }
 }
