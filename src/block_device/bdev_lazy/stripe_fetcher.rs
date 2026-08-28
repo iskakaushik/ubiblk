@@ -290,6 +290,20 @@ impl StripeFetcher {
         while !self.fetch_queue.is_empty() && self.buffer_pool.has_available() {
             let stripe_id = self.fetch_queue.pop_front().unwrap();
 
+            // The stripe may have arrived while it sat in the queue — pushed to
+            // us by the snapshot, or fetched by an earlier request. Pulling it
+            // again would be wasted work, and on a fork it fails outright:
+            // once prod has copied a stripe out it stops serving it.
+            if self
+                .shared_metadata_state
+                .stripe_fetched_if_needed(stripe_id)
+            {
+                self.stripe_states.insert(stripe_id, FetchState::Fetched);
+                self.first_failure.remove(&stripe_id);
+                self.stripe_fetch_retries.remove(&stripe_id);
+                continue;
+            }
+
             let buf = self.buffer_pool.get_buffer().unwrap();
             self.allocated_buffers.insert(stripe_id, buf.clone());
             if let Err(e) = self.stripe_source.request(stripe_id, buf.clone()) {
@@ -410,6 +424,13 @@ impl StripeFetcher {
             if since.elapsed() < PUSH_WAIT {
                 debug!("Stripe {stripe_id} is not servable yet; waiting for its push");
                 self.fetch_queue.push_back(stripe_id);
+                self.stripe_states.remove(&stripe_id);
+                return;
+            }
+
+            if self.pending_pushes.contains_key(&stripe_id) {
+                // The push is here, it just could not be written while the pull
+                // was outstanding. Let the next update apply it.
                 self.stripe_states.remove(&stripe_id);
                 return;
             }
@@ -541,6 +562,32 @@ mod tests {
     }
 
     /// With no pull in flight the push is written straight away.
+    /// A stripe that arrives while its fetch is still queued must not be
+    /// pulled anyway: on a fork the source stops serving a stripe once it has
+    /// been copied out, so the pull would fail and take the guest read with it.
+    #[test]
+    fn a_queued_fetch_is_dropped_when_the_stripe_arrives_first() {
+        let mut state = prep(false);
+        state.fetcher.set_expects_pushes(true);
+
+        // Queue a fetch, then let the stripe arrive by push before it starts.
+        state.fetcher.handle_fetch_request(0);
+        state
+            .fetcher
+            .shared_metadata_state
+            .set_stripe_header(0, metadata_flags::FETCHED);
+
+        for _ in 0..10 {
+            state.fetcher.update();
+        }
+
+        let source_metrics = state.source_dev.metrics.read().unwrap();
+        assert_eq!(
+            source_metrics.reads, 0,
+            "the queued fetch must not go to the source"
+        );
+    }
+
     #[test]
     fn pushed_stripe_is_written_immediately_when_nothing_is_fetching() {
         let mut state = prep(false);
