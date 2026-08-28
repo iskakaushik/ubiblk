@@ -151,8 +151,12 @@ impl SnapshotWorker {
     /// goes back to Free and prod stops paying for the snapshot.
     fn end_snapshot_if_unwatched(&mut self) {
         if self.destinations.is_empty() && self.state.generation() > 0 {
-            info!("Last snapshot destination is gone, releasing all stripes");
-            self.state.release_all();
+            // End it properly rather than only releasing the stripes: with the
+            // generation still set, the server would keep answering pulls from
+            // the live device, and a fork still attached would silently read
+            // post-snapshot content instead of being told the snapshot is gone.
+            info!("Last snapshot destination is gone, ending the snapshot");
+            self.state.end_snapshot();
         }
     }
 

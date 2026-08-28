@@ -36,6 +36,7 @@ struct BgWorkerConfig {
     metadata_dev: Box<dyn BlockDevice>,
     alignment: usize,
     autofetch: bool,
+    expects_pushes: bool,
     shared_state: SharedMetadataState,
     receiver: Receiver<BgWorkerRequest>,
 }
@@ -143,6 +144,7 @@ impl BackendEnv {
     pub fn snapshot_control(&self) -> Option<rpc::SnapshotControl> {
         self.snapshot.as_ref().map(|snapshot| rpc::SnapshotControl {
             state: snapshot.state.clone(),
+            sender: snapshot.sender.clone(),
         })
     }
 
@@ -309,6 +311,9 @@ impl BackendEnv {
                 .stripe_source
                 .as_ref()
                 .is_some_and(|stripe_source| stripe_source.autofetch()),
+            // This device forks another one, so a stripe its source refuses is
+            // one the snapshot is pushing to us instead.
+            expects_pushes: config.device.snapshot_source.is_some(),
             shared_state,
             receiver: bgworker_receiver,
         };
@@ -407,6 +412,7 @@ impl BackendEnv {
             metadata_dev,
             alignment,
             autofetch,
+            expects_pushes,
             shared_state,
             receiver,
         } = config;
@@ -425,6 +431,7 @@ impl BackendEnv {
             &*metadata_dev,
             alignment,
             autofetch,
+            expects_pushes,
             shared_state,
             receiver,
         )
@@ -838,6 +845,7 @@ mod tests {
 
         (
             BgWorkerConfig {
+                expects_pushes: false,
                 target_dev: Box::new(target_dev),
                 stripe_source_builder,
                 metadata_dev: Box::new(metadata_dev),

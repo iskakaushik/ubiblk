@@ -316,6 +316,12 @@ fn losing_the_last_destination_ends_the_snapshot() {
     worker.process_request(SnapshotRequest::RemoveDestination(7));
 
     assert_eq!(h.state.stripe_state(0), FREE, "every stripe is released");
+    assert_eq!(
+        h.state.generation(),
+        0,
+        "the snapshot is over, not just unlocked: a fork that is still attached \
+         must be told rather than served post-snapshot content"
+    );
     assert_eq!(channel.poll(), vec![(1, true)]);
 }
 

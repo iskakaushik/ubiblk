@@ -1,4 +1,7 @@
-use std::collections::{HashMap, VecDeque};
+use std::{
+    collections::{HashMap, VecDeque},
+    time::{Duration, Instant},
+};
 
 use log::{debug, error, info, warn};
 
@@ -14,6 +17,14 @@ use crate::{
 
 const MAX_CONCURRENT_FETCHES: usize = 16;
 const MAX_FETCH_RETRIES: u8 = 3;
+
+/// How long a fork keeps retrying a stripe its snapshot server refuses to serve.
+///
+/// Prod stops serving a stripe the moment it copies it out, and the copy it
+/// pushed is already on the wire by then, so the pull that just failed will
+/// succeed as soon as that push has been written locally. Failing after three
+/// immediate retries loses that race and fails the guest's read.
+const PUSH_WAIT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FetchState {
@@ -36,6 +47,10 @@ pub struct StripeFetcher {
     shared_metadata_state: SharedMetadataState,
     stripe_states: HashMap<usize, FetchState>,
     stripe_fetch_retries: HashMap<usize, u8>,
+    /// Set when this device forks another one, so a refused pull means "the
+    /// push is on its way" rather than "this stripe is unavailable".
+    expects_pushes: bool,
+    first_failure: HashMap<usize, Instant>,
     allocated_buffers: HashMap<usize, SharedBuffer>,
     /// Stripes the snapshot server pushed while a pull for them was in flight.
     /// Applied once that pull finishes: after a copy-out the server refuses to
@@ -96,6 +111,8 @@ impl StripeFetcher {
             shared_metadata_state,
             stripe_states: HashMap::new(),
             stripe_fetch_retries: HashMap::new(),
+            expects_pushes: false,
+            first_failure: HashMap::new(),
             allocated_buffers: HashMap::new(),
             pending_pushes: HashMap::new(),
             finished_fetches: Vec::new(),
@@ -137,6 +154,12 @@ impl StripeFetcher {
     ///
     /// It is written to the target exactly like a fetched stripe, so the same
     /// write/flush/mark-fetched path runs and the fork never pulls it later.
+    /// Tell the fetcher that this device subscribes to a snapshot, so stripes
+    /// its source refuses are coming over the push channel instead.
+    pub fn set_expects_pushes(&mut self, expects_pushes: bool) {
+        self.expects_pushes = expects_pushes;
+    }
+
     pub fn accept_pushed_stripe(&mut self, stripe_id: usize, data: &[u8]) {
         if self
             .shared_metadata_state
@@ -374,8 +397,22 @@ impl StripeFetcher {
         if success {
             self.stripe_states.insert(stripe_id, FetchState::Fetched);
             self.stripe_fetch_retries.remove(&stripe_id);
+            self.first_failure.remove(&stripe_id);
             self.finished_fetches.push((stripe_id, true));
             return;
+        }
+
+        if self.expects_pushes {
+            let since = *self
+                .first_failure
+                .entry(stripe_id)
+                .or_insert_with(Instant::now);
+            if since.elapsed() < PUSH_WAIT {
+                debug!("Stripe {stripe_id} is not servable yet; waiting for its push");
+                self.fetch_queue.push_back(stripe_id);
+                self.stripe_states.remove(&stripe_id);
+                return;
+            }
         }
 
         let retries = self.stripe_fetch_retries.entry(stripe_id).or_insert(0);

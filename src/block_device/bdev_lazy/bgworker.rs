@@ -38,13 +38,14 @@ impl BgWorker {
         metadata_dev: &dyn BlockDevice,
         alignment: usize,
         autofetch: bool,
+        expects_pushes: bool,
         metadata_state: SharedMetadataState,
         req_receiver: Receiver<BgWorkerRequest>,
     ) -> Result<Self> {
         let source_sector_count = stripe_source.sector_count();
         let metadata_flusher =
             MetadataFlusher::new(metadata_dev, source_sector_count, metadata_state.clone())?;
-        let stripe_fetcher = StripeFetcher::new(
+        let mut stripe_fetcher = StripeFetcher::new(
             stripe_source,
             target_dev,
             metadata_state.stripe_sector_count(),
@@ -52,6 +53,7 @@ impl BgWorker {
             alignment,
             autofetch,
         )?;
+        stripe_fetcher.set_expects_pushes(expects_pushes);
         Ok(BgWorker {
             stripe_fetcher,
             metadata_flusher,
@@ -165,6 +167,7 @@ mod tests {
                 &metadata_dev,
                 4096,
                 false,
+                false,
                 metadata_state,
                 rx,
             )
@@ -217,6 +220,7 @@ mod tests {
             &target_dev,
             &metadata_dev,
             4096,
+            false,
             false,
             metadata_state,
             rx,

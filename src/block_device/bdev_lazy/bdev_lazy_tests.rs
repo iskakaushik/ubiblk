@@ -65,6 +65,7 @@ mod tests {
                 &metadata_dev,
                 SECTOR_SIZE,
                 false,
+                false,
                 metadata_state.clone(),
                 bgworker_rx,
             )
@@ -105,6 +106,7 @@ mod tests {
                 &target_dev,
                 &metadata_dev,
                 SECTOR_SIZE,
+                false,
                 false,
                 metadata_state.clone(),
                 bgworker_rx,

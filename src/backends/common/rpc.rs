@@ -6,6 +6,7 @@ use std::{
         net::{UnixListener, UnixStream},
     },
     path::{Path, PathBuf},
+    sync::mpsc::Sender,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -24,7 +25,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use ubiblk_macros::error_context;
 
-use crate::block_device::{SharedSnapshotState, StatusReporter};
+use crate::block_device::{SharedSnapshotState, SnapshotRequest, StatusReporter};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -39,11 +40,17 @@ struct RpcState {
 #[derive(Clone)]
 pub struct SnapshotControl {
     pub state: SharedSnapshotState,
+    /// The freeze itself is done by the worker: it owns the destinations and
+    /// the grace period a fresh snapshot gets to find its first subscriber.
+    pub sender: Sender<SnapshotRequest>,
 }
 
 /// How long the freeze waits for the I/O channels to drain before giving up and
 /// letting the device run again.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long to wait for the worker to mark the stripes once it has been asked.
+const FREEZE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Freeze the device: hold new I/O, wait for what is in flight, then mark every
 /// stripe as owed to the snapshot and resume. Reads never wait after this; only
@@ -64,7 +71,24 @@ fn take_snapshot(control: &SnapshotControl) -> Value {
         thread::sleep(Duration::from_millis(1));
     }
 
-    let generation = state.lock_all();
+    let before = state.generation();
+    if control.sender.send(SnapshotRequest::Freeze).is_err() {
+        state.resume();
+        return json!({ "error": "snapshot worker is gone" });
+    }
+
+    // The worker marks the stripes and starts the grace period; wait for it so
+    // the caller gets the generation it can hand to a fork.
+    let deadline = Instant::now() + FREEZE_TIMEOUT;
+    while state.generation() == before {
+        if Instant::now() >= deadline {
+            state.resume();
+            return json!({ "error": "snapshot worker did not freeze in time" });
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    let generation = state.generation();
     state.resume();
 
     json!({
