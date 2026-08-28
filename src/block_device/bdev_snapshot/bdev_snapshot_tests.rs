@@ -407,3 +407,59 @@ fn a_busy_channel_holds_the_freeze_until_its_io_completes() {
     // Keep the harness alive for the sender the channel holds.
     let _ = h.receiver.take();
 }
+
+#[test]
+fn a_write_waits_for_a_fork_that_has_not_subscribed_yet() {
+    let mut h = harness(4);
+    let mut worker = worker_for(&mut h);
+    let mut channel = h.device.create_channel().unwrap();
+
+    // Snapshot taken, but the fork is still starting up.
+    worker.process_request(SnapshotRequest::Freeze);
+
+    channel.add_write(0, 1, buffer_of(0x77, 1), 1);
+    channel.submit().unwrap();
+    worker.receive_requests(false);
+
+    // Losing this stripe would tear the snapshot, so the write waits instead.
+    assert_eq!(worker.deferred_stripes(), &[0]);
+    assert_eq!(h.state.stripe_state(0), LOCKED);
+    assert!(channel.poll().is_empty(), "the write is still held");
+    assert_eq!(h.state.generation(), 1, "the snapshot is still live");
+
+    // The fork arrives: the deferred copy-out runs and the write goes through.
+    let destination = TestDestination::new(1);
+    worker.process_request(SnapshotRequest::AddDestination(Box::new(
+        destination.clone(),
+    )));
+
+    assert_eq!(destination.offered_stripes(), vec![0]);
+    assert_eq!(h.state.stripe_state(0), COPIED);
+    assert_eq!(channel.poll(), vec![(1, true)]);
+}
+
+#[test]
+fn a_snapshot_nobody_subscribes_to_is_given_up() {
+    let mut h = harness(4);
+    let mut worker = worker_for(&mut h);
+    let mut channel = h.device.create_channel().unwrap();
+    worker.set_subscriber_grace(std::time::Duration::from_millis(0));
+
+    worker.process_request(SnapshotRequest::Freeze);
+    channel.add_write(0, 1, buffer_of(0x88, 1), 1);
+    channel.submit().unwrap();
+    worker.receive_requests(false);
+
+    // With the grace already expired, the snapshot ends rather than being
+    // served half-preserved to a fork that turns up later.
+    worker.expire_grace_if_needed();
+
+    assert_eq!(h.state.generation(), 0, "the snapshot is gone");
+    assert_eq!(h.state.stripe_state(0), FREE);
+    assert!(worker.deferred_stripes().is_empty());
+    assert_eq!(
+        channel.poll(),
+        vec![(1, true)],
+        "prod is not held any longer"
+    );
+}

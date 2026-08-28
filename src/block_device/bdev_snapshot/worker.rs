@@ -56,6 +56,7 @@ pub struct SnapshotWorker {
     /// that triggered them are blocked until then.
     deferred: Vec<usize>,
     frozen_at: Option<Instant>,
+    subscriber_grace: Duration,
     done: bool,
 }
 
@@ -73,12 +74,23 @@ impl SnapshotWorker {
             next_request_id: 0,
             deferred: Vec::new(),
             frozen_at: None,
+            subscriber_grace: SUBSCRIBER_GRACE,
             done: false,
         })
     }
 
     pub fn destination_count(&self) -> usize {
         self.destinations.len()
+    }
+
+    /// How long a fresh snapshot holds writes waiting for its first subscriber.
+    pub fn set_subscriber_grace(&mut self, grace: Duration) {
+        self.subscriber_grace = grace;
+    }
+
+    #[cfg(test)]
+    pub fn deferred_stripes(&self) -> &[usize] {
+        &self.deferred
     }
 
     fn add_destination(&mut self, destination: Box<dyn SnapshotDestination>) {
@@ -105,20 +117,20 @@ impl SnapshotWorker {
 
     /// Give up on a snapshot nobody ever subscribed to, releasing the writes it
     /// was holding.
-    fn expire_grace_if_needed(&mut self) {
+    pub fn expire_grace_if_needed(&mut self) {
         if self.deferred.is_empty() || !self.destinations.is_empty() {
             return;
         }
         let Some(frozen_at) = self.frozen_at else {
             return;
         };
-        if frozen_at.elapsed() < SUBSCRIBER_GRACE {
+        if frozen_at.elapsed() < self.subscriber_grace {
             return;
         }
 
         warn!(
             "No snapshot subscriber after {}s; ending the snapshot and releasing {} held stripes",
-            SUBSCRIBER_GRACE.as_secs(),
+            self.subscriber_grace.as_secs(),
             self.deferred.len()
         );
         self.deferred.clear();
@@ -201,7 +213,7 @@ impl SnapshotWorker {
             if self.state.generation() > 0
                 && self
                     .frozen_at
-                    .is_some_and(|frozen_at| frozen_at.elapsed() < SUBSCRIBER_GRACE)
+                    .is_some_and(|frozen_at| frozen_at.elapsed() < self.subscriber_grace)
             {
                 // The fork is still coming up. Put the stripe back and leave the
                 // write waiting rather than losing the snapshot's copy of it.

@@ -466,6 +466,88 @@ mod tests {
         assert_eq!(target_metrics.flushes, 1);
     }
 
+    /// A stripe pushed while a pull for it is in flight must not be dropped:
+    /// once prod has copied the stripe out it stops serving it, so the pull can
+    /// never succeed and the pushed copy is the only correct one.
+    #[test]
+    fn pushed_stripe_is_applied_after_the_racing_fetch_fails() {
+        let mut state = prep(false);
+        let pushed = vec![0xAB; (state.fetcher.stripe_sector_count as usize) * SECTOR_SIZE];
+
+        // Start a pull and make it fail, the way a pull for a stripe prod has
+        // already copied out fails.
+        state
+            .source_dev
+            .fail_next
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        state.fetcher.handle_fetch_request(0);
+        state.fetcher.update();
+
+        // The push arrives while that pull is still outstanding.
+        state.fetcher.accept_pushed_stripe(0, &pushed);
+        assert_eq!(
+            state.target_dev.metrics.read().unwrap().writes,
+            0,
+            "the push waits for the pull rather than racing it to the disk"
+        );
+
+        for _ in 0..10 {
+            state.fetcher.update();
+        }
+
+        let mut written = vec![0u8; pushed.len()];
+        state.target_dev.read(0, &mut written, pushed.len());
+        assert_eq!(
+            written, pushed,
+            "the pushed copy must reach the disk once the pull is out of the way"
+        );
+    }
+
+    /// With no pull in flight the push is written straight away.
+    #[test]
+    fn pushed_stripe_is_written_immediately_when_nothing_is_fetching() {
+        let mut state = prep(false);
+        let pushed = vec![0xCD; (state.fetcher.stripe_sector_count as usize) * SECTOR_SIZE];
+
+        state.fetcher.accept_pushed_stripe(1, &pushed);
+        for _ in 0..10 {
+            state.fetcher.update();
+        }
+
+        let offset = (state.fetcher.stripe_sector_count as usize) * SECTOR_SIZE;
+        let mut written = vec![0u8; pushed.len()];
+        state.target_dev.read(offset, &mut written, pushed.len());
+        assert_eq!(written, pushed);
+
+        let finished = state.fetcher.take_finished_fetches();
+        assert_eq!(finished, vec![(1, true)], "it counts as a completed fetch");
+    }
+
+    /// A stripe the fork already has locally does not need the pushed copy.
+    #[test]
+    fn pushed_stripe_is_ignored_when_the_stripe_is_already_local() {
+        let mut state = prep(false);
+        state.fetcher.handle_fetch_request(0);
+        for _ in 0..10 {
+            state.fetcher.update();
+        }
+        state
+            .fetcher
+            .shared_metadata_state
+            .set_stripe_header(0, metadata_flags::FETCHED);
+        let writes_before = state.target_dev.metrics.read().unwrap().writes;
+
+        state.fetcher.accept_pushed_stripe(0, &[0xEF; 512]);
+        for _ in 0..10 {
+            state.fetcher.update();
+        }
+
+        assert_eq!(
+            state.target_dev.metrics.read().unwrap().writes,
+            writes_before
+        );
+    }
+
     #[test]
     fn test_repeat_requests_ignored() {
         let mut state = prep(false);
