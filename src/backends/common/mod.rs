@@ -24,6 +24,9 @@ use crate::{
 
 pub mod io_tracking;
 pub mod rpc;
+pub mod snapshot_service;
+
+use std::sync::Arc;
 
 pub const SECTOR_SIZE: usize = 512;
 
@@ -42,6 +45,10 @@ struct SnapshotEnv {
     state: block_device::SharedSnapshotState,
     sender: Sender<block_device::SnapshotRequest>,
     receiver: Option<Receiver<block_device::SnapshotRequest>>,
+    /// What the embedded stripe server reads stripes from, and the metadata it
+    /// serves: both describe the device as the fork should see it.
+    server_device: Box<dyn BlockDevice>,
+    metadata: Arc<UbiMetadata>,
     /// The device the worker reads pre-write stripe content from: bdev_lazy,
     /// not the raw disk, so unfetched stripes still read correctly.
     source: Box<dyn BlockDevice>,
@@ -153,6 +160,36 @@ impl BackendEnv {
             .map(|snapshot| snapshot.state.clone())
     }
 
+    /// Start serving snapshots to forks, and/or subscribing to the device this
+    /// one forks, depending on what the config asks for.
+    pub fn run_snapshot_services(&mut self) -> Result<()> {
+        if let Some(address) = self.config.device.snapshot_server.clone() {
+            let Some(snapshot) = self.snapshot.as_ref() else {
+                return Err(crate::ubiblk_error!(InvalidParameter {
+                    description: "snapshot_server needs a device with metadata".to_string(),
+                }));
+            };
+            snapshot_service::spawn_snapshot_server(
+                &address,
+                snapshot.server_device.clone(),
+                snapshot.metadata.clone(),
+                snapshot.sender.clone(),
+                snapshot.state.clone(),
+            )?;
+        }
+
+        if let Some(address) = self.config.device.snapshot_source.clone() {
+            let Some(bgworker_sender) = self.bgworker_sender.clone() else {
+                return Err(crate::ubiblk_error!(InvalidParameter {
+                    description: "snapshot_source needs a device with metadata".to_string(),
+                }));
+            };
+            snapshot_service::spawn_snapshot_subscriber(&address, bgworker_sender)?;
+        }
+
+        Ok(())
+    }
+
     pub fn run_snapshot_worker_thread(&mut self) -> Result<()> {
         let Some(snapshot) = self.snapshot.as_mut() else {
             return Ok(());
@@ -232,6 +269,8 @@ impl BackendEnv {
             state: snapshot_state,
             sender: snapshot_sender,
             receiver: Some(snapshot_receiver),
+            server_device: snapshot_source.clone(),
+            metadata: Arc::from(UbiMetadata::load_from_bdev(metadata_device.as_ref())?),
             source: snapshot_source,
         };
 
@@ -395,6 +434,7 @@ where
     let mut backend_env = BackendEnv::build(config)?;
     backend_env.run_bgworker_thread()?;
     backend_env.run_snapshot_worker_thread()?;
+    backend_env.run_snapshot_services()?;
 
     let _rpc_handle = if let Some(path) = config.device.rpc_socket.as_ref() {
         let status_reporter = backend_env.status_reporter();
@@ -630,6 +670,8 @@ mod tests {
     ) -> v2::Config {
         v2::Config {
             device: DeviceSection {
+                snapshot_server: None,
+                snapshot_source: None,
                 data_path: data_path.to_path_buf(),
                 metadata_path: metadata_path.map(|path| path.to_path_buf()),
                 vhost_socket: None,

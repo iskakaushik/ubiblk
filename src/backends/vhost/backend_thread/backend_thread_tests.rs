@@ -144,6 +144,8 @@ mod tests {
     fn default_config(path: &str) -> v2::Config {
         v2::Config {
             device: v2::DeviceSection {
+                snapshot_server: None,
+                snapshot_source: None,
                 data_path: path.into(),
                 metadata_path: None,
                 vhost_socket: Some("sock".into()),

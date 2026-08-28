@@ -612,6 +612,8 @@ mod tests {
 
         let config = v2::Config {
             device: DeviceSection {
+                snapshot_server: None,
+                snapshot_source: None,
                 data_path: overlay_file.path().into(),
                 metadata_path: None,
                 vhost_socket: None,

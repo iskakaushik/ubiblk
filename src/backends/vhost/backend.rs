@@ -323,6 +323,8 @@ mod tests {
     fn default_config(path: String) -> v2::Config {
         v2::Config {
             device: DeviceSection {
+                snapshot_server: None,
+                snapshot_source: None,
                 data_path: path.into(),
                 vhost_socket: Some("/tmp/vhost.sock".into()),
                 rpc_socket: Some("/tmp/rpc.sock".into()),

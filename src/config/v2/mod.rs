@@ -129,6 +129,14 @@ pub struct DeviceSection {
     pub device_id: String,
     #[serde(default)]
     pub track_written: bool,
+    /// `host:port` this device serves snapshots on. When set, the backend
+    /// listens there and a fork can subscribe to a snapshot taken with the
+    /// `snapshot` RPC, or pull cold stripes.
+    pub snapshot_server: Option<String>,
+    /// `host:port` of the prod device this one is a fork of. When set, the
+    /// backend subscribes to that device's snapshot and takes the stripes it
+    /// pushes.
+    pub snapshot_source: Option<String>,
 }
 
 fn default_device_id() -> String {
