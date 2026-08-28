@@ -10,7 +10,8 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    thread::JoinHandle,
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -23,7 +24,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use ubiblk_macros::error_context;
 
-use crate::block_device::StatusReporter;
+use crate::block_device::{
+    bdev_snapshot::state as snapshot_state, SharedSnapshotState, StatusReporter,
+};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -31,6 +34,64 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 struct RpcState {
     status_reporter: Option<StatusReporter>,
     io_trackers: Vec<IoTracker>,
+    snapshot: Option<SnapshotControl>,
+}
+
+/// What the RPC server needs to freeze the device it fronts.
+#[derive(Clone)]
+pub struct SnapshotControl {
+    pub state: SharedSnapshotState,
+}
+
+/// How long the freeze waits for the I/O channels to drain before giving up and
+/// letting the device run again.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Freeze the device: hold new I/O, wait for what is in flight, then mark every
+/// stripe as owed to the snapshot and resume. Reads never wait after this; only
+/// writes to stripes the snapshot still needs.
+fn take_snapshot(control: &SnapshotControl) -> Value {
+    let state = &control.state;
+    state.begin_drain();
+
+    let deadline = Instant::now() + DRAIN_TIMEOUT;
+    while !state.drained() {
+        if Instant::now() >= deadline {
+            // Never leave the device holding I/O because a channel is wedged.
+            state.set_mode(snapshot_state::RUNNING);
+            return json!({
+                "error": "timed out draining io channels; snapshot not taken"
+            });
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    let generation = state.lock_all();
+    state.set_mode(snapshot_state::RUNNING);
+
+    json!({
+        "snapshot": {
+            "generation": generation,
+            "stripes": state.stripe_count(),
+        }
+    })
+}
+
+fn snapshot_status(control: &SnapshotControl) -> Value {
+    let state = &control.state;
+    let (free, locked, copying, copied) = state.counts();
+    json!({
+        "snapshot_status": {
+            "generation": state.generation(),
+            "destinations": state.destination_count(),
+            "stripes": {
+                "free": free,
+                "locked": locked,
+                "copying": copying,
+                "copied": copied,
+            }
+        }
+    })
 }
 
 #[derive(Deserialize)]
@@ -74,6 +135,7 @@ pub fn start_rpc_server<P: AsRef<Path>>(
     path: P,
     status_reporter: Option<StatusReporter>,
     io_trackers: Vec<IoTracker>,
+    snapshot: Option<SnapshotControl>,
 ) -> Result<RpcServerHandle> {
     let path = path.as_ref().to_path_buf();
     if let Err(e) = fs::remove_file(&path) {
@@ -97,6 +159,7 @@ pub fn start_rpc_server<P: AsRef<Path>>(
     fs::set_permissions(&path, fs::Permissions::from_mode(0o660))?;
 
     let state = Arc::new(RpcState {
+        snapshot,
         status_reporter,
         io_trackers,
     });
@@ -213,6 +276,14 @@ fn queue_snapshots(state: &RpcState) -> Vec<Value> {
 fn process_request(request: RpcRequest, state: &RpcState) -> Value {
     match request.command.as_str() {
         "version" => json!({ "version": VERSION }),
+        "snapshot" => match state.snapshot.as_ref() {
+            Some(control) => take_snapshot(control),
+            None => json!({ "error": "snapshot is not enabled on this device" }),
+        },
+        "snapshot_status" => match state.snapshot.as_ref() {
+            Some(control) => snapshot_status(control),
+            None => json!({ "error": "snapshot is not enabled on this device" }),
+        },
         "status" => {
             let status = state.status_reporter.as_ref().map(StatusReporter::report);
             json!({ "status": status })
@@ -313,7 +384,7 @@ mod tests {
         io_trackers: Vec<IoTracker>,
     ) -> Result<RpcServerHandle> {
         let _l = UMASK_LOCK.lock().unwrap();
-        start_rpc_server(path, status_reporter, io_trackers)
+        start_rpc_server(path, status_reporter, io_trackers, None)
     }
 
     #[test]

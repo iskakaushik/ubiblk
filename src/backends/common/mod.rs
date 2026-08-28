@@ -37,11 +37,23 @@ struct BgWorkerConfig {
     receiver: Receiver<BgWorkerRequest>,
 }
 
+/// The snapshot layer's shared state plus what is needed to start its worker.
+struct SnapshotEnv {
+    state: block_device::SharedSnapshotState,
+    sender: Sender<block_device::SnapshotRequest>,
+    receiver: Option<Receiver<block_device::SnapshotRequest>>,
+    /// The device the worker reads pre-write stripe content from: bdev_lazy,
+    /// not the raw disk, so unfetched stripes still read correctly.
+    source: Box<dyn BlockDevice>,
+}
+
 pub struct BackendEnv {
     bdev: Box<dyn BlockDevice>,
     bgworker_config: Option<BgWorkerConfig>,
     bgworker_sender: Option<Sender<BgWorkerRequest>>,
     bgworker_thread: Option<std::thread::JoinHandle<()>>,
+    snapshot: Option<SnapshotEnv>,
+    snapshot_thread: Option<std::thread::JoinHandle<()>>,
     alignment: usize,
     config: v2::Config,
     status_reporter: Option<StatusReporter>,
@@ -70,6 +82,9 @@ impl BackendEnv {
                 bgworker_config: None,
                 bgworker_sender: None,
                 bgworker_thread: None,
+                // No metadata means no lazy layer, and snapshots hang off that.
+                snapshot: None,
+                snapshot_thread: None,
                 alignment,
                 config: config.clone(),
                 status_reporter: None,
@@ -116,6 +131,56 @@ impl BackendEnv {
         self.status_reporter.clone()
     }
 
+    /// What the RPC server needs to freeze this device, when the stack has a
+    /// snapshot layer.
+    pub fn snapshot_control(&self) -> Option<rpc::SnapshotControl> {
+        self.snapshot.as_ref().map(|snapshot| rpc::SnapshotControl {
+            state: snapshot.state.clone(),
+        })
+    }
+
+    /// Sender the embedded stripe server uses to hand subscribed sessions to
+    /// the snapshot worker.
+    pub fn snapshot_sender(&self) -> Option<Sender<block_device::SnapshotRequest>> {
+        self.snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.sender.clone())
+    }
+
+    pub fn snapshot_state(&self) -> Option<block_device::SharedSnapshotState> {
+        self.snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.state.clone())
+    }
+
+    pub fn run_snapshot_worker_thread(&mut self) -> Result<()> {
+        let Some(snapshot) = self.snapshot.as_mut() else {
+            return Ok(());
+        };
+        let Some(receiver) = snapshot.receiver.take() else {
+            return Ok(());
+        };
+
+        let mut worker = block_device::SnapshotWorker::new(
+            snapshot.source.as_ref(),
+            snapshot.state.clone(),
+            receiver,
+        )?;
+
+        self.snapshot_thread = Some(
+            std::thread::Builder::new()
+                .name("snapshot-worker".to_string())
+                .spawn(move || worker.run())
+                .map_err(|e| {
+                    crate::ubiblk_error!(InvalidParameter {
+                        description: format!("Failed to spawn snapshot worker thread: {e}"),
+                    })
+                })?,
+        );
+
+        Ok(())
+    }
+
     pub fn io_trackers(&self) -> &Vec<io_tracking::IoTracker> {
         &self.io_trackers
     }
@@ -151,6 +216,25 @@ impl BackendEnv {
             shared_state.clone(),
         )?;
 
+        // The snapshot layer is a pass-through until a snapshot is taken, so it
+        // is always present on the lazy path rather than being configured.
+        // Its worker reads pre-write content *through* bdev_lazy, so a stripe
+        // that has not been fetched from the source yet is still correct.
+        let (snapshot_sender, snapshot_receiver) = channel();
+        let snapshot_source = bdev_lazy.clone();
+        let snapshot_bdev = Box::new(block_device::SnapshotBlockDevice::new(
+            bdev_lazy,
+            metadata.stripe_sector_count_shift,
+            snapshot_sender.clone(),
+        ));
+        let snapshot_state = snapshot_bdev.state();
+        let snapshot = SnapshotEnv {
+            state: snapshot_state,
+            sender: snapshot_sender,
+            receiver: Some(snapshot_receiver),
+            source: snapshot_source,
+        };
+
         let stripe_source_builder = Box::new(StripeSourceBuilder::new(
             config.clone(),
             shared_state.stripe_sector_count(),
@@ -171,10 +255,12 @@ impl BackendEnv {
         };
 
         Ok(BackendEnv {
-            bdev: bdev_lazy,
+            bdev: snapshot_bdev,
             bgworker_config: Some(bgworker_config),
             bgworker_sender: Some(bgworker_sender),
             bgworker_thread: None,
+            snapshot: Some(snapshot),
+            snapshot_thread: None,
             alignment,
             config: config.clone(),
             status_reporter: Some(status_reporter),
@@ -308,11 +394,18 @@ where
 
     let mut backend_env = BackendEnv::build(config)?;
     backend_env.run_bgworker_thread()?;
+    backend_env.run_snapshot_worker_thread()?;
 
     let _rpc_handle = if let Some(path) = config.device.rpc_socket.as_ref() {
         let status_reporter = backend_env.status_reporter();
         let io_trackers = backend_env.io_trackers().clone();
-        Some(rpc::start_rpc_server(path, status_reporter, io_trackers)?)
+        let snapshot_control = backend_env.snapshot_control();
+        Some(rpc::start_rpc_server(
+            path,
+            status_reporter,
+            io_trackers,
+            snapshot_control,
+        )?)
     } else {
         None
     };

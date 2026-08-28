@@ -21,8 +21,12 @@ impl StripeServerClient {
         }
     }
 
+    /// Ask the server for its metadata, which `fetch_stripe` needs in order to
+    /// know stripe sizes. `connect_to_stripe_server` does this as part of the
+    /// handshake; a caller that built the client from its own stream (a fork
+    /// pulling cold stripes, for instance) calls it directly.
     #[error_context("Failed to fetch metadata from stripe server")]
-    fn fetch_metadata(&mut self) -> Result<()> {
+    pub fn fetch_metadata(&mut self) -> Result<()> {
         info!("Fetching metadata from server");
 
         // Send metadata request opcode

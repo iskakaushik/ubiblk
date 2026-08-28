@@ -11,7 +11,7 @@ use crate::{
 };
 
 use super::{
-    state::{SharedSnapshotState, DRAINING, LOCKED, RUNNING},
+    state::{SharedSnapshotState, LOCKED, RUNNING},
     worker::SnapshotRequest,
 };
 
@@ -66,7 +66,6 @@ impl SnapshotBlockDevice {
 
 impl BlockDevice for SnapshotBlockDevice {
     fn create_channel(&self) -> Result<Box<dyn IoChannel>> {
-        self.state.register_channel();
         Ok(Box::new(SnapshotIoChannel::new(
             self.inner.create_channel()?,
             self.state.clone(),
@@ -96,10 +95,9 @@ pub struct SnapshotIoChannel {
     copy_outs_requested: HashSet<usize>,
     queued: VecDeque<QueuedRequest>,
     finished: Vec<(usize, bool)>,
-    /// Requests handed to the device below that have not completed yet. The
-    /// freeze waits for this to reach zero on every channel.
+    /// This channel's share of the in-flight count, so `poll` knows how many
+    /// completions belong to it.
     in_flight: usize,
-    drain_reported: bool,
 }
 
 impl SnapshotIoChannel {
@@ -116,7 +114,6 @@ impl SnapshotIoChannel {
             queued: VecDeque::new(),
             finished: Vec::new(),
             in_flight: 0,
-            drain_reported: false,
         }
     }
 
@@ -172,6 +169,7 @@ impl SnapshotIoChannel {
             RequestType::Flush => self.inner.add_flush(request.id),
         }
         self.in_flight += 1;
+        self.state.request_started();
     }
 
     /// Replay whatever the layer was holding: everything while draining, and
@@ -210,6 +208,7 @@ impl IoChannel for SnapshotIoChannel {
         if self.state.mode() == RUNNING {
             self.inner.add_read(sector_offset, sector_count, buf, id);
             self.in_flight += 1;
+            self.state.request_started();
             return;
         }
 
@@ -231,6 +230,7 @@ impl IoChannel for SnapshotIoChannel {
         if self.state.mode() == RUNNING && self.write_allowed(first, last) {
             self.inner.add_write(sector_offset, sector_count, buf, id);
             self.in_flight += 1;
+            self.state.request_started();
             return;
         }
 
@@ -250,6 +250,7 @@ impl IoChannel for SnapshotIoChannel {
         if self.state.mode() == RUNNING {
             self.inner.add_flush(id);
             self.in_flight += 1;
+            self.state.request_started();
             return;
         }
 
@@ -272,18 +273,13 @@ impl IoChannel for SnapshotIoChannel {
         // Replay before polling, like `bdev_lazy` does, so a request released
         // this cycle can also complete this cycle.
         if self.state.mode() == RUNNING {
-            self.drain_reported = false;
             self.process_queued();
         }
 
         let completed = self.inner.poll();
         self.in_flight = self.in_flight.saturating_sub(completed.len());
+        self.state.requests_finished(completed.len());
         self.finished.extend(completed);
-
-        if self.state.mode() == DRAINING && self.in_flight == 0 && !self.drain_reported {
-            self.state.report_drained();
-            self.drain_reported = true;
-        }
 
         std::mem::take(&mut self.finished)
     }

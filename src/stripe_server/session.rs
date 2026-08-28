@@ -3,15 +3,27 @@ use std::io::ErrorKind;
 use log::{error, info};
 
 use crate::{
-    block_device::{metadata_flags, shared_buffer, wait_for_completion, SharedBuffer},
+    block_device::{
+        metadata_flags, shared_buffer, wait_for_completion, SharedBuffer, SnapshotRequest,
+    },
     UbiblkError,
 };
 
 use super::*;
 
 impl StripeServerSession {
+    fn stream_mut(&mut self) -> &mut DynStream {
+        self.stream
+            .as_mut()
+            .expect("session stream is taken only when the session ends")
+    }
+
     pub fn handle_requests(&mut self) {
         loop {
+            if self.stream.is_none() {
+                // The session handed its stream to the snapshot worker.
+                return;
+            }
             let Err(e) = self.handle_single_request() else {
                 continue;
             };
@@ -42,7 +54,7 @@ impl StripeServerSession {
     pub fn handle_single_request(&mut self) -> Result<()> {
         let mut opcode = [0u8; 1];
 
-        self.stream.read_exact(&mut opcode)?;
+        self.stream_mut().read_exact(&mut opcode)?;
 
         match opcode[0] {
             HELLO_CMD => {
@@ -51,9 +63,12 @@ impl StripeServerSession {
             METADATA_CMD => {
                 self.handle_metadata_request()?;
             }
+            SUBSCRIBE_SNAPSHOT_CMD => {
+                self.handle_subscribe_snapshot()?;
+            }
             READ_STRIPE_CMD => {
                 let mut stripe_id_bytes = [0u8; 8];
-                self.stream.read_exact(&mut stripe_id_bytes)?;
+                self.stream_mut().read_exact(&mut stripe_id_bytes)?;
 
                 let stripe_id = u64::from_le_bytes(stripe_id_bytes);
 
@@ -61,19 +76,59 @@ impl StripeServerSession {
             }
             _ => {
                 error!("Received unknown opcode: {}", opcode[0]);
-                self.stream.write_all(&[STATUS_INVALID_COMMAND])?;
-                self.stream.flush()?;
+                self.stream_mut().write_all(&[STATUS_INVALID_COMMAND])?;
+                self.stream_mut().flush()?;
             }
         }
 
         Ok(())
     }
 
+    /// Hand this session's stream to the snapshot worker as a destination. The
+    /// session ends here: from now on the worker owns the stream and writes
+    /// push frames on it, and the fork pulls cold stripes on another session.
+    fn handle_subscribe_snapshot(&mut self) -> Result<()> {
+        let (Some(snapshot_ch), Some(snapshot_state)) =
+            (self.snapshot_ch.clone(), self.snapshot_state.clone())
+        else {
+            info!("Snapshot subscribe refused: this server serves no snapshots");
+            return self.reply_status(STATUS_NO_SNAPSHOT);
+        };
+
+        let generation = snapshot_state.generation();
+        if generation == 0 {
+            info!("Snapshot subscribe refused: no snapshot has been taken");
+            return self.reply_status(STATUS_NO_SNAPSHOT);
+        }
+
+        self.stream_mut().write_all(&[STATUS_OK])?;
+        self.stream_mut().write_all(&generation.to_le_bytes())?;
+        self.stream_mut().flush()?;
+
+        let id = self
+            .next_destination_id
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let stream = self.stream.take().expect("stream checked above");
+        let destination = RemoteDestination::new(id, stream);
+
+        if snapshot_ch
+            .send(SnapshotRequest::AddDestination(Box::new(destination)))
+            .is_err()
+        {
+            error!("Snapshot worker is gone, dropping subscriber {id}");
+            return Ok(());
+        }
+
+        info!("Snapshot destination {id} subscribed to generation {generation}");
+        Ok(())
+    }
+
     fn handle_hello_request(&mut self) -> Result<()> {
         info!("Handling hello request");
-        self.stream.write_all(&[STATUS_OK])?;
-        self.stream.write_all(&PROTOCOL_VERSION.to_le_bytes())?;
-        self.stream.flush()?;
+        self.stream_mut().write_all(&[STATUS_OK])?;
+        self.stream_mut()
+            .write_all(&PROTOCOL_VERSION.to_le_bytes())?;
+        self.stream_mut().flush()?;
         Ok(())
     }
 
@@ -84,12 +139,12 @@ impl StripeServerSession {
         let mut metadata_buf = vec![0u8; metadata_size];
         self.metadata.write_to_buf(&mut metadata_buf)?;
 
-        self.stream.write_all(&[STATUS_OK])?;
+        self.stream_mut().write_all(&[STATUS_OK])?;
         let metadata_size_bytes = (metadata_size as u64).to_le_bytes();
-        self.stream.write_all(&metadata_size_bytes)?;
-        self.stream.write_all(&metadata_buf)?;
+        self.stream_mut().write_all(&metadata_size_bytes)?;
+        self.stream_mut().write_all(&metadata_buf)?;
 
-        self.stream.flush()?;
+        self.stream_mut().flush()?;
 
         info!("Successfully served metadata request");
 
@@ -136,12 +191,13 @@ impl StripeServerSession {
 
         let stripe_len_bytes = self.metadata.stripe_size();
 
-        self.stream.write_all(&[STATUS_OK])?;
-        self.stream
+        self.stream_mut().write_all(&[STATUS_OK])?;
+        self.stream_mut()
             .write_all(&(stripe_len_bytes as u64).to_le_bytes())?;
-        self.stream.write_all(stripe_data.borrow().as_slice())?;
+        self.stream_mut()
+            .write_all(stripe_data.borrow().as_slice())?;
 
-        self.stream.flush()?;
+        self.stream_mut().flush()?;
 
         info!("Successfully served stripe_id: {}", stripe_id);
 
@@ -177,13 +233,13 @@ impl StripeServerSession {
 
     /// Reply with a single status byte and no payload.
     fn reply_status(&mut self, status: u8) -> Result<()> {
-        self.stream.write_all(&[status])?;
-        self.stream.flush()?;
+        self.stream_mut().write_all(&[status])?;
+        self.stream_mut().flush()?;
         Ok(())
     }
 
     fn notify_server_error(&mut self) {
-        if let Err(e) = self.stream.write_all(&[STATUS_SERVER_ERROR]) {
+        if let Err(e) = self.stream_mut().write_all(&[STATUS_SERVER_ERROR]) {
             error!("Failed to notify client of server error: {}", e);
         }
     }

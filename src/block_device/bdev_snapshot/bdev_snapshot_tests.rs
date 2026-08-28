@@ -134,7 +134,6 @@ fn only_one_copy_out_is_started_per_stripe() {
 fn draining_holds_new_io_until_the_freeze_completes() {
     let (device, state) = setup(4);
     let mut channel = device.create_channel().unwrap();
-    assert_eq!(state.channel_count(), 1);
 
     state.begin_drain();
 
@@ -145,7 +144,10 @@ fn draining_holds_new_io_until_the_freeze_completes() {
     // Nothing reaches the device below while draining, and with no requests in
     // flight the channel reports itself drained.
     assert!(channel.poll().is_empty());
-    assert!(state.all_channels_drained());
+    assert!(
+        state.drained(),
+        "nothing was in flight when the drain started"
+    );
 
     // The freeze happens here; afterwards the layer runs again and replays.
     state.lock_all();

@@ -78,10 +78,16 @@ impl SnapshotWorker {
         }
         info!("Snapshot destination {} added", destination.id());
         self.destinations.push(destination);
+        self.publish_destination_count();
+    }
+
+    fn publish_destination_count(&self) {
+        self.state.set_destination_count(self.destinations.len());
     }
 
     fn remove_destination(&mut self, id: DestinationId) {
         self.destinations.retain(|d| d.id() != id);
+        self.publish_destination_count();
         self.end_snapshot_if_unwatched();
     }
 
@@ -157,6 +163,7 @@ impl SnapshotWorker {
             info!("Dropping snapshot destination {id}");
             self.destinations.retain(|d| d.id() != id);
         }
+        self.publish_destination_count();
 
         self.state.finish_copy(stripe_id);
         self.end_snapshot_if_unwatched();

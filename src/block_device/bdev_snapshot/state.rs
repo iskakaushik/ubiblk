@@ -31,13 +31,19 @@ pub struct SharedSnapshotState {
     stripe_states: Arc<Vec<AtomicU8>>,
     stripe_sector_count_shift: u8,
     mode: Arc<AtomicU8>,
-    /// Number of channels that have reported themselves drained. The freeze
-    /// waits for this to reach the channel count.
-    drained_channels: Arc<AtomicU64>,
-    /// Number of channels created so far, so the freeze knows what to wait for.
-    channel_count: Arc<AtomicU64>,
+    /// Requests handed to the device below across all channels that have not
+    /// completed yet. The freeze waits for this to reach zero.
+    ///
+    /// Counting here rather than asking each channel to report itself drained
+    /// means an idle channel costs nothing: a queue with no work has nothing in
+    /// flight, and a queue with work is already being polled by whoever is
+    /// waiting on its completions.
+    in_flight: Arc<AtomicU64>,
     /// Bumped on every freeze so a destination can tell snapshots apart.
     generation: Arc<AtomicU64>,
+    /// Destinations the worker currently serves. Published here so the RPC can
+    /// report it and a subscriber can tell when it has been registered.
+    destinations: Arc<AtomicU64>,
 }
 
 impl SharedSnapshotState {
@@ -51,9 +57,9 @@ impl SharedSnapshotState {
             stripe_states: Arc::new(stripe_states),
             stripe_sector_count_shift,
             mode: Arc::new(AtomicU8::new(RUNNING)),
-            drained_channels: Arc::new(AtomicU64::new(0)),
-            channel_count: Arc::new(AtomicU64::new(0)),
+            in_flight: Arc::new(AtomicU64::new(0)),
             generation: Arc::new(AtomicU64::new(0)),
+            destinations: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -107,8 +113,30 @@ impl SharedSnapshotState {
         self.generation.fetch_add(1, Ordering::AcqRel) + 1
     }
 
+    pub fn set_destination_count(&self, count: usize) {
+        self.destinations.store(count as u64, Ordering::Release);
+    }
+
+    pub fn destination_count(&self) -> u64 {
+        self.destinations.load(Ordering::Acquire)
+    }
+
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
+    }
+
+    /// (free, locked, copying, copied) — what `snapshot_status` reports.
+    pub fn counts(&self) -> (usize, usize, usize, usize) {
+        let (mut free, mut locked, mut copying, mut copied) = (0, 0, 0, 0);
+        for state in self.stripe_states.iter() {
+            match state.load(Ordering::Acquire) {
+                LOCKED => locked += 1,
+                COPYING => copying += 1,
+                COPIED => copied += 1,
+                _ => free += 1,
+            }
+        }
+        (free, locked, copying, copied)
     }
 
     pub fn mode(&self) -> u8 {
@@ -119,24 +147,28 @@ impl SharedSnapshotState {
         self.mode.store(mode, Ordering::Release);
     }
 
-    pub fn register_channel(&self) {
-        self.channel_count.fetch_add(1, Ordering::AcqRel);
+    pub fn request_started(&self) {
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
     }
 
-    pub fn channel_count(&self) -> u64 {
-        self.channel_count.load(Ordering::Acquire)
+    pub fn requests_finished(&self, count: usize) {
+        if count > 0 {
+            self.in_flight.fetch_sub(count as u64, Ordering::AcqRel);
+        }
     }
 
+    pub fn in_flight(&self) -> u64 {
+        self.in_flight.load(Ordering::Acquire)
+    }
+
+    /// Start holding new I/O. Nothing new reaches the device below from here
+    /// on, so `in_flight` can only fall.
     pub fn begin_drain(&self) {
-        self.drained_channels.store(0, Ordering::Release);
         self.set_mode(DRAINING);
     }
 
-    pub fn report_drained(&self) {
-        self.drained_channels.fetch_add(1, Ordering::AcqRel);
-    }
-
-    pub fn all_channels_drained(&self) -> bool {
-        self.drained_channels.load(Ordering::Acquire) >= self.channel_count()
+    /// True once everything handed to the device below has completed.
+    pub fn drained(&self) -> bool {
+        self.in_flight() == 0
     }
 }
