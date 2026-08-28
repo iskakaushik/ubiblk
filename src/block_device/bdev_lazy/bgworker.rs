@@ -8,8 +8,17 @@ use log::{error, info};
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 pub enum BgWorkerRequest {
-    Fetch { stripe_id: usize },
-    SetWritten { stripe_id: usize },
+    Fetch {
+        stripe_id: usize,
+    },
+    /// A stripe the snapshot server pushed to this fork.
+    PushedStripe {
+        stripe_id: usize,
+        data: Vec<u8>,
+    },
+    SetWritten {
+        stripe_id: usize,
+    },
     Shutdown,
 }
 
@@ -60,6 +69,9 @@ impl BgWorker {
         match req {
             BgWorkerRequest::Fetch { stripe_id } => {
                 self.stripe_fetcher.handle_fetch_request(stripe_id)
+            }
+            BgWorkerRequest::PushedStripe { stripe_id, data } => {
+                self.stripe_fetcher.accept_pushed_stripe(stripe_id, &data)
             }
             BgWorkerRequest::SetWritten { stripe_id } => {
                 self.metadata_flusher.set_stripe_written(stripe_id)

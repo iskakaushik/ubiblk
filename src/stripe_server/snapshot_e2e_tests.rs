@@ -13,8 +13,8 @@ use std::{
 use crate::{
     backends::SECTOR_SIZE,
     block_device::{
-        bdev_snapshot::state::RUNNING, metadata_flags, shared_buffer, BlockDevice, IoChannel,
-        SharedSnapshotState, SnapshotBlockDevice, SnapshotWorker, SyncBlockDevice, UbiMetadata,
+        metadata_flags, shared_buffer, BlockDevice, IoChannel, SharedSnapshotState,
+        SnapshotBlockDevice, SnapshotWorker, SyncBlockDevice, UbiMetadata,
     },
     stripe_server::{
         PushedFrame, RemoteStripeProvider, SnapshotSubscriber, StripeServer, StripeServerClient,
@@ -45,7 +45,7 @@ fn freeze(state: &SharedSnapshotState) -> u64 {
     state.begin_drain();
     wait_until("io to drain", || state.drained());
     let generation = state.lock_all();
-    state.set_mode(RUNNING);
+    state.resume();
     generation
 }
 

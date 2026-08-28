@@ -24,9 +24,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use ubiblk_macros::error_context;
 
-use crate::block_device::{
-    bdev_snapshot::state as snapshot_state, SharedSnapshotState, StatusReporter,
-};
+use crate::block_device::{SharedSnapshotState, StatusReporter};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -58,7 +56,7 @@ fn take_snapshot(control: &SnapshotControl) -> Value {
     while !state.drained() {
         if Instant::now() >= deadline {
             // Never leave the device holding I/O because a channel is wedged.
-            state.set_mode(snapshot_state::RUNNING);
+            state.resume();
             return json!({
                 "error": "timed out draining io channels; snapshot not taken"
             });
@@ -67,7 +65,7 @@ fn take_snapshot(control: &SnapshotControl) -> Value {
     }
 
     let generation = state.lock_all();
-    state.set_mode(snapshot_state::RUNNING);
+    state.resume();
 
     json!({
         "snapshot": {
@@ -84,6 +82,11 @@ fn snapshot_status(control: &SnapshotControl) -> Value {
         "snapshot_status": {
             "generation": state.generation(),
             "destinations": state.destination_count(),
+            "channels": {
+                "open": state.channel_states().0,
+                "locked": state.channel_states().1,
+                "drained": state.channel_states().2,
+            },
             "stripes": {
                 "free": free,
                 "locked": locked,

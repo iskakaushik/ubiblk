@@ -172,6 +172,16 @@ impl StripeServerSession {
             return self.reply_status(STATUS_INVALID_STRIPE);
         }
 
+        // While a snapshot is live, a stripe is only safe to serve from the
+        // live device until its copy-out runs: after that prod's new content is
+        // on disk and the snapshot's version exists only in what was pushed.
+        if let Some(state) = self.snapshot_state.as_ref() {
+            if state.generation() > 0 && !state.write_allowed_before_copy(stripe_id as usize) {
+                info!("Stripe {stripe_id} was already pushed to subscribers");
+                return self.reply_status(STATUS_ALREADY_PUSHED);
+            }
+        }
+
         let stripe_data = if self.stripe_not_fetched(stripe_id) {
             // Not yet copied into the local device: the data still lives in the
             // source, so serve it straight from there.

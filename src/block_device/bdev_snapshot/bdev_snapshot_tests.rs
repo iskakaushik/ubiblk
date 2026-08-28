@@ -11,7 +11,7 @@ use crate::{
 use super::{
     destination::test_destination::TestDestination,
     device::SnapshotBlockDevice,
-    state::{SharedSnapshotState, COPIED, FREE, LOCKED, RUNNING},
+    state::{SharedSnapshotState, COPIED, FREE, LOCKED},
     worker::{SnapshotRequest, SnapshotWorker},
 };
 
@@ -152,7 +152,7 @@ fn draining_holds_new_io_until_the_freeze_completes() {
     // The freeze happens here; afterwards the layer runs again and replays.
     state.lock_all();
     state.finish_copy(0);
-    state.set_mode(RUNNING);
+    state.resume();
 
     let mut completed = channel.poll();
     completed.sort();
@@ -363,4 +363,47 @@ fn freeze_through_the_worker_bumps_the_generation() {
     worker.receive_requests(false);
     assert_eq!(h.state.generation(), 1);
     assert_eq!(h.state.stripe_state(0), LOCKED);
+}
+
+#[test]
+fn an_idle_channel_does_not_hold_the_freeze_up() {
+    let h = harness(4);
+    // Two channels exist; neither is polled after the drain starts.
+    let _first = h.device.create_channel().unwrap();
+    let _second = h.device.create_channel().unwrap();
+    assert_eq!(h.state.channel_count(), 2);
+
+    h.state.begin_drain();
+    assert_eq!(h.state.channel_states(), (0, 2, 0));
+
+    // Nothing is in flight, so the freeze retires both without either of them
+    // running.
+    assert!(h.state.drained());
+    assert_eq!(h.state.channel_states(), (0, 0, 2));
+
+    h.state.resume();
+    assert_eq!(h.state.channel_states(), (2, 0, 0));
+}
+
+#[test]
+fn a_busy_channel_holds_the_freeze_until_its_io_completes() {
+    let mut h = harness(4);
+    let mut channel = h.device.create_channel().unwrap();
+
+    // TestBlockDevice completes on submit, so hold the completion by not
+    // polling: the request is in flight from the slot's point of view.
+    channel.add_write(0, 1, buffer_of(0x55, 1), 1);
+    channel.submit().unwrap();
+
+    h.state.begin_drain();
+    assert!(
+        !h.state.drained(),
+        "a channel with in-flight io is not drained"
+    );
+
+    assert_eq!(channel.poll(), vec![(1, true)]);
+    assert!(h.state.drained());
+
+    // Keep the harness alive for the sender the channel holds.
+    let _ = h.receiver.take();
 }

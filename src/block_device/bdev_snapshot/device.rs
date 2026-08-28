@@ -1,6 +1,6 @@
 use std::{
     collections::{HashSet, VecDeque},
-    sync::mpsc::Sender,
+    sync::{mpsc::Sender, Arc},
 };
 
 use log::error;
@@ -11,7 +11,7 @@ use crate::{
 };
 
 use super::{
-    state::{SharedSnapshotState, LOCKED, RUNNING},
+    state::{ChannelSlot, SharedSnapshotState, LOCKED},
     worker::SnapshotRequest,
 };
 
@@ -66,9 +66,11 @@ impl SnapshotBlockDevice {
 
 impl BlockDevice for SnapshotBlockDevice {
     fn create_channel(&self) -> Result<Box<dyn IoChannel>> {
+        let slot = self.state.register_channel();
         Ok(Box::new(SnapshotIoChannel::new(
             self.inner.create_channel()?,
             self.state.clone(),
+            slot,
             self.worker_ch.clone(),
         )))
     }
@@ -89,31 +91,31 @@ impl BlockDevice for SnapshotBlockDevice {
 pub struct SnapshotIoChannel {
     inner: Box<dyn IoChannel>,
     state: SharedSnapshotState,
+    /// This channel's place in the freeze handshake.
+    slot: Arc<ChannelSlot>,
     worker_ch: Sender<SnapshotRequest>,
     /// Stripes this channel has already asked the worker to copy out, so a
     /// burst of writes to one stripe does not queue a request each time.
     copy_outs_requested: HashSet<usize>,
     queued: VecDeque<QueuedRequest>,
     finished: Vec<(usize, bool)>,
-    /// This channel's share of the in-flight count, so `poll` knows how many
-    /// completions belong to it.
-    in_flight: usize,
 }
 
 impl SnapshotIoChannel {
     fn new(
         inner: Box<dyn IoChannel>,
         state: SharedSnapshotState,
+        slot: Arc<ChannelSlot>,
         worker_ch: Sender<SnapshotRequest>,
     ) -> Self {
         Self {
             inner,
             state,
+            slot,
             worker_ch,
             copy_outs_requested: HashSet::new(),
             queued: VecDeque::new(),
             finished: Vec::new(),
-            in_flight: 0,
         }
     }
 
@@ -168,14 +170,13 @@ impl SnapshotIoChannel {
             ),
             RequestType::Flush => self.inner.add_flush(request.id),
         }
-        self.in_flight += 1;
-        self.state.request_started();
+        self.slot.request_started();
     }
 
     /// Replay whatever the layer was holding: everything while draining, and
     /// writes whose stripes have since been copied out.
     fn process_queued(&mut self) {
-        if self.state.mode() != RUNNING {
+        if !self.slot.is_open() {
             return;
         }
 
@@ -205,10 +206,9 @@ impl SnapshotIoChannel {
 
 impl IoChannel for SnapshotIoChannel {
     fn add_read(&mut self, sector_offset: u64, sector_count: u32, buf: SharedBuffer, id: usize) {
-        if self.state.mode() == RUNNING {
+        if self.slot.is_open() {
             self.inner.add_read(sector_offset, sector_count, buf, id);
-            self.in_flight += 1;
-            self.state.request_started();
+            self.slot.request_started();
             return;
         }
 
@@ -227,10 +227,9 @@ impl IoChannel for SnapshotIoChannel {
     fn add_write(&mut self, sector_offset: u64, sector_count: u32, buf: SharedBuffer, id: usize) {
         let (first, last) = self.stripe_range(sector_offset, sector_count);
 
-        if self.state.mode() == RUNNING && self.write_allowed(first, last) {
+        if self.slot.is_open() && self.write_allowed(first, last) {
             self.inner.add_write(sector_offset, sector_count, buf, id);
-            self.in_flight += 1;
-            self.state.request_started();
+            self.slot.request_started();
             return;
         }
 
@@ -247,10 +246,9 @@ impl IoChannel for SnapshotIoChannel {
     }
 
     fn add_flush(&mut self, id: usize) {
-        if self.state.mode() == RUNNING {
+        if self.slot.is_open() {
             self.inner.add_flush(id);
-            self.in_flight += 1;
-            self.state.request_started();
+            self.slot.request_started();
             return;
         }
 
@@ -272,19 +270,16 @@ impl IoChannel for SnapshotIoChannel {
     fn poll(&mut self) -> Vec<(usize, bool)> {
         // Replay before polling, like `bdev_lazy` does, so a request released
         // this cycle can also complete this cycle.
-        if self.state.mode() == RUNNING {
-            self.process_queued();
-        }
+        self.process_queued();
 
         let completed = self.inner.poll();
-        self.in_flight = self.in_flight.saturating_sub(completed.len());
-        self.state.requests_finished(completed.len());
+        self.slot.requests_finished(completed.len());
         self.finished.extend(completed);
 
         std::mem::take(&mut self.finished)
     }
 
     fn busy(&self) -> bool {
-        self.in_flight > 0 || !self.queued.is_empty() || !self.finished.is_empty()
+        self.slot.in_flight() > 0 || !self.queued.is_empty() || !self.finished.is_empty()
     }
 }

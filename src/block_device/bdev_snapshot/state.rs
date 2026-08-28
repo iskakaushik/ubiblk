@@ -1,6 +1,6 @@
 use std::sync::{
     atomic::{AtomicU64, AtomicU8, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 
 /// Per-stripe snapshot state.
@@ -19,10 +19,63 @@ pub const LOCKED: u8 = 1;
 pub const COPYING: u8 = 2;
 pub const COPIED: u8 = 3;
 
-/// Whether the layer is passing I/O through or holding it while a freeze
-/// drains the in-flight requests.
-pub const RUNNING: u8 = 0;
-pub const DRAINING: u8 = 1;
+/// Where a single channel is in the freeze handshake. A channel walks
+/// `Open -> Locked -> Drained -> Open`, and only passes I/O through while it is
+/// `Open`.
+pub const CHANNEL_OPEN: u8 = 0;
+pub const CHANNEL_LOCKED: u8 = 1;
+pub const CHANNEL_DRAINED: u8 = 2;
+
+/// One channel's slot in the freeze handshake.
+///
+/// The channel publishes its in-flight count here, so the freeze can retire a
+/// channel that is idle without waiting for it to be polled — an idle queue
+/// never runs, so a scheme where each channel has to report itself drained
+/// stalls until that queue happens to get work.
+#[derive(Debug)]
+pub struct ChannelSlot {
+    state: AtomicU8,
+    in_flight: AtomicU64,
+}
+
+impl ChannelSlot {
+    fn new() -> Self {
+        Self {
+            state: AtomicU8::new(CHANNEL_OPEN),
+            in_flight: AtomicU64::new(0),
+        }
+    }
+
+    pub fn state(&self) -> u8 {
+        self.state.load(Ordering::Acquire)
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.state() == CHANNEL_OPEN
+    }
+
+    pub fn request_started(&self) {
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub fn requests_finished(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        self.in_flight.fetch_sub(count as u64, Ordering::AcqRel);
+        // A channel that is being drained and has just gone quiet retires
+        // itself, so the freeze does not have to wait for the next poll.
+        if self.in_flight.load(Ordering::Acquire) == 0
+            && self.state.load(Ordering::Acquire) == CHANNEL_LOCKED
+        {
+            self.state.store(CHANNEL_DRAINED, Ordering::Release);
+        }
+    }
+
+    pub fn in_flight(&self) -> u64 {
+        self.in_flight.load(Ordering::Acquire)
+    }
+}
 
 /// State shared between the `SnapshotBlockDevice`, every `SnapshotIoChannel`
 /// and (later) the snapshot worker. Cloning shares the underlying atomics.
@@ -30,15 +83,10 @@ pub const DRAINING: u8 = 1;
 pub struct SharedSnapshotState {
     stripe_states: Arc<Vec<AtomicU8>>,
     stripe_sector_count_shift: u8,
-    mode: Arc<AtomicU8>,
-    /// Requests handed to the device below across all channels that have not
-    /// completed yet. The freeze waits for this to reach zero.
-    ///
-    /// Counting here rather than asking each channel to report itself drained
-    /// means an idle channel costs nothing: a queue with no work has nothing in
-    /// flight, and a queue with work is already being polled by whoever is
-    /// waiting on its completions.
-    in_flight: Arc<AtomicU64>,
+    /// One slot per channel. Only touched under the lock when channels are
+    /// created, which happens at startup; the I/O path only ever touches its
+    /// own slot's atomics.
+    channels: Arc<Mutex<Vec<Arc<ChannelSlot>>>>,
     /// Bumped on every freeze so a destination can tell snapshots apart.
     generation: Arc<AtomicU64>,
     /// Destinations the worker currently serves. Published here so the RPC can
@@ -56,8 +104,7 @@ impl SharedSnapshotState {
         Self {
             stripe_states: Arc::new(stripe_states),
             stripe_sector_count_shift,
-            mode: Arc::new(AtomicU8::new(RUNNING)),
-            in_flight: Arc::new(AtomicU64::new(0)),
+            channels: Arc::new(Mutex::new(Vec::new())),
             generation: Arc::new(AtomicU64::new(0)),
             destinations: Arc::new(AtomicU64::new(0)),
         }
@@ -83,6 +130,14 @@ impl SharedSnapshotState {
     /// pre-write content every destination already has.
     pub fn write_allowed(&self, stripe_id: usize) -> bool {
         matches!(self.stripe_state(stripe_id), FREE | COPIED)
+    }
+
+    /// True while the live device still holds this stripe's snapshot content,
+    /// i.e. before any copy-out has run for it. Once a copy-out starts, prod may
+    /// overwrite the stripe, so the live device stops being a valid source for
+    /// the snapshot.
+    pub fn write_allowed_before_copy(&self, stripe_id: usize) -> bool {
+        matches!(self.stripe_state(stripe_id), FREE | LOCKED)
     }
 
     /// Claim a locked stripe for copy-out. Returns true for the caller that won
@@ -139,36 +194,58 @@ impl SharedSnapshotState {
         (free, locked, copying, copied)
     }
 
-    pub fn mode(&self) -> u8 {
-        self.mode.load(Ordering::Acquire)
+    /// Give a new channel its slot in the handshake.
+    pub fn register_channel(&self) -> Arc<ChannelSlot> {
+        let slot = Arc::new(ChannelSlot::new());
+        self.channels.lock().unwrap().push(slot.clone());
+        slot
     }
 
-    pub fn set_mode(&self, mode: u8) {
-        self.mode.store(mode, Ordering::Release);
+    pub fn channel_count(&self) -> usize {
+        self.channels.lock().unwrap().len()
     }
 
-    pub fn request_started(&self) {
-        self.in_flight.fetch_add(1, Ordering::AcqRel);
-    }
-
-    pub fn requests_finished(&self, count: usize) {
-        if count > 0 {
-            self.in_flight.fetch_sub(count as u64, Ordering::AcqRel);
+    /// Lock every channel: from here on new I/O queues instead of reaching the
+    /// device below, so in-flight counts can only fall.
+    pub fn begin_drain(&self) {
+        for slot in self.channels.lock().unwrap().iter() {
+            slot.state.store(CHANNEL_LOCKED, Ordering::Release);
         }
     }
 
-    pub fn in_flight(&self) -> u64 {
-        self.in_flight.load(Ordering::Acquire)
-    }
-
-    /// Start holding new I/O. Nothing new reaches the device below from here
-    /// on, so `in_flight` can only fall.
-    pub fn begin_drain(&self) {
-        self.set_mode(DRAINING);
-    }
-
-    /// True once everything handed to the device below has completed.
+    /// True once every channel is quiet. Retires the idle ones itself, so a
+    /// queue that is not being polled does not hold the freeze up.
     pub fn drained(&self) -> bool {
-        self.in_flight() == 0
+        let channels = self.channels.lock().unwrap();
+        let mut all_drained = true;
+        for slot in channels.iter() {
+            if slot.in_flight() == 0 {
+                slot.state.store(CHANNEL_DRAINED, Ordering::Release);
+                continue;
+            }
+            all_drained = false;
+        }
+        all_drained
+    }
+
+    /// Open every channel again and let them replay what they queued.
+    pub fn resume(&self) {
+        for slot in self.channels.lock().unwrap().iter() {
+            slot.state.store(CHANNEL_OPEN, Ordering::Release);
+        }
+    }
+
+    /// (open, locked, drained) — what `snapshot_status` reports.
+    pub fn channel_states(&self) -> (usize, usize, usize) {
+        let channels = self.channels.lock().unwrap();
+        let (mut open, mut locked, mut drained) = (0, 0, 0);
+        for slot in channels.iter() {
+            match slot.state() {
+                CHANNEL_LOCKED => locked += 1,
+                CHANNEL_DRAINED => drained += 1,
+                _ => open += 1,
+            }
+        }
+        (open, locked, drained)
     }
 }

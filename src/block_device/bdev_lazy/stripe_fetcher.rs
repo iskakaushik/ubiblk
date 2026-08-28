@@ -127,6 +127,49 @@ impl StripeFetcher {
         self.stripe_states.insert(stripe_id, FetchState::Queued);
     }
 
+    /// Take a stripe the snapshot server pushed to us: the content this fork
+    /// must see, handed over just before prod overwrites it.
+    ///
+    /// It is written to the target exactly like a fetched stripe, so the same
+    /// write/flush/mark-fetched path runs and the fork never pulls it later.
+    pub fn accept_pushed_stripe(&mut self, stripe_id: usize, data: &[u8]) {
+        if self
+            .shared_metadata_state
+            .stripe_fetched_if_needed(stripe_id)
+        {
+            debug!("Stripe {stripe_id} is already local, ignoring the pushed copy");
+            return;
+        }
+
+        if self.stripe_states.contains_key(&stripe_id) {
+            // A pull is already in flight for this stripe. It reads the same
+            // point-in-time content, because prod cannot overwrite a stripe
+            // before its copy-out finishes, so let the pull finish.
+            debug!("Stripe {stripe_id} is already being fetched, ignoring the pushed copy");
+            return;
+        }
+
+        let Some(buf) = self.buffer_pool.get_buffer() else {
+            // Every buffer is busy fetching. Dropping the push is safe: the
+            // stripe is not marked fetched, so it will be pulled on demand.
+            warn!("No buffer available for pushed stripe {stripe_id}, dropping it");
+            return;
+        };
+
+        {
+            let mut target = buf.borrow_mut();
+            let len = data.len().min(target.as_slice().len());
+            target.as_mut_slice()[..len].copy_from_slice(&data[..len]);
+        }
+
+        self.allocated_buffers.insert(stripe_id, buf.clone());
+        self.stripe_states.insert(stripe_id, FetchState::Fetching);
+
+        if !self.start_write(buf, stripe_id) {
+            self.fetch_completed(stripe_id, false);
+        }
+    }
+
     pub fn update(&mut self) {
         self.update_autofetch();
         self.start_fetches();

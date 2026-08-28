@@ -154,6 +154,10 @@ ubiblk_error_variants! {
     MissingStripeMetadata {
         meta: ErrorMeta,
     } => "{meta}Missing stripe metadata on client {meta:#}",
+    StripeAlreadyPushed {
+        stripe: u64,
+        meta: ErrorMeta,
+    } => "{meta}Stripe {stripe} was already pushed to snapshot subscribers {meta:#}",
     StripeUnavailableData {
         stripe: u64,
         meta: ErrorMeta,

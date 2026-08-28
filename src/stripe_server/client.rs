@@ -174,6 +174,9 @@ impl RemoteStripeProvider for StripeServerClient {
             STATUS_INVALID_STRIPE => Err(crate::ubiblk_error!(InvalidParameter {
                 description: format!("Invalid stripe index: {}", stripe_idx),
             })),
+            STATUS_ALREADY_PUSHED => Err(crate::ubiblk_error!(StripeAlreadyPushed {
+                stripe: stripe_idx
+            })),
             STATUS_NO_DATA | STATUS_NOT_FETCHED => {
                 Err(crate::ubiblk_error!(StripeUnavailableData {
                     stripe: stripe_idx

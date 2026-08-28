@@ -34,6 +34,9 @@ pub const STATUS_INVALID_STRIPE: u8 = 0x01;
 pub const STATUS_NO_DATA: u8 = 0x02;
 pub const STATUS_NOT_FETCHED: u8 = 0x03;
 pub const STATUS_NO_SNAPSHOT: u8 = 0x04;
+/// The snapshot's copy of this stripe was already pushed to the subscribers:
+/// prod has moved on, so the local copy is the only correct one.
+pub const STATUS_ALREADY_PUSHED: u8 = 0x05;
 pub const STATUS_INVALID_COMMAND: u8 = 0xFE;
 pub const STATUS_SERVER_ERROR: u8 = 0xFF;
 
