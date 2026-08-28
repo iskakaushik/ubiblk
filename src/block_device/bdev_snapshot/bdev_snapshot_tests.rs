@@ -1,21 +1,49 @@
+use std::sync::{
+    atomic::Ordering,
+    mpsc::{channel, Receiver, Sender},
+};
+
 use crate::{
     backends::SECTOR_SIZE,
     block_device::{bdev_test::TestBlockDevice, shared_buffer, BlockDevice},
 };
 
 use super::{
+    destination::test_destination::TestDestination,
     device::SnapshotBlockDevice,
     state::{SharedSnapshotState, COPIED, FREE, LOCKED, RUNNING},
+    worker::{SnapshotRequest, SnapshotWorker},
 };
 
 const STRIPE_SHIFT: u8 = 3; // 8 sectors per stripe
 const STRIPE_SECTORS: u64 = 1 << STRIPE_SHIFT;
 
-fn setup(stripes: u64) -> (SnapshotBlockDevice, SharedSnapshotState) {
+struct Harness {
+    device: SnapshotBlockDevice,
+    state: SharedSnapshotState,
+    sender: Sender<SnapshotRequest>,
+    receiver: Option<Receiver<SnapshotRequest>>,
+    inner: TestBlockDevice,
+}
+
+fn harness(stripes: u64) -> Harness {
     let size = stripes * STRIPE_SECTORS * SECTOR_SIZE as u64;
-    let device = SnapshotBlockDevice::new(Box::new(TestBlockDevice::new(size)), STRIPE_SHIFT);
+    let inner = TestBlockDevice::new(size);
+    let (sender, receiver) = channel();
+    let device = SnapshotBlockDevice::new(BlockDevice::clone(&inner), STRIPE_SHIFT, sender.clone());
     let state = device.state();
-    (device, state)
+    Harness {
+        device,
+        state,
+        sender,
+        receiver: Some(receiver),
+        inner,
+    }
+}
+
+fn setup(stripes: u64) -> (SnapshotBlockDevice, SharedSnapshotState) {
+    let h = harness(stripes);
+    (h.device, h.state)
 }
 
 fn buffer_of(byte: u8, sectors: u32) -> crate::block_device::SharedBuffer {
@@ -169,4 +197,168 @@ fn each_freeze_gets_its_own_generation() {
     assert_eq!(state.lock_all(), 1);
     state.release_all();
     assert_eq!(state.lock_all(), 2);
+}
+
+fn worker_for(h: &mut Harness) -> SnapshotWorker {
+    SnapshotWorker::new(
+        &h.inner,
+        h.state.clone(),
+        h.receiver.take().expect("receiver taken once"),
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_blocked_write_pushes_the_old_content_to_every_destination() {
+    let mut h = harness(4);
+    let mut worker = worker_for(&mut h);
+    let mut channel = h.device.create_channel().unwrap();
+
+    // Pre-snapshot content is what the snapshot must see.
+    h.inner.write(0, &[0xAA; SECTOR_SIZE], SECTOR_SIZE);
+
+    let first = TestDestination::new(1);
+    let second = TestDestination::new(2);
+    worker.process_request(SnapshotRequest::AddDestination(Box::new(first.clone())));
+    worker.process_request(SnapshotRequest::AddDestination(Box::new(second.clone())));
+    worker.process_request(SnapshotRequest::Freeze);
+
+    // Prod overwrites stripe 0.
+    channel.add_write(0, 1, buffer_of(0xBB, 1), 1);
+    channel.submit().unwrap();
+    assert!(channel.poll().is_empty(), "write waits for the copy-out");
+
+    worker.receive_requests(false);
+
+    assert_eq!(first.offered_stripes(), vec![0]);
+    assert_eq!(second.offered_stripes(), vec![0]);
+    assert_eq!(first.offered.lock().unwrap()[0].1[0], 0xAA);
+
+    // With the old content safe, the write goes through.
+    assert_eq!(channel.poll(), vec![(1, true)]);
+    let mut written = [0u8; SECTOR_SIZE];
+    h.inner.read(0, &mut written, SECTOR_SIZE);
+    assert_eq!(written[0], 0xBB);
+}
+
+#[test]
+fn one_copy_out_is_requested_per_stripe_however_many_writes_wait() {
+    let mut h = harness(4);
+    let mut worker = worker_for(&mut h);
+    let mut channel = h.device.create_channel().unwrap();
+
+    let destination = TestDestination::new(1);
+    worker.process_request(SnapshotRequest::AddDestination(Box::new(
+        destination.clone(),
+    )));
+    worker.process_request(SnapshotRequest::Freeze);
+
+    for id in 1..=3 {
+        channel.add_write(0, 1, buffer_of(0xCC, 1), id);
+    }
+    channel.submit().unwrap();
+    assert!(channel.poll().is_empty());
+
+    worker.receive_requests(false);
+    assert_eq!(
+        destination.offered_stripes(),
+        vec![0],
+        "the stripe is copied out once, not once per write"
+    );
+
+    let mut completed = channel.poll();
+    completed.sort();
+    assert_eq!(completed, vec![(1, true), (2, true), (3, true)]);
+}
+
+#[test]
+fn a_destination_that_fails_is_dropped_and_prod_carries_on() {
+    let mut h = harness(4);
+    let mut worker = worker_for(&mut h);
+    let mut channel = h.device.create_channel().unwrap();
+
+    let healthy = TestDestination::new(1);
+    let broken = TestDestination::new(2);
+    broken.fail_next_offer.store(true, Ordering::SeqCst);
+    worker.process_request(SnapshotRequest::AddDestination(Box::new(healthy.clone())));
+    worker.process_request(SnapshotRequest::AddDestination(Box::new(broken.clone())));
+    worker.process_request(SnapshotRequest::Freeze);
+
+    channel.add_write(0, 1, buffer_of(0xDD, 1), 1);
+    channel.submit().unwrap();
+    worker.receive_requests(false);
+
+    assert_eq!(worker.destination_count(), 1, "the broken one is dropped");
+    assert_eq!(healthy.offered_stripes(), vec![0]);
+    assert_eq!(channel.poll(), vec![(1, true)], "prod is not held up");
+}
+
+#[test]
+fn losing_the_last_destination_ends_the_snapshot() {
+    let mut h = harness(4);
+    let mut worker = worker_for(&mut h);
+    let mut channel = h.device.create_channel().unwrap();
+
+    let destination = TestDestination::new(7);
+    worker.process_request(SnapshotRequest::AddDestination(Box::new(
+        destination.clone(),
+    )));
+    worker.process_request(SnapshotRequest::Freeze);
+    assert_eq!(h.state.stripe_state(3), LOCKED);
+
+    channel.add_write(3 * STRIPE_SECTORS, 1, buffer_of(0xEE, 1), 1);
+    channel.submit().unwrap();
+    assert!(channel.poll().is_empty());
+
+    // The fork disconnected.
+    worker.process_request(SnapshotRequest::RemoveDestination(7));
+
+    assert_eq!(h.state.stripe_state(0), FREE, "every stripe is released");
+    assert_eq!(channel.poll(), vec![(1, true)]);
+}
+
+#[test]
+fn a_dead_destination_is_not_offered_stripes() {
+    let mut h = harness(4);
+    let mut worker = worker_for(&mut h);
+    let mut channel = h.device.create_channel().unwrap();
+
+    let destination = TestDestination::new(1);
+    destination.alive.store(false, Ordering::SeqCst);
+    worker.process_request(SnapshotRequest::AddDestination(Box::new(
+        destination.clone(),
+    )));
+    worker.process_request(SnapshotRequest::Freeze);
+
+    channel.add_write(0, 1, buffer_of(0xFF, 1), 1);
+    channel.submit().unwrap();
+    worker.receive_requests(false);
+
+    assert!(destination.offered_stripes().is_empty());
+    assert_eq!(worker.destination_count(), 0);
+    assert_eq!(channel.poll(), vec![(1, true)]);
+}
+
+#[test]
+fn destinations_are_capped() {
+    let mut h = harness(2);
+    let mut worker = worker_for(&mut h);
+
+    for id in 0..(super::worker::MAX_DESTINATIONS as u64 + 3) {
+        worker.process_request(SnapshotRequest::AddDestination(Box::new(
+            TestDestination::new(id),
+        )));
+    }
+
+    assert_eq!(worker.destination_count(), super::worker::MAX_DESTINATIONS);
+}
+
+#[test]
+fn freeze_through_the_worker_bumps_the_generation() {
+    let mut h = harness(2);
+    let mut worker = worker_for(&mut h);
+    let _ = h.sender.send(SnapshotRequest::Freeze);
+    worker.receive_requests(false);
+    assert_eq!(h.state.generation(), 1);
+    assert_eq!(h.state.stripe_state(0), LOCKED);
 }

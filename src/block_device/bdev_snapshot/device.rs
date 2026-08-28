@@ -1,4 +1,7 @@
-use std::collections::VecDeque;
+use std::{
+    collections::{HashSet, VecDeque},
+    sync::mpsc::Sender,
+};
 
 use log::error;
 
@@ -7,7 +10,10 @@ use crate::{
     Result,
 };
 
-use super::state::{SharedSnapshotState, DRAINING, RUNNING};
+use super::{
+    state::{SharedSnapshotState, DRAINING, LOCKED, RUNNING},
+    worker::SnapshotRequest,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequestType {
@@ -35,13 +41,22 @@ struct QueuedRequest {
 pub struct SnapshotBlockDevice {
     inner: Box<dyn BlockDevice>,
     state: SharedSnapshotState,
+    worker_ch: Sender<SnapshotRequest>,
 }
 
 impl SnapshotBlockDevice {
-    pub fn new(inner: Box<dyn BlockDevice>, stripe_sector_count_shift: u8) -> Self {
+    pub fn new(
+        inner: Box<dyn BlockDevice>,
+        stripe_sector_count_shift: u8,
+        worker_ch: Sender<SnapshotRequest>,
+    ) -> Self {
         let stripe_count = inner.stripe_count(1u64 << stripe_sector_count_shift);
         let state = SharedSnapshotState::new(stripe_count, stripe_sector_count_shift);
-        Self { inner, state }
+        Self {
+            inner,
+            state,
+            worker_ch,
+        }
     }
 
     pub fn state(&self) -> SharedSnapshotState {
@@ -55,6 +70,7 @@ impl BlockDevice for SnapshotBlockDevice {
         Ok(Box::new(SnapshotIoChannel::new(
             self.inner.create_channel()?,
             self.state.clone(),
+            self.worker_ch.clone(),
         )))
     }
 
@@ -66,6 +82,7 @@ impl BlockDevice for SnapshotBlockDevice {
         Box::new(SnapshotBlockDevice {
             inner: self.inner.clone(),
             state: self.state.clone(),
+            worker_ch: self.worker_ch.clone(),
         })
     }
 }
@@ -73,6 +90,10 @@ impl BlockDevice for SnapshotBlockDevice {
 pub struct SnapshotIoChannel {
     inner: Box<dyn IoChannel>,
     state: SharedSnapshotState,
+    worker_ch: Sender<SnapshotRequest>,
+    /// Stripes this channel has already asked the worker to copy out, so a
+    /// burst of writes to one stripe does not queue a request each time.
+    copy_outs_requested: HashSet<usize>,
     queued: VecDeque<QueuedRequest>,
     finished: Vec<(usize, bool)>,
     /// Requests handed to the device below that have not completed yet. The
@@ -82,10 +103,16 @@ pub struct SnapshotIoChannel {
 }
 
 impl SnapshotIoChannel {
-    fn new(inner: Box<dyn IoChannel>, state: SharedSnapshotState) -> Self {
+    fn new(
+        inner: Box<dyn IoChannel>,
+        state: SharedSnapshotState,
+        worker_ch: Sender<SnapshotRequest>,
+    ) -> Self {
         Self {
             inner,
             state,
+            worker_ch,
+            copy_outs_requested: HashSet::new(),
             queued: VecDeque::new(),
             finished: Vec::new(),
             in_flight: 0,
@@ -109,6 +136,23 @@ impl SnapshotIoChannel {
 
     fn queue(&mut self, request: QueuedRequest) {
         self.queued.push_back(request);
+    }
+
+    /// Ask the worker for the pre-write content of every stripe in the range
+    /// that a snapshot still needs.
+    fn request_copy_outs(&mut self, first: usize, last: usize) {
+        for stripe_id in first..=last {
+            if self.state.stripe_state(stripe_id) != LOCKED
+                || self.copy_outs_requested.contains(&stripe_id)
+            {
+                continue;
+            }
+            if let Err(e) = self.worker_ch.send(SnapshotRequest::CopyOut { stripe_id }) {
+                error!("Failed to request copy-out of stripe {stripe_id}: {e}");
+                continue;
+            }
+            self.copy_outs_requested.insert(stripe_id);
+        }
     }
 
     fn pass_through(&mut self, request: &QueuedRequest) {
@@ -146,6 +190,9 @@ impl SnapshotIoChannel {
             }
 
             let request = self.queued.pop_front().expect("front exists");
+            for stripe_id in request.stripe_id_first..=request.stripe_id_last {
+                self.copy_outs_requested.remove(&stripe_id);
+            }
             self.pass_through(&request);
             submit_needed = true;
         }
@@ -196,6 +243,7 @@ impl IoChannel for SnapshotIoChannel {
             stripe_id_first: first,
             stripe_id_last: last,
         });
+        self.request_copy_outs(first, last);
     }
 
     fn add_flush(&mut self, id: usize) {

@@ -63,7 +63,10 @@ pub use bdev_lazy::{
 
 pub use bdev_crypt::CryptBlockDevice;
 pub use bdev_null::NullBlockDevice;
-pub use bdev_snapshot::{SharedSnapshotState, SnapshotBlockDevice};
+pub use bdev_snapshot::{
+    DestinationId, SharedSnapshotState, SnapshotBlockDevice, SnapshotDestination, SnapshotRequest,
+    SnapshotWorker, MAX_DESTINATIONS,
+};
 pub use bdev_sync::SyncBlockDevice;
 pub use bdev_uring::UringBlockDevice;
 pub use wait_for_completion::wait_for_completion;
