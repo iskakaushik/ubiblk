@@ -160,6 +160,26 @@ impl BackendEnv {
             .map(|snapshot| snapshot.state.clone())
     }
 
+    /// Metadata describing this device as a fork should see it.
+    ///
+    /// A fork reads the whole device, not only the stripes prod has written so
+    /// far: a region prod never touched reads as zeros there and must read as
+    /// zeros on the fork too. The device's own metadata only marks what has
+    /// been written, and the server refuses to serve anything else, so the
+    /// served copy marks every stripe as holding data.
+    ///
+    /// This assumes prod owns its content. A prod device that is itself still
+    /// lazily fetching from an upstream source would serve a stripe it has not
+    /// fetched yet; forking such a device needs the server to consult the live
+    /// SharedMetadataState instead of a copy.
+    fn snapshot_metadata(metadata_device: &dyn BlockDevice) -> Result<Box<UbiMetadata>> {
+        let mut metadata = UbiMetadata::load_from_bdev(metadata_device)?;
+        for header in metadata.stripe_headers.iter_mut() {
+            *header |= block_device::metadata_flags::WRITTEN;
+        }
+        Ok(metadata)
+    }
+
     /// Start serving snapshots to forks, and/or subscribing to the device this
     /// one forks, depending on what the config asks for.
     pub fn run_snapshot_services(&mut self) -> Result<()> {
@@ -270,7 +290,7 @@ impl BackendEnv {
             sender: snapshot_sender,
             receiver: Some(snapshot_receiver),
             server_device: snapshot_source.clone(),
-            metadata: Arc::from(UbiMetadata::load_from_bdev(metadata_device.as_ref())?),
+            metadata: Arc::from(Self::snapshot_metadata(metadata_device.as_ref())?),
             source: snapshot_source,
         };
 
