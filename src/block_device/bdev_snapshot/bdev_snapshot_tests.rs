@@ -549,3 +549,37 @@ fn a_write_is_not_held_for_a_stripe_every_fork_already_has() {
         "the second write does not copy the stripe out again"
     );
 }
+
+/// A write that arrives while the freeze is draining is queued before any
+/// stripe is locked, so `add_write` has nothing to ask for. When the layer runs
+/// again that write must still get its stripe copied out — otherwise it waits
+/// for a copy-out nobody will ever request, and every write behind it waits too.
+///
+/// This is the stall that showed up on the VMs under pgbench and never in the
+/// single-write demos: a write in flight at the moment of the freeze.
+#[test]
+fn a_write_queued_during_the_freeze_still_gets_its_copy_out() {
+    let mut h = harness(4);
+    let mut worker = worker_for(&mut h);
+    let mut channel = h.device.create_channel().unwrap();
+
+    let destination = TestDestination::new(1);
+
+    // The freeze starts and a write lands mid-drain.
+    h.state.begin_drain();
+    channel.add_write(0, 1, buffer_of(0x99, 1), 1);
+    channel.submit().unwrap();
+    assert!(channel.poll().is_empty(), "the write is held by the drain");
+
+    // The snapshot is taken and the layer runs again.
+    worker.process_request(SnapshotRequest::Freeze);
+    attach(&mut worker, &h.state, destination.clone());
+    h.state.resume();
+
+    // Replaying asks for the copy-out this write never got to request.
+    assert!(channel.poll().is_empty(), "still waiting on the copy-out");
+    worker.receive_requests(false);
+    assert_eq!(destination.offered_stripes(), vec![0]);
+
+    assert_eq!(channel.poll(), vec![(1, true)], "the write finally lands");
+}

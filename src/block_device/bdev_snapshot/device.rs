@@ -185,6 +185,13 @@ impl SnapshotIoChannel {
             if front.kind == RequestType::Out
                 && !self.write_allowed(front.stripe_id_first, front.stripe_id_last)
             {
+                // Nothing else will ask for this stripe. A write held here was
+                // either queued by a drain, before the freeze locked anything,
+                // or queued behind a write to a different stripe — in neither
+                // case did add_write get to request the copy-out, and the queue
+                // is in order, so this request blocks every one behind it.
+                let (first, last) = (front.stripe_id_first, front.stripe_id_last);
+                self.request_copy_outs(first, last);
                 break;
             }
 
