@@ -191,6 +191,14 @@ impl StripeFetcher {
     }
 
     fn write_pushed_stripe(&mut self, stripe_id: usize, data: &[u8]) {
+        // A pull for this stripe may still be queued: it failed because prod had
+        // already copied the stripe out, and this is that copy. Retrying it
+        // would fail again, and its completion would land on top of this write
+        // and be taken for it, losing the only copy the fork can get.
+        self.fetch_queue.retain(|queued| *queued != stripe_id);
+        self.stripe_fetch_retries.remove(&stripe_id);
+        self.first_failure.remove(&stripe_id);
+
         let Some(buf) = self.buffer_pool.get_buffer() else {
             // Every buffer is busy. Keep the copy: this stripe cannot be pulled
             // any more, so dropping it would lose it for good.
@@ -237,8 +245,6 @@ impl StripeFetcher {
                 continue;
             }
             // The pull failed or was never going to succeed; this is the copy.
-            self.stripe_fetch_retries.remove(&stripe_id);
-            self.fetch_queue.retain(|queued| *queued != stripe_id);
             self.write_pushed_stripe(stripe_id, &data);
         }
     }
@@ -560,6 +566,44 @@ mod tests {
         assert_eq!(
             written, pushed,
             "the pushed copy must reach the disk once the pull is out of the way"
+        );
+    }
+
+    /// A pull that failed because prod had already copied the stripe out is
+    /// left queued for a retry. When the pushed copy then arrives, that retry
+    /// has to go away: it would fail again, and its completion would arrive on
+    /// top of the push's write and be mistaken for it — leaving the stripe with
+    /// no way to ever be filled and failing the guest read for good.
+    #[test]
+    fn a_queued_retry_is_dropped_when_the_pushed_copy_arrives() {
+        let mut state = prep(false);
+        state.fetcher.set_expects_pushes(true);
+        let pushed = vec![0x5C; (state.fetcher.stripe_sector_count as usize) * SECTOR_SIZE];
+
+        state
+            .source_dev
+            .fail_next
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        state.fetcher.handle_fetch_request(0);
+        state.fetcher.update();
+
+        state.fetcher.accept_pushed_stripe(0, &pushed);
+        for _ in 0..10 {
+            state.fetcher.update();
+        }
+
+        assert_eq!(
+            state.source_dev.metrics.read().unwrap().reads,
+            0,
+            "the queued retry must not reach the source once the push has arrived"
+        );
+        let mut written = vec![0u8; pushed.len()];
+        state.target_dev.read(0, &mut written, pushed.len());
+        assert_eq!(written, pushed, "the pushed copy must reach the disk");
+        assert_eq!(
+            state.fetcher.take_finished_fetches(),
+            vec![(0, true)],
+            "and the stripe must end up fetched"
         );
     }
 
