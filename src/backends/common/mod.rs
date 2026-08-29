@@ -147,7 +147,6 @@ impl BackendEnv {
     pub fn snapshot_control(&self) -> Option<rpc::SnapshotControl> {
         self.snapshot.as_ref().map(|snapshot| rpc::SnapshotControl {
             state: snapshot.state.clone(),
-            sender: snapshot.sender.clone(),
         })
     }
 

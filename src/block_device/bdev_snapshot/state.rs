@@ -1,7 +1,17 @@
-use std::sync::{
-    atomic::{AtomicU64, AtomicU8, Ordering},
-    Arc, Mutex,
+use std::{
+    sync::{
+        atomic::{AtomicU64, AtomicU8, Ordering},
+        Arc, Mutex,
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// Per-stripe snapshot state.
 ///
@@ -87,8 +97,15 @@ pub struct SharedSnapshotState {
     /// created, which happens at startup; the I/O path only ever touches its
     /// own slot's atomics.
     channels: Arc<Mutex<Vec<Arc<ChannelSlot>>>>,
-    /// Bumped on every freeze so a destination can tell snapshots apart.
+    /// Bumped on every freeze so a destination can tell snapshots apart. Never
+    /// reset: a fork holding generation 3 must not be confused by a later,
+    /// different snapshot also calling itself 3.
     generation: Arc<AtomicU64>,
+    /// When the current snapshot was frozen, as milliseconds since the unix
+    /// epoch, or 0 when none is live. Kept here rather than in the worker so a
+    /// freeze does not have to wait for the worker to get to it — the worker can
+    /// be inside a slow push to a fork that has gone away.
+    frozen_at_ms: Arc<AtomicU64>,
     /// Destinations the worker currently serves. Published here so the RPC can
     /// report it and a subscriber can tell when it has been registered.
     destinations: Arc<AtomicU64>,
@@ -107,6 +124,7 @@ impl SharedSnapshotState {
             channels: Arc::new(Mutex::new(Vec::new())),
             generation: Arc::new(AtomicU64::new(0)),
             destinations: Arc::new(AtomicU64::new(0)),
+            frozen_at_ms: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -170,7 +188,14 @@ impl SharedSnapshotState {
     /// rather than being served a half-preserved one.
     pub fn end_snapshot(&self) {
         self.release_all();
-        self.generation.store(0, Ordering::Release);
+        // Liveness is the timestamp, not the counter, so generations stay
+        // monotonic across snapshots that come and go.
+        self.frozen_at_ms.store(0, Ordering::Release);
+    }
+
+    /// Whether a snapshot is currently being held.
+    pub fn snapshot_live(&self) -> bool {
+        self.frozen_at_ms.load(Ordering::Acquire) != 0
     }
 
     /// Mark every stripe as needed by a snapshot and return the new generation.
@@ -178,7 +203,17 @@ impl SharedSnapshotState {
         for state in self.stripe_states.iter() {
             state.store(LOCKED, Ordering::Release);
         }
+        self.frozen_at_ms.store(now_ms(), Ordering::Release);
         self.generation.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// How long ago the current snapshot was frozen, if there is one.
+    pub fn since_frozen(&self) -> Option<Duration> {
+        let frozen_at = self.frozen_at_ms.load(Ordering::Acquire);
+        if frozen_at == 0 {
+            return None;
+        }
+        Some(Duration::from_millis(now_ms().saturating_sub(frozen_at)))
     }
 
     pub fn set_destination_count(&self, count: usize) {

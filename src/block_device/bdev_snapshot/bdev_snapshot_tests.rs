@@ -316,11 +316,15 @@ fn losing_the_last_destination_ends_the_snapshot() {
     worker.process_request(SnapshotRequest::RemoveDestination(7));
 
     assert_eq!(h.state.stripe_state(0), FREE, "every stripe is released");
-    assert_eq!(
-        h.state.generation(),
-        0,
+    assert!(
+        !h.state.snapshot_live(),
         "the snapshot is over, not just unlocked: a fork that is still attached \
          must be told rather than served post-snapshot content"
+    );
+    assert_eq!(
+        h.state.generation(),
+        1,
+        "generations stay monotonic so a later snapshot cannot reuse this id"
     );
     assert_eq!(channel.poll(), vec![(1, true)]);
 }
@@ -460,7 +464,7 @@ fn a_snapshot_nobody_subscribes_to_is_given_up() {
     // served half-preserved to a fork that turns up later.
     worker.expire_grace_if_needed();
 
-    assert_eq!(h.state.generation(), 0, "the snapshot is gone");
+    assert!(!h.state.snapshot_live(), "the snapshot is gone");
     assert_eq!(h.state.stripe_state(0), FREE);
     assert!(worker.deferred_stripes().is_empty());
     assert_eq!(

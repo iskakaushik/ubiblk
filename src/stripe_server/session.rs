@@ -95,11 +95,11 @@ impl StripeServerSession {
             return self.reply_status(STATUS_NO_SNAPSHOT);
         };
 
-        let generation = snapshot_state.generation();
-        if generation == 0 {
-            info!("Snapshot subscribe refused: no snapshot has been taken");
+        if !snapshot_state.snapshot_live() {
+            info!("Snapshot subscribe refused: no snapshot is live");
             return self.reply_status(STATUS_NO_SNAPSHOT);
         }
+        let generation = snapshot_state.generation();
 
         self.stream_mut().write_all(&[STATUS_OK])?;
         self.stream_mut().write_all(&generation.to_le_bytes())?;
@@ -200,7 +200,7 @@ impl StripeServerSession {
         // live device until its copy-out runs: after that prod's new content is
         // on disk and the snapshot's version exists only in what was pushed.
         if let Some(state) = self.snapshot_state.as_ref() {
-            if state.generation() > 0 && !state.write_allowed_before_copy(stripe_id as usize) {
+            if state.snapshot_live() && !state.write_allowed_before_copy(stripe_id as usize) {
                 info!("Stripe {stripe_id} was already pushed to subscribers");
                 return self.reply_status(STATUS_ALREADY_PUSHED);
             }

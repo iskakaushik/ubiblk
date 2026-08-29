@@ -1,6 +1,6 @@
 use std::{
     sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use log::{debug, error, info, warn};
@@ -55,7 +55,6 @@ pub struct SnapshotWorker {
     /// Stripes whose copy-out is waiting for the first subscriber. The writes
     /// that triggered them are blocked until then.
     deferred: Vec<usize>,
-    frozen_at: Option<Instant>,
     subscriber_grace: Duration,
     done: bool,
 }
@@ -73,7 +72,6 @@ impl SnapshotWorker {
             requests,
             next_request_id: 0,
             deferred: Vec::new(),
-            frozen_at: None,
             subscriber_grace: SUBSCRIBER_GRACE,
             done: false,
         })
@@ -121,10 +119,10 @@ impl SnapshotWorker {
         if self.deferred.is_empty() || !self.destinations.is_empty() {
             return;
         }
-        let Some(frozen_at) = self.frozen_at else {
+        let Some(since_frozen) = self.state.since_frozen() else {
             return;
         };
-        if frozen_at.elapsed() < self.subscriber_grace {
+        if since_frozen < self.subscriber_grace {
             return;
         }
 
@@ -150,7 +148,7 @@ impl SnapshotWorker {
     /// With no destination left there is nothing to protect, so every stripe
     /// goes back to Free and prod stops paying for the snapshot.
     fn end_snapshot_if_unwatched(&mut self) {
-        if self.destinations.is_empty() && self.state.generation() > 0 {
+        if self.destinations.is_empty() && self.state.snapshot_live() {
             // End it properly rather than only releasing the stripes: with the
             // generation still set, the server would keep answering pulls from
             // the live device, and a fork still attached would silently read
@@ -214,10 +212,11 @@ impl SnapshotWorker {
         }
 
         if self.destinations.is_empty() {
-            if self.state.generation() > 0
+            if self.state.snapshot_live()
                 && self
-                    .frozen_at
-                    .is_some_and(|frozen_at| frozen_at.elapsed() < self.subscriber_grace)
+                    .state
+                    .since_frozen()
+                    .is_some_and(|since_frozen| since_frozen < self.subscriber_grace)
             {
                 // The fork is still coming up. Put the stripe back and leave the
                 // write waiting rather than losing the snapshot's copy of it.
@@ -280,7 +279,6 @@ impl SnapshotWorker {
             SnapshotRequest::RemoveDestination(id) => self.remove_destination(id),
             SnapshotRequest::Freeze => {
                 let generation = self.state.lock_all();
-                self.frozen_at = Some(Instant::now());
                 info!("Snapshot generation {generation} frozen");
                 self.sweep_for_exporters();
             }
