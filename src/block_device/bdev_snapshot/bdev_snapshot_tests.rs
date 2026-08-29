@@ -201,6 +201,14 @@ fn each_freeze_gets_its_own_generation() {
     assert_eq!(state.lock_all(), 2);
 }
 
+/// Attach a destination to the snapshot that is live right now.
+fn attach(worker: &mut SnapshotWorker, state: &SharedSnapshotState, destination: TestDestination) {
+    worker.process_request(SnapshotRequest::AddDestination {
+        destination: Box::new(destination),
+        generation: state.generation(),
+    });
+}
+
 fn worker_for(h: &mut Harness) -> SnapshotWorker {
     SnapshotWorker::new(
         &h.inner,
@@ -221,8 +229,8 @@ fn a_blocked_write_pushes_the_old_content_to_every_destination() {
 
     let first = TestDestination::new(1);
     let second = TestDestination::new(2);
-    worker.process_request(SnapshotRequest::AddDestination(Box::new(first.clone())));
-    worker.process_request(SnapshotRequest::AddDestination(Box::new(second.clone())));
+    attach(&mut worker, &h.state, first.clone());
+    attach(&mut worker, &h.state, second.clone());
     worker.process_request(SnapshotRequest::Freeze);
 
     // Prod overwrites stripe 0.
@@ -250,9 +258,7 @@ fn one_copy_out_is_requested_per_stripe_however_many_writes_wait() {
     let mut channel = h.device.create_channel().unwrap();
 
     let destination = TestDestination::new(1);
-    worker.process_request(SnapshotRequest::AddDestination(Box::new(
-        destination.clone(),
-    )));
+    attach(&mut worker, &h.state, destination.clone());
     worker.process_request(SnapshotRequest::Freeze);
 
     for id in 1..=3 {
@@ -282,8 +288,8 @@ fn a_destination_that_fails_is_dropped_and_prod_carries_on() {
     let healthy = TestDestination::new(1);
     let broken = TestDestination::new(2);
     broken.fail_next_offer.store(true, Ordering::SeqCst);
-    worker.process_request(SnapshotRequest::AddDestination(Box::new(healthy.clone())));
-    worker.process_request(SnapshotRequest::AddDestination(Box::new(broken.clone())));
+    attach(&mut worker, &h.state, healthy.clone());
+    attach(&mut worker, &h.state, broken.clone());
     worker.process_request(SnapshotRequest::Freeze);
 
     channel.add_write(0, 1, buffer_of(0xDD, 1), 1);
@@ -302,9 +308,7 @@ fn losing_the_last_destination_ends_the_snapshot() {
     let mut channel = h.device.create_channel().unwrap();
 
     let destination = TestDestination::new(7);
-    worker.process_request(SnapshotRequest::AddDestination(Box::new(
-        destination.clone(),
-    )));
+    attach(&mut worker, &h.state, destination.clone());
     worker.process_request(SnapshotRequest::Freeze);
     assert_eq!(h.state.stripe_state(3), LOCKED);
 
@@ -337,9 +341,7 @@ fn a_dead_destination_is_not_offered_stripes() {
 
     let destination = TestDestination::new(1);
     destination.alive.store(false, Ordering::SeqCst);
-    worker.process_request(SnapshotRequest::AddDestination(Box::new(
-        destination.clone(),
-    )));
+    attach(&mut worker, &h.state, destination.clone());
     worker.process_request(SnapshotRequest::Freeze);
 
     channel.add_write(0, 1, buffer_of(0xFF, 1), 1);
@@ -357,9 +359,7 @@ fn destinations_are_capped() {
     let mut worker = worker_for(&mut h);
 
     for id in 0..(super::worker::MAX_DESTINATIONS as u64 + 3) {
-        worker.process_request(SnapshotRequest::AddDestination(Box::new(
-            TestDestination::new(id),
-        )));
+        attach(&mut worker, &h.state, TestDestination::new(id));
     }
 
     assert_eq!(worker.destination_count(), super::worker::MAX_DESTINATIONS);
@@ -439,9 +439,7 @@ fn a_write_waits_for_a_fork_that_has_not_subscribed_yet() {
 
     // The fork arrives: the deferred copy-out runs and the write goes through.
     let destination = TestDestination::new(1);
-    worker.process_request(SnapshotRequest::AddDestination(Box::new(
-        destination.clone(),
-    )));
+    attach(&mut worker, &h.state, destination.clone());
 
     assert_eq!(destination.offered_stripes(), vec![0]);
     assert_eq!(h.state.stripe_state(0), COPIED);
@@ -471,5 +469,83 @@ fn a_snapshot_nobody_subscribes_to_is_given_up() {
         channel.poll(),
         vec![(1, true)],
         "prod is not held any longer"
+    );
+}
+
+/// Two forks taken at different moments, both catching up at the same time.
+///
+/// This is the case a single "has this stripe been copied out?" flag cannot
+/// express: after the first fork has been given a stripe, prod moves on, and the
+/// second fork must get the *newer* content while the first keeps the older one.
+#[test]
+fn forks_taken_at_different_moments_each_see_their_own_snapshot() {
+    let mut h = harness(4);
+    let mut worker = worker_for(&mut h);
+    let mut channel = h.device.create_channel().unwrap();
+
+    // v1 is on the disk when the first fork is taken.
+    h.inner.write(0, &[0x11; SECTOR_SIZE], SECTOR_SIZE);
+
+    let early = TestDestination::new(1);
+    worker.process_request(SnapshotRequest::Freeze);
+    attach(&mut worker, &h.state, early.clone());
+
+    // Prod overwrites the stripe: the early fork is handed v1.
+    channel.add_write(0, 1, buffer_of(0x22, 1), 1);
+    channel.submit().unwrap();
+    worker.receive_requests(false);
+    assert_eq!(channel.poll(), vec![(1, true)]);
+    assert_eq!(early.offered_stripes(), vec![0]);
+    assert_eq!(early.offered.lock().unwrap()[0].1[0], 0x11);
+
+    // A second fork is taken now, when the disk holds v2.
+    let late = TestDestination::new(2);
+    worker.process_request(SnapshotRequest::Freeze);
+    attach(&mut worker, &h.state, late.clone());
+    assert_eq!(worker.destination_count(), 2, "both forks are served");
+
+    // Prod overwrites again. The late fork needs v2; the early fork must not be
+    // handed it, because v2 is not what its snapshot held.
+    channel.add_write(0, 1, buffer_of(0x33, 1), 2);
+    channel.submit().unwrap();
+    worker.receive_requests(false);
+    assert_eq!(channel.poll(), vec![(2, true)]);
+
+    assert_eq!(late.offered_stripes(), vec![0]);
+    assert_eq!(
+        late.offered.lock().unwrap()[0].1[0],
+        0x22,
+        "the later fork sees the content as of its own snapshot"
+    );
+    assert_eq!(
+        early.offered_stripes(),
+        vec![0],
+        "the earlier fork is not handed the stripe a second time"
+    );
+    assert_eq!(early.offered.lock().unwrap()[0].1[0], 0x11);
+}
+
+/// A stripe nobody still needs does not hold a write up.
+#[test]
+fn a_write_is_not_held_for_a_stripe_every_fork_already_has() {
+    let mut h = harness(4);
+    let mut worker = worker_for(&mut h);
+    let mut channel = h.device.create_channel().unwrap();
+
+    let destination = TestDestination::new(1);
+    worker.process_request(SnapshotRequest::Freeze);
+    attach(&mut worker, &h.state, destination.clone());
+
+    for id in 1..=2 {
+        channel.add_write(0, 1, buffer_of(0x44, 1), id);
+        channel.submit().unwrap();
+        worker.receive_requests(false);
+        assert_eq!(channel.poll(), vec![(id, true)]);
+    }
+
+    assert_eq!(
+        destination.offered_stripes(),
+        vec![0],
+        "the second write does not copy the stripe out again"
     );
 }

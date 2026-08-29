@@ -35,7 +35,13 @@ pub enum SnapshotRequest {
     CopyOut {
         stripe_id: usize,
     },
-    AddDestination(Box<dyn SnapshotDestination>),
+    /// A fork attaching to the snapshot it was told about. The generation says
+    /// which snapshot it is reading, so two forks taken at different moments
+    /// can be served at the same time.
+    AddDestination {
+        destination: Box<dyn SnapshotDestination>,
+        generation: u64,
+    },
     RemoveDestination(DestinationId),
     /// Freeze: lock every stripe and start serving the snapshot.
     Freeze,
@@ -46,10 +52,29 @@ pub enum SnapshotRequest {
 ///
 /// It runs on its own thread so a slow or wedged destination costs the I/O
 /// path nothing beyond the stripes it is actually holding.
+/// A fork attached to a snapshot, and what it still has to be given.
+///
+/// Forks overlap: one taken at generation 3 and another at generation 5 can be
+/// catching up at the same time. They are tracked separately because the live
+/// device only holds a stripe's content until the first copy-out — after that
+/// the older fork has its copy and must not be handed the newer content.
+struct Subscriber {
+    destination: Box<dyn SnapshotDestination>,
+    generation: u64,
+    /// Stripes this fork has not been given yet.
+    needs: Vec<bool>,
+}
+
+impl Subscriber {
+    fn needs(&self, stripe_id: usize) -> bool {
+        self.needs.get(stripe_id).copied().unwrap_or(false)
+    }
+}
+
 pub struct SnapshotWorker {
     read_channel: Box<dyn IoChannel>,
     state: SharedSnapshotState,
-    destinations: Vec<Box<dyn SnapshotDestination>>,
+    destinations: Vec<Subscriber>,
     requests: Receiver<SnapshotRequest>,
     next_request_id: usize,
     /// Stripes whose copy-out is waiting for the first subscriber. The writes
@@ -91,7 +116,7 @@ impl SnapshotWorker {
         &self.deferred
     }
 
-    fn add_destination(&mut self, destination: Box<dyn SnapshotDestination>) {
+    fn add_destination(&mut self, destination: Box<dyn SnapshotDestination>, generation: u64) {
         if self.destinations.len() >= MAX_DESTINATIONS {
             warn!(
                 "Refusing snapshot destination {}: already serving {} destinations",
@@ -100,10 +125,28 @@ impl SnapshotWorker {
             );
             return;
         }
-        info!("Snapshot destination {} added", destination.id());
-        self.destinations.push(destination);
+        info!(
+            "Snapshot destination {} added for generation {generation}",
+            destination.id()
+        );
+        // It has none of the snapshot yet, so it needs every stripe. What it can
+        // read straight from prod it will pull; the rest arrives by push.
+        self.destinations.push(Subscriber {
+            destination,
+            generation,
+            needs: vec![true; self.state.stripe_count()],
+        });
         self.publish_destination_count();
         self.run_deferred_copy_outs();
+    }
+
+    /// True once the newest snapshot has a fork attached. Until then a copy-out
+    /// has nowhere to send that snapshot's content, so writes wait.
+    fn latest_generation_subscribed(&self) -> bool {
+        let latest = self.state.generation();
+        self.destinations
+            .iter()
+            .any(|subscriber| subscriber.generation == latest)
     }
 
     /// Copy out the stripes that were waiting for someone to send them to.
@@ -140,7 +183,8 @@ impl SnapshotWorker {
     }
 
     fn remove_destination(&mut self, id: DestinationId) {
-        self.destinations.retain(|d| d.id() != id);
+        self.destinations
+            .retain(|subscriber| subscriber.destination.id() != id);
         self.publish_destination_count();
         self.end_snapshot_if_unwatched();
     }
@@ -166,7 +210,11 @@ impl SnapshotWorker {
     /// interleaves with the copy-outs that prod writes are waiting on rather
     /// than blocking them behind a full pass over the device.
     fn sweep_for_exporters(&mut self) {
-        if !self.destinations.iter().any(|d| d.wants_all_stripes()) {
+        if !self
+            .destinations
+            .iter()
+            .any(|subscriber| subscriber.destination.wants_all_stripes())
+        {
             return;
         }
 
@@ -179,8 +227,8 @@ impl SnapshotWorker {
             self.copy_out(stripe_id);
         }
 
-        for destination in self.destinations.iter_mut() {
-            destination.finish();
+        for subscriber in self.destinations.iter_mut() {
+            subscriber.destination.finish();
         }
     }
 
@@ -204,34 +252,66 @@ impl SnapshotWorker {
     /// Read the pre-write content of a stripe and hand it to every live
     /// destination. Destinations that fail are dropped, never retried: prod
     /// writes are waiting on this.
+    /// Forget forks that have gone away. Done before every copy-out so a dead
+    /// fork is dropped even when it is not the one holding a stripe up.
+    fn prune_dead_destinations(&mut self) {
+        let before = self.destinations.len();
+        self.destinations
+            .retain(|subscriber| subscriber.destination.is_alive());
+        if self.destinations.len() != before {
+            info!(
+                "Dropped {} snapshot destination(s) that went away",
+                before - self.destinations.len()
+            );
+            self.publish_destination_count();
+            self.end_snapshot_if_unwatched();
+        }
+    }
+
     fn copy_out(&mut self, stripe_id: usize) {
+        self.prune_dead_destinations();
+
         if !self.state.begin_copy(stripe_id) {
             // Someone else already copied this stripe out, or it was never
             // locked in the first place.
             return;
         }
 
-        if self.destinations.is_empty() {
+        // Only the forks that have not been given this stripe get it. A fork
+        // taken before the last write already holds its own version.
+        let waiting: Vec<usize> = self
+            .destinations
+            .iter()
+            .enumerate()
+            .filter(|(_, subscriber)| subscriber.needs(stripe_id))
+            .map(|(index, _)| index)
+            .collect();
+
+        if waiting.is_empty() {
             if self.state.snapshot_live()
+                && !self.latest_generation_subscribed()
                 && self
                     .state
                     .since_frozen()
                     .is_some_and(|since_frozen| since_frozen < self.subscriber_grace)
             {
-                // The fork is still coming up. Put the stripe back and leave the
-                // write waiting rather than losing the snapshot's copy of it.
+                // The newest fork is still coming up. Put the stripe back and
+                // leave the write waiting rather than losing the only copy.
                 debug!("Deferring copy-out of stripe {stripe_id} until a fork subscribes");
                 self.state.defer_copy(stripe_id);
                 self.deferred.push(stripe_id);
                 return;
             }
 
-            // Nobody is listening and nobody is coming: this stripe's content is
-            // about to be overwritten with no copy anywhere. Serving the rest of
-            // the snapshot after that would hand a fork a torn image, so end it.
-            warn!("Copy-out of stripe {stripe_id} with no destinations; ending the snapshot");
+            if self.state.snapshot_live() && !self.latest_generation_subscribed() {
+                warn!("Snapshot has no subscriber and the grace period is over; ending it");
+                self.state.finish_copy(stripe_id);
+                self.state.end_snapshot();
+                return;
+            }
+
+            // Everyone who needs this stripe already has it.
             self.state.finish_copy(stripe_id);
-            self.state.end_snapshot();
             return;
         }
 
@@ -248,23 +328,23 @@ impl SnapshotWorker {
         };
 
         let mut failed = Vec::new();
-        for destination in self.destinations.iter_mut() {
-            if !destination.is_alive() {
-                failed.push(destination.id());
-                continue;
-            }
-            if let Err(e) = destination.offer(stripe_id, &data) {
+        for index in waiting {
+            let subscriber = &mut self.destinations[index];
+            if let Err(e) = subscriber.destination.offer(stripe_id, &data) {
                 warn!(
                     "Snapshot destination {} failed on stripe {stripe_id}: {e}",
-                    destination.id()
+                    subscriber.destination.id()
                 );
-                failed.push(destination.id());
+                failed.push(subscriber.destination.id());
+                continue;
             }
+            subscriber.needs[stripe_id] = false;
         }
 
         for id in failed {
             info!("Dropping snapshot destination {id}");
-            self.destinations.retain(|d| d.id() != id);
+            self.destinations
+                .retain(|subscriber| subscriber.destination.id() != id);
         }
         self.publish_destination_count();
 
@@ -275,7 +355,10 @@ impl SnapshotWorker {
     pub fn process_request(&mut self, request: SnapshotRequest) {
         match request {
             SnapshotRequest::CopyOut { stripe_id } => self.copy_out(stripe_id),
-            SnapshotRequest::AddDestination(destination) => self.add_destination(destination),
+            SnapshotRequest::AddDestination {
+                destination,
+                generation,
+            } => self.add_destination(destination, generation),
             SnapshotRequest::RemoveDestination(id) => self.remove_destination(id),
             SnapshotRequest::Freeze => {
                 let generation = self.state.lock_all();

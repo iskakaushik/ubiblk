@@ -112,7 +112,10 @@ impl StripeServerSession {
         let destination = RemoteDestination::new(id, stream);
 
         if snapshot_ch
-            .send(SnapshotRequest::AddDestination(Box::new(destination)))
+            .send(SnapshotRequest::AddDestination {
+                destination: Box::new(destination),
+                generation,
+            })
             .is_err()
         {
             error!("Snapshot worker is gone, dropping subscriber {id}");
