@@ -93,6 +93,10 @@ impl SnapshotDestination for RemoteDestination {
     fn is_alive(&self) -> bool {
         self.alive.load(Ordering::SeqCst)
     }
+
+    fn finish(&mut self) {
+        self.send_end();
+    }
 }
 
 /// What a subscribed fork reads off its push session.

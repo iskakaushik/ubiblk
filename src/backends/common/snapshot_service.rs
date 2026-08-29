@@ -27,6 +27,15 @@ use crate::{
 /// How long to wait before reconnecting a dropped subscription.
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 
+/// How long a push may take to reach a fork before that fork is considered gone.
+///
+/// Without this a fork whose VM disappears leaves a half-open socket: writes to
+/// it block until TCP gives up, minutes later, and the snapshot worker is stuck
+/// in that write. Everything else then waits on the worker — the copy-out never
+/// finishes, so prod's write stays blocked, and a new fork's subscription is not
+/// even processed. A fork must never be able to do that to prod.
+const PUSH_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Serve snapshots of this device to forks.
 pub fn spawn_snapshot_server(
     address: &str,
@@ -61,6 +70,11 @@ pub fn spawn_snapshot_server(
                         continue;
                     }
                 };
+
+                if let Err(e) = stream.set_write_timeout(Some(PUSH_WRITE_TIMEOUT)) {
+                    error!("Failed to set the push write timeout: {e}");
+                    continue;
+                }
 
                 let server = server.clone();
                 // One thread per fork. A session that subscribes hands its
