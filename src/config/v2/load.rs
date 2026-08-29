@@ -561,8 +561,13 @@ allow_env_secrets = true
         use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = std::env::temp_dir().join("ubiblk-test-perms");
-        let _ = std::fs::create_dir_all(&dir);
+        // A fresh directory whose mode this test sets itself: umask is
+        // process-wide, so a umask test running alongside this one decides what
+        // a directory created here would otherwise be — and a directory left
+        // without its execute bit fails every later run of this suite.
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
 
         // File with 0644 should be detected as loose
         let loose_path = dir.join("loose.toml");
@@ -589,8 +594,6 @@ allow_env_secrets = true
         // load_root_toml should succeed (warning only, not error) even with loose perms
         let result = load_root_toml(&loose_path, "test");
         assert!(result.is_ok(), "loose permissions should warn, not error");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
