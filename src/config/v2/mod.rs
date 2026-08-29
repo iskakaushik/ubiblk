@@ -12,6 +12,7 @@ use crate::config::v2::{
     secrets::SecretRef,
     stripe_source::{ArchiveStorageConfig, RemoteStripeConfig},
 };
+use crate::stripe_server::WireCompression;
 
 pub const MAX_NUM_QUEUES: usize = 63;
 
@@ -137,6 +138,14 @@ pub struct DeviceSection {
     /// backend subscribes to that device's snapshot and takes the stripes it
     /// pushes.
     pub snapshot_source: Option<String>,
+    /// How the source should compress the stripes it pushes. Falls back to
+    /// uncompressed against a source that cannot do it.
+    #[serde(default = "default_snapshot_compression")]
+    pub snapshot_compression: WireCompression,
+}
+
+fn default_snapshot_compression() -> WireCompression {
+    WireCompression::Zstd
 }
 
 fn default_device_id() -> String {

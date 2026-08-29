@@ -20,21 +20,23 @@ use crate::{
     Result,
 };
 
-use super::{DynStream, PUSH_STRIPE_FRAME, SNAPSHOT_END_FRAME};
+use super::{DynStream, WireCompression, PUSH_STRIPE_FRAME, SNAPSHOT_END_FRAME};
 
 /// Server side: a fork that subscribed, seen as a snapshot destination.
 pub struct RemoteDestination {
     id: DestinationId,
     stream: DynStream,
     alive: Arc<AtomicBool>,
+    compression: WireCompression,
 }
 
 impl RemoteDestination {
-    pub fn new(id: DestinationId, stream: DynStream) -> Self {
+    pub fn new(id: DestinationId, stream: DynStream, compression: WireCompression) -> Self {
         Self {
             id,
             stream,
             alive: Arc::new(AtomicBool::new(true)),
+            compression,
         }
     }
 
@@ -70,11 +72,18 @@ impl SnapshotDestination for RemoteDestination {
     fn offer(&mut self, stripe_id: usize, data: &[u8]) -> Result<()> {
         use std::io::Write;
 
+        let payload = self.compression.compress(data).inspect_err(|_| {
+            // Nothing else can send this stripe, so a destination that cannot
+            // be encoded for is a destination that is over.
+            self.mark_dead();
+        })?;
+
         let result = (|| -> std::io::Result<()> {
             self.stream.write_all(&[PUSH_STRIPE_FRAME])?;
             self.stream.write_all(&(stripe_id as u64).to_le_bytes())?;
-            self.stream.write_all(&(data.len() as u64).to_le_bytes())?;
-            self.stream.write_all(data)?;
+            self.stream
+                .write_all(&(payload.len() as u64).to_le_bytes())?;
+            self.stream.write_all(&payload)?;
             self.stream.flush()
         })();
 
@@ -112,13 +121,18 @@ pub enum PushedFrame {
 pub struct SnapshotSubscriber {
     stream: DynStream,
     generation: u64,
+    compression: WireCompression,
 }
 
 impl SnapshotSubscriber {
     /// Send the subscribe command and read the acknowledgement. The caller
     /// supplies a stream that has already been connected (and PSK-wrapped, if
     /// the deployment uses one), exactly like the pull client.
-    pub fn subscribe(mut stream: DynStream) -> Result<Self> {
+    pub fn subscribe(stream: DynStream, compression: WireCompression) -> Result<Self> {
+        Self::subscribe_inner(stream, compression)
+    }
+
+    fn subscribe_inner(mut stream: DynStream, wanted: WireCompression) -> Result<Self> {
         use std::io::{Read, Write};
 
         stream.write_all(&[super::SUBSCRIBE_SNAPSHOT_CMD])?;
@@ -139,7 +153,19 @@ impl SnapshotSubscriber {
         stream.read_exact(&mut generation_bytes)?;
         let generation = u64::from_le_bytes(generation_bytes);
 
-        Ok(Self { stream, generation })
+        // Prod encodes the pushes; this fork decodes them. Same negotiation as
+        // the pull session, since the same two sides have to agree.
+        let mut server_mask = [0u8; 1];
+        stream.read_exact(&mut server_mask)?;
+        let compression = wanted.best_of(server_mask[0]);
+        stream.write_all(&[compression.code()])?;
+        stream.flush()?;
+
+        Ok(Self {
+            stream,
+            generation,
+            compression,
+        })
     }
 
     /// The snapshot generation this subscription is attached to. A fork that
@@ -169,12 +195,12 @@ impl SnapshotSubscriber {
                 self.stream.read_exact(&mut len_bytes)?;
 
                 let len = u64::from_le_bytes(len_bytes) as usize;
-                let mut data = vec![0u8; len];
-                self.stream.read_exact(&mut data)?;
+                let mut payload = vec![0u8; len];
+                self.stream.read_exact(&mut payload)?;
 
                 Ok(Some(PushedFrame::Stripe {
                     stripe_id: u64::from_le_bytes(stripe_id_bytes),
-                    data,
+                    data: self.compression.decompress(payload)?,
                 }))
             }
             SNAPSHOT_END_FRAME => Ok(Some(PushedFrame::End)),
@@ -197,8 +223,14 @@ mod tests {
 
     #[test]
     fn pushed_stripes_arrive_in_order() {
+        for compression in [WireCompression::None, WireCompression::Zstd] {
+            pushed_stripes_arrive_in_order_with(compression);
+        }
+    }
+
+    fn pushed_stripes_arrive_in_order_with(compression: WireCompression) {
         let (server, client) = pair();
-        let mut destination = RemoteDestination::new(1, server);
+        let mut destination = RemoteDestination::new(1, server, compression);
 
         destination.offer(7, &[0xAA; 16]).unwrap();
         destination.offer(9, &[0xBB; 16]).unwrap();
@@ -207,6 +239,7 @@ mod tests {
         let mut subscriber = SnapshotSubscriber {
             stream: client,
             generation: 1,
+            compression,
         };
 
         assert_eq!(
@@ -229,7 +262,7 @@ mod tests {
     #[test]
     fn a_hung_up_fork_kills_the_destination_instead_of_blocking() {
         let (server, client) = pair();
-        let mut destination = RemoteDestination::new(2, server);
+        let mut destination = RemoteDestination::new(2, server, WireCompression::None);
         drop(client);
 
         // The first offer may or may not fail depending on socket buffering,
@@ -254,6 +287,7 @@ mod tests {
         let mut subscriber = SnapshotSubscriber {
             stream: client,
             generation: 3,
+            compression: WireCompression::None,
         };
         assert_eq!(subscriber.next_frame().unwrap(), None);
     }
@@ -270,6 +304,7 @@ mod tests {
         let mut subscriber = SnapshotSubscriber {
             stream: client,
             generation: 1,
+            compression: WireCompression::None,
         };
         assert!(subscriber.next_frame().is_err());
     }

@@ -13,12 +13,25 @@ use super::*;
 
 const MAX_REMOTE_METADATA_SIZE: usize = 64 * 1024 * 1024;
 
+/// A compressed stripe should be smaller than the stripe, and is at worst a
+/// little larger. Anything past this is a server talking nonsense, and the
+/// client is about to allocate whatever it is told.
+const MAX_STRIPE_PAYLOAD_FACTOR: usize = 2;
+
 impl StripeServerClient {
     pub fn new(stream: DynStream) -> Self {
         Self {
             stream,
             metadata: None,
+            compression: WireCompression::default(),
         }
+    }
+
+    /// Ask the server to compress stripes with this algorithm, if it can. The
+    /// hello handshake settles what is actually used.
+    pub fn wanting(mut self, compression: WireCompression) -> Self {
+        self.compression = compression;
+        self
     }
 
     /// Ask the server for its metadata, which `fetch_stripe` needs in order to
@@ -76,7 +89,7 @@ impl StripeServerClient {
     }
 
     #[error_context("Failed to complete hello handshake with stripe server")]
-    fn hello(&mut self) -> Result<()> {
+    pub fn hello(&mut self) -> Result<()> {
         info!("Performing hello handshake with server");
 
         // Send hello opcode
@@ -109,6 +122,22 @@ impl StripeServerClient {
                 ),
             }));
         }
+
+        // The server encodes stripes; this client decodes them. It offers what
+        // it can encode and the client picks, so the choice stays with the side
+        // that was configured.
+        let mut server_mask = [0u8; 1];
+        self.stream.read_exact(&mut server_mask)?;
+        self.compression = self.compression.best_of(server_mask[0]);
+        self.stream.write_all(&[self.compression.code()])?;
+        self.stream.flush()?;
+        info!(
+            "Stripes will be sent {}",
+            match self.compression {
+                WireCompression::None => "uncompressed",
+                WireCompression::Zstd => "zstd-compressed",
+            }
+        );
 
         Ok(())
     }
@@ -150,24 +179,32 @@ impl RemoteStripeProvider for StripeServerClient {
 
         match status[0] {
             STATUS_OK => {
-                // Read stripe size
+                // The length on the wire is the payload's, which is the
+                // stripe's only when nothing compressed it.
                 let mut size_bytes = [0u8; 8];
                 self.stream.read_exact(&mut size_bytes)?;
-                let stripe_size = u64::from_le_bytes(size_bytes) as usize;
+                let payload_size = u64::from_le_bytes(size_bytes) as usize;
 
                 let expected_stripe_size = metadata.stripe_size();
-
-                if stripe_size != expected_stripe_size {
-                    return Err(crate::ubiblk_error!(StripeSizeMismatch {
-                        stripe: stripe_idx,
-                        expected: expected_stripe_size,
-                        actual: stripe_size,
+                if payload_size > MAX_STRIPE_PAYLOAD_FACTOR * expected_stripe_size {
+                    return Err(crate::ubiblk_error!(ProtocolError {
+                        description: format!(
+                            "Remote payload for stripe {stripe_idx} is {payload_size} bytes, far past a {expected_stripe_size} byte stripe"
+                        ),
                     }));
                 }
 
-                // Read stripe data
-                let mut stripe_data = vec![0u8; stripe_size];
-                self.stream.read_exact(&mut stripe_data)?;
+                let mut payload = vec![0u8; payload_size];
+                self.stream.read_exact(&mut payload)?;
+                let stripe_data = self.compression.decompress(payload)?;
+
+                if stripe_data.len() != expected_stripe_size {
+                    return Err(crate::ubiblk_error!(StripeSizeMismatch {
+                        stripe: stripe_idx,
+                        expected: expected_stripe_size,
+                        actual: stripe_data.len(),
+                    }));
+                }
 
                 Ok(stripe_data)
             }
@@ -234,7 +271,7 @@ pub fn connect_to_stripe_server(
         stream
     };
 
-    let mut client = StripeServerClient::new(stream);
+    let mut client = StripeServerClient::new(stream).wanting(conf.compression);
     client.hello()?;
     client.fetch_metadata()?;
 
@@ -312,6 +349,34 @@ mod tests {
             metadata.stripe_headers[idx] |= metadata_flags::WRITTEN;
         }
         Arc::from(metadata)
+    }
+
+    /// A stripe pulled over a session that negotiated zstd arrives as the
+    /// bytes that were on the server's disk.
+    #[test]
+    fn fetches_a_compressed_stripe() {
+        let stripe_count = 2;
+        let metadata = test_metadata(stripe_count, 0, &[], &[0]);
+        let stripe_device = Arc::new(TestBlockDevice::new(
+            (stripe_count as u64) * SECTOR_SIZE as u64,
+        ));
+
+        // Compressible on purpose: a stripe of one repeated byte is the shape
+        // an empty database page has, and the case worth the compression.
+        let pattern = vec![0x42u8; SECTOR_SIZE];
+        stripe_device.write(0, &pattern, pattern.len());
+
+        let stripe_data = run_client_with_server(metadata, stripe_device, None, |client| {
+            client.compression = WireCompression::Zstd;
+            client.hello().expect("hello handshake should succeed");
+            client
+                .fetch_metadata()
+                .expect("metadata fetch should succeed");
+            client
+                .fetch_stripe(0)
+                .expect("written stripe should be readable")
+        });
+        assert_eq!(stripe_data, pattern);
     }
 
     #[test]
@@ -578,6 +643,7 @@ mod tests {
             connect_timeout_ms: 5_000,
             operation_attempt_timeout_ms: 20_000,
             connections: 1,
+            compression: Default::default(),
         };
         let result = connect_to_stripe_server(&conf, &HashMap::new());
         assert!(result.is_err());
@@ -614,6 +680,7 @@ mod tests {
             device: DeviceSection {
                 snapshot_server: None,
                 snapshot_source: None,
+                snapshot_compression: Default::default(),
                 data_path: overlay_file.path().into(),
                 metadata_path: None,
                 vhost_socket: None,

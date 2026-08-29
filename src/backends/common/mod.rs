@@ -189,7 +189,11 @@ impl BackendEnv {
                     description: "snapshot_source needs a device with metadata".to_string(),
                 }));
             };
-            snapshot_service::spawn_snapshot_subscriber(&address, bgworker_sender)?;
+            snapshot_service::spawn_snapshot_subscriber(
+                &address,
+                self.config.device.snapshot_compression,
+                bgworker_sender,
+            )?;
         }
 
         Ok(())
@@ -683,6 +687,7 @@ mod tests {
             device: DeviceSection {
                 snapshot_server: None,
                 snapshot_source: None,
+                snapshot_compression: Default::default(),
                 data_path: data_path.to_path_buf(),
                 metadata_path: metadata_path.map(|path| path.to_path_buf()),
                 vhost_socket: None,

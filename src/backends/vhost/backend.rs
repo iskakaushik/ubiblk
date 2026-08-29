@@ -325,6 +325,7 @@ mod tests {
             device: DeviceSection {
                 snapshot_server: None,
                 snapshot_source: None,
+                snapshot_compression: Default::default(),
                 data_path: path.into(),
                 vhost_socket: Some("/tmp/vhost.sock".into()),
                 rpc_socket: Some("/tmp/rpc.sock".into()),

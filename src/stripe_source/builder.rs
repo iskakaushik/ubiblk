@@ -248,6 +248,7 @@ mod tests {
                         connect_timeout_ms: 5_000,
                         operation_attempt_timeout_ms: 20_000,
                         connections: 1,
+                        compression: Default::default(),
                     })
                 })
             });
@@ -256,6 +257,7 @@ mod tests {
             device: DeviceSection {
                 snapshot_server: None,
                 snapshot_source: None,
+                snapshot_compression: Default::default(),
                 data_path: "/tmp/non-existent-disk".into(),
                 metadata_path: None,
                 vhost_socket: None,

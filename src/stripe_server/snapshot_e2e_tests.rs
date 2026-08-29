@@ -10,6 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::stripe_server::WireCompression;
 use crate::{
     backends::SECTOR_SIZE,
     block_device::{
@@ -129,8 +130,11 @@ fn a_fork_sees_the_snapshot_while_prod_keeps_writing() {
     let generation = freeze(&state);
     assert_eq!(generation, 1);
 
-    let mut subscriber =
-        SnapshotSubscriber::subscribe(Box::new(TcpStream::connect(address).unwrap())).unwrap();
+    let mut subscriber = SnapshotSubscriber::subscribe(
+        Box::new(TcpStream::connect(address).unwrap()),
+        WireCompression::Zstd,
+    )
+    .unwrap();
     assert_eq!(subscriber.generation(), generation);
     wait_until("the fork to register as a destination", || {
         state.destination_count() == 1
@@ -165,8 +169,11 @@ fn a_fork_sees_the_snapshot_while_prod_keeps_writing() {
         .iter()
         .all(|byte| *byte == 0xFF));
 
-    // A cold stripe nobody has overwritten still comes over the pull path.
-    let mut puller = StripeServerClient::new(Box::new(TcpStream::connect(address).unwrap()));
+    // A cold stripe nobody has overwritten still comes over the pull path, and
+    // over the same compression the pushes used.
+    let mut puller = StripeServerClient::new(Box::new(TcpStream::connect(address).unwrap()))
+        .wanting(WireCompression::Zstd);
+    puller.hello().unwrap();
     puller.fetch_metadata().unwrap();
     let cold = puller.fetch_stripe(2).unwrap();
     assert_eq!(cold.len(), STRIPE_BYTES);
@@ -210,6 +217,9 @@ fn subscribing_without_a_snapshot_is_refused() {
     });
 
     // No freeze has happened, so there is nothing to subscribe to.
-    let result = SnapshotSubscriber::subscribe(Box::new(TcpStream::connect(address).unwrap()));
+    let result = SnapshotSubscriber::subscribe(
+        Box::new(TcpStream::connect(address).unwrap()),
+        WireCompression::Zstd,
+    );
     assert!(result.is_err());
 }

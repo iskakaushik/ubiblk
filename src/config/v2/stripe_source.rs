@@ -6,6 +6,7 @@ use std::{
 use serde::Deserialize;
 
 use super::{secrets::SecretRef, DangerZone};
+use crate::stripe_server::WireCompression;
 use crate::{
     config::v2::{
         load::resolve_path,
@@ -101,6 +102,14 @@ pub struct RemoteStripeConfig {
     /// only have one fetch in flight at a time, so this bounds fetch throughput.
     #[serde(default = "default_connections")]
     pub connections: usize,
+    /// How the server should compress stripes it sends. Falls back to
+    /// uncompressed against a server that cannot do it.
+    #[serde(default = "default_wire_compression")]
+    pub compression: WireCompression,
+}
+
+fn default_wire_compression() -> WireCompression {
+    WireCompression::Zstd
 }
 
 impl RemoteStripeConfig {
@@ -587,6 +596,7 @@ mod tests {
                 connect_timeout_ms: 5_000,
                 operation_attempt_timeout_ms: 20_000,
                 connections: 16,
+                compression: WireCompression::Zstd,
             })
         );
     }
@@ -612,6 +622,7 @@ mod tests {
                 connect_timeout_ms: 5_000,
                 operation_attempt_timeout_ms: 20_000,
                 connections: 16,
+                compression: WireCompression::Zstd,
             })
         );
     }
@@ -774,6 +785,7 @@ mod tests {
             connect_timeout_ms: 5_000,
             operation_attempt_timeout_ms: 20_000,
             connections: 1,
+            compression: Default::default(),
         });
         let danger_zone = DangerZone {
             enabled: false,
@@ -802,6 +814,7 @@ mod tests {
             connect_timeout_ms: 0,
             operation_attempt_timeout_ms: 20_000,
             connections: 1,
+            compression: Default::default(),
         });
         let danger_zone = DangerZone {
             enabled: true,
@@ -823,6 +836,7 @@ mod tests {
             connect_timeout_ms: 5_000,
             operation_attempt_timeout_ms: 0,
             connections: 1,
+            compression: Default::default(),
         });
         let danger_zone = DangerZone {
             enabled: true,

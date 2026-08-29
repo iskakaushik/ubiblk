@@ -146,6 +146,7 @@ mod tests {
             device: v2::DeviceSection {
                 snapshot_server: None,
                 snapshot_source: None,
+                snapshot_compression: Default::default(),
                 data_path: path.into(),
                 metadata_path: None,
                 vhost_socket: Some("sock".into()),

@@ -108,6 +108,7 @@ mod tests {
             device: v2::DeviceSection {
                 snapshot_server: None,
                 snapshot_source: None,
+                snapshot_compression: Default::default(),
                 data_path: disk_path.to_path_buf(),
                 vhost_socket: socket_path.map(|p| p.to_path_buf()),
                 metadata_path: None,

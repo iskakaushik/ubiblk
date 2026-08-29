@@ -19,6 +19,7 @@ use aes_gcm::{
 use serde::Deserialize;
 use serde_with::{base64::Base64, serde_as};
 
+use crate::stripe_server::WireCompression;
 use crate::{
     backends::SECTOR_SIZE,
     block_device::{
@@ -241,6 +242,7 @@ pub fn load_legacy_config(config_path: &Path, kek_path: Option<&Path>) -> Result
         device: DeviceSection {
             snapshot_server: None,
             snapshot_source: None,
+            snapshot_compression: WireCompression::default(),
             data_path: options.path.into(),
             metadata_path: options.metadata_path.map(Into::into),
             vhost_socket: None,

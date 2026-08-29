@@ -30,7 +30,10 @@ pub const SNAPSHOT_END_FRAME: u8 = 0x11;
 
 /// Remote stripe protocol version, reported by the hello command so a client can
 /// detect a server it is not compatible with. Bump on incompatible wire changes.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// 2: hello and subscribe negotiate stripe compression, and stripe payloads on
+/// the wire are whatever that negotiation chose.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 pub const STATUS_OK: u8 = 0x00;
 pub const STATUS_INVALID_STRIPE: u8 = 0x01;
@@ -64,6 +67,9 @@ pub struct StripeServer {
 
 pub struct StripeServerSession {
     stream: Option<DynStream>,
+    /// How stripe payloads are encoded on this session, agreed at hello or
+    /// subscribe time. Uncompressed until then.
+    compression: WireCompression,
     metadata: Arc<UbiMetadata>,
     stripe_channel: Box<dyn IoChannel>,
     source: Option<Box<dyn StripeSource>>,
@@ -76,6 +82,9 @@ pub struct StripeServerSession {
 pub struct StripeServerClient {
     stream: DynStream,
     pub metadata: Option<UbiMetadata>,
+    /// What this client asks the server to encode stripes with, and what it
+    /// decodes them as once the server has agreed.
+    compression: WireCompression,
 }
 
 pub trait RemoteStripeProvider {
@@ -128,6 +137,7 @@ impl StripeServer {
             .transpose()?;
         Ok(StripeServerSession {
             stream: Some(stream),
+            compression: WireCompression::default(),
             metadata: self.metadata.clone(),
             stripe_channel,
             source,
@@ -140,6 +150,7 @@ impl StripeServer {
 }
 
 mod client;
+mod compression;
 mod legacy;
 mod prepare;
 mod psk;
@@ -150,6 +161,7 @@ mod snapshot_push;
 mod snapshot_e2e_tests;
 
 pub use client::connect_to_stripe_server;
+pub use compression::WireCompression;
 pub use legacy::load_legacy_config;
 pub use prepare::prepare_stripe_server;
 pub use psk::{

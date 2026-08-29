@@ -20,7 +20,7 @@ use crate::{
     block_device::{
         BgWorkerRequest, SharedMetadataState, SharedSnapshotState, SnapshotRequest, UbiMetadata,
     },
-    stripe_server::{PushedFrame, SnapshotSubscriber, StripeServer},
+    stripe_server::{PushedFrame, SnapshotSubscriber, StripeServer, WireCompression},
     Result,
 };
 
@@ -154,6 +154,7 @@ pub fn spawn_snapshot_server(
 /// bgworker.
 pub fn spawn_snapshot_subscriber(
     address: &str,
+    compression: WireCompression,
     bgworker_ch: Sender<BgWorkerRequest>,
 ) -> Result<()> {
     let address = address.to_string();
@@ -161,7 +162,7 @@ pub fn spawn_snapshot_subscriber(
     thread::Builder::new()
         .name("snapshot-subscriber".to_string())
         .spawn(move || loop {
-            match subscribe_once(&address, &bgworker_ch) {
+            match subscribe_once(&address, compression, &bgworker_ch) {
                 Ok(()) => info!("Snapshot ended; not resubscribing"),
                 Err(e) => {
                     warn!("Snapshot subscription to {address} ended: {e}");
@@ -180,14 +181,18 @@ pub fn spawn_snapshot_subscriber(
     Ok(())
 }
 
-fn subscribe_once(address: &str, bgworker_ch: &Sender<BgWorkerRequest>) -> Result<()> {
+fn subscribe_once(
+    address: &str,
+    compression: WireCompression,
+    bgworker_ch: &Sender<BgWorkerRequest>,
+) -> Result<()> {
     let stream = TcpStream::connect(address).map_err(|e| {
         crate::ubiblk_error!(InvalidParameter {
             description: format!("Failed to connect to the snapshot server {address}: {e}"),
         })
     })?;
 
-    let mut subscriber = SnapshotSubscriber::subscribe(Box::new(stream))?;
+    let mut subscriber = SnapshotSubscriber::subscribe(Box::new(stream), compression)?;
     info!(
         "Subscribed to snapshot generation {} on {address}",
         subscriber.generation()

@@ -103,13 +103,13 @@ impl StripeServerSession {
 
         self.stream_mut().write_all(&[STATUS_OK])?;
         self.stream_mut().write_all(&generation.to_le_bytes())?;
-        self.stream_mut().flush()?;
+        let compression = self.negotiate_compression()?;
 
         let id = self
             .next_destination_id
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         let stream = self.stream.take().expect("stream checked above");
-        let destination = RemoteDestination::new(id, stream);
+        let destination = RemoteDestination::new(id, stream, compression);
 
         if snapshot_ch
             .send(SnapshotRequest::AddDestination {
@@ -131,8 +131,23 @@ impl StripeServerSession {
         self.stream_mut().write_all(&[STATUS_OK])?;
         self.stream_mut()
             .write_all(&PROTOCOL_VERSION.to_le_bytes())?;
-        self.stream_mut().flush()?;
+        self.compression = self.negotiate_compression()?;
         Ok(())
+    }
+
+    /// Offer what this server can encode stripes with and take the client's
+    /// pick. Written last in a reply the client is already reading, so a client
+    /// that rejects the version hangs up rather than deadlocking here.
+    fn negotiate_compression(&mut self) -> Result<WireCompression> {
+        self.stream_mut()
+            .write_all(&[WireCompression::supported_mask()])?;
+        self.stream_mut().flush()?;
+
+        let mut chosen = [0u8; 1];
+        self.stream_mut().read_exact(&mut chosen)?;
+        let compression = WireCompression::from_code(chosen[0])?;
+        info!("Session will send stripes as {compression:?}");
+        Ok(compression)
     }
 
     /// The metadata to hand a client: the file's, with the device's live
@@ -226,13 +241,14 @@ impl StripeServerSession {
                 .inspect_err(|_| self.notify_server_error())?
         };
 
-        let stripe_len_bytes = self.metadata.stripe_size();
+        let compression = self.compression;
+        let stripe = stripe_data.borrow();
+        let payload = compression.compress(stripe.as_slice())?;
 
         self.stream_mut().write_all(&[STATUS_OK])?;
         self.stream_mut()
-            .write_all(&(stripe_len_bytes as u64).to_le_bytes())?;
-        self.stream_mut()
-            .write_all(stripe_data.borrow().as_slice())?;
+            .write_all(&(payload.len() as u64).to_le_bytes())?;
+        self.stream_mut().write_all(&payload)?;
 
         self.stream_mut().flush()?;
 
@@ -334,13 +350,20 @@ mod tests {
     fn test_handle_hello_request() {
         let metadata: Arc<UbiMetadata> = Arc::from(UbiMetadata::new(0, 1, 0));
         let device = Arc::new(TestBlockDevice::new(SECTOR_SIZE as u64));
-        let (mut session, writes) = make_session(vec![HELLO_CMD], metadata, device);
+        // The client answers the compression offer with its pick.
+        let (mut session, writes) = make_session(
+            vec![HELLO_CMD, WireCompression::Zstd.code()],
+            metadata,
+            device,
+        );
 
         session.handle_single_request().unwrap();
 
         let mut expected = vec![STATUS_OK];
         expected.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+        expected.push(WireCompression::supported_mask());
         assert_eq!(*writes.lock().unwrap(), expected);
+        assert_eq!(session.compression, WireCompression::Zstd);
     }
 
     #[test]
