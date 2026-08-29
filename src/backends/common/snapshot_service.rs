@@ -34,7 +34,10 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 /// in that write. Everything else then waits on the worker — the copy-out never
 /// finishes, so prod's write stays blocked, and a new fork's subscription is not
 /// even processed. A fork must never be able to do that to prod.
-const PUSH_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Kept short: a fork on the same network acknowledges a stripe in well under a
+/// second, while a fork whose VM was destroyed costs prod this long on every
+/// push until it is dropped, and prod's writes are waiting behind those pushes.
+const PUSH_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Serve snapshots of this device to forks.
 pub fn spawn_snapshot_server(
