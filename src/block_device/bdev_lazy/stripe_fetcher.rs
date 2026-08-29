@@ -58,6 +58,11 @@ pub struct StripeFetcher {
     /// Applied once that pull finishes: after a copy-out the server refuses to
     /// serve the stripe, so the pushed copy is the only correct one.
     pending_pushes: HashMap<usize, Vec<u8>>,
+    /// The subscriber's slot for each stripe still somewhere in the push
+    /// pipeline, held until that stripe is written or given up on. Without it
+    /// the subscriber would go on reading and this map's copies would be where
+    /// prod's write rate accumulates.
+    push_permits: HashMap<usize, PushPermit>,
     finished_fetches: Vec<(usize, bool)>,
     autofetch: bool,
     disconnected: bool,
@@ -117,6 +122,7 @@ impl StripeFetcher {
             first_failure: HashMap::new(),
             allocated_buffers: HashMap::new(),
             pending_pushes: HashMap::new(),
+            push_permits: HashMap::new(),
             finished_fetches: Vec::new(),
             autofetch,
             autofetch_queue,
@@ -162,7 +168,7 @@ impl StripeFetcher {
         self.expects_pushes = expects_pushes;
     }
 
-    pub fn accept_pushed_stripe(&mut self, stripe_id: usize, data: &[u8]) {
+    pub fn accept_pushed_stripe(&mut self, stripe_id: usize, data: &[u8], permit: PushPermit) {
         if self
             .shared_metadata_state
             .stripe_fetched_if_needed(stripe_id)
@@ -170,6 +176,10 @@ impl StripeFetcher {
             debug!("Stripe {stripe_id} is already local, ignoring the pushed copy");
             return;
         }
+
+        // Held until this stripe leaves the push pipeline. A second push of the
+        // same stripe supersedes the first, and drops its slot here.
+        self.push_permits.insert(stripe_id, permit);
 
         if self.fetch_in_flight(stripe_id) {
             // Once prod has copied a stripe out it stops serving it, so a pull
@@ -242,6 +252,7 @@ impl StripeFetcher {
                 .shared_metadata_state
                 .stripe_fetched_if_needed(stripe_id)
             {
+                self.push_permits.remove(&stripe_id);
                 continue;
             }
             // The pull failed or was never going to succeed; this is the copy.
@@ -410,6 +421,11 @@ impl StripeFetcher {
     fn fetch_completed(&mut self, stripe_id: usize, success: bool) {
         debug!("Fetch completed for stripe {stripe_id}, success={success}");
 
+        // Whatever the outcome, this stripe is no longer waiting on a push.
+        if !self.pending_pushes.contains_key(&stripe_id) {
+            self.push_permits.remove(&stripe_id);
+        }
+
         if let Some(buf) = self.allocated_buffers.remove(&stripe_id) {
             self.buffer_pool.return_buffer(&buf);
         } else {
@@ -550,7 +566,9 @@ mod tests {
         state.fetcher.update();
 
         // The push arrives while that pull is still outstanding.
-        state.fetcher.accept_pushed_stripe(0, &pushed);
+        state
+            .fetcher
+            .accept_pushed_stripe(0, &pushed, PushPermit::unbounded());
         assert_eq!(
             state.target_dev.metrics.read().unwrap().writes,
             0,
@@ -587,7 +605,9 @@ mod tests {
         state.fetcher.handle_fetch_request(0);
         state.fetcher.update();
 
-        state.fetcher.accept_pushed_stripe(0, &pushed);
+        state
+            .fetcher
+            .accept_pushed_stripe(0, &pushed, PushPermit::unbounded());
         for _ in 0..10 {
             state.fetcher.update();
         }
@@ -604,6 +624,42 @@ mod tests {
             state.fetcher.take_finished_fetches(),
             vec![(0, true)],
             "and the stripe must end up fetched"
+        );
+    }
+
+    /// The subscriber's slot is held for as long as the stripe is anywhere in
+    /// the push pipeline. If it were released when the worker took the request,
+    /// the copies waiting on a racing pull would be where prod's write rate
+    /// accumulates, and the fork would grow a megabyte per pushed stripe.
+    #[test]
+    fn a_pushed_stripe_holds_its_slot_until_it_lands() {
+        let mut state = prep(false);
+        state.fetcher.set_expects_pushes(true);
+        let pushed = vec![0x3C; (state.fetcher.stripe_sector_count as usize) * SECTOR_SIZE];
+        let gate = super::super::push_gate::PushGate::new(4);
+
+        // A pull is in flight, so the pushed copy has to wait for it.
+        state
+            .source_dev
+            .fail_next
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        state.fetcher.handle_fetch_request(0);
+        state
+            .fetcher
+            .accept_pushed_stripe(0, &pushed, gate.acquire());
+        assert_eq!(gate.queued(), 1, "the slot is held while the copy waits");
+
+        for _ in 0..10 {
+            state.fetcher.update();
+        }
+
+        let mut written = vec![0u8; pushed.len()];
+        state.target_dev.read(0, &mut written, pushed.len());
+        assert_eq!(written, pushed);
+        assert_eq!(
+            gate.queued(),
+            0,
+            "and released once the stripe is on the fork's disk"
         );
     }
 
@@ -639,7 +695,9 @@ mod tests {
         let mut state = prep(false);
         let pushed = vec![0xCD; (state.fetcher.stripe_sector_count as usize) * SECTOR_SIZE];
 
-        state.fetcher.accept_pushed_stripe(1, &pushed);
+        state
+            .fetcher
+            .accept_pushed_stripe(1, &pushed, PushPermit::unbounded());
         for _ in 0..10 {
             state.fetcher.update();
         }
@@ -667,7 +725,9 @@ mod tests {
             .set_stripe_header(0, metadata_flags::FETCHED);
         let writes_before = state.target_dev.metrics.read().unwrap().writes;
 
-        state.fetcher.accept_pushed_stripe(0, &[0xEF; 512]);
+        state
+            .fetcher
+            .accept_pushed_stripe(0, &[0xEF; 512], PushPermit::unbounded());
         for _ in 0..10 {
             state.fetcher.update();
         }

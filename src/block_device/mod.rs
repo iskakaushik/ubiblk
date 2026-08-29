@@ -58,6 +58,7 @@ pub use bdev_lazy::{
         shared_state::SharedMetadataState,
         types::{metadata_flags, UbiMetadata},
     },
+    push_gate::{PushGate, PushPermit, MAX_QUEUED_PUSHES},
     status_report::{StatusReport, StatusReporter},
 };
 

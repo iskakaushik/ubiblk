@@ -18,7 +18,8 @@ use log::{error, info, warn};
 use crate::{
     block_device::BlockDevice,
     block_device::{
-        BgWorkerRequest, SharedMetadataState, SharedSnapshotState, SnapshotRequest, UbiMetadata,
+        BgWorkerRequest, PushGate, SharedMetadataState, SharedSnapshotState, SnapshotRequest,
+        UbiMetadata, MAX_QUEUED_PUSHES,
     },
     stripe_server::{PushedFrame, SnapshotSubscriber, StripeServer, WireCompression},
     Result,
@@ -158,11 +159,12 @@ pub fn spawn_snapshot_subscriber(
     bgworker_ch: Sender<BgWorkerRequest>,
 ) -> Result<()> {
     let address = address.to_string();
+    let gate = PushGate::new(MAX_QUEUED_PUSHES);
 
     thread::Builder::new()
         .name("snapshot-subscriber".to_string())
         .spawn(move || loop {
-            match subscribe_once(&address, compression, &bgworker_ch) {
+            match subscribe_once(&address, compression, &gate, &bgworker_ch) {
                 Ok(()) => info!("Snapshot ended; not resubscribing"),
                 Err(e) => {
                     warn!("Snapshot subscription to {address} ended: {e}");
@@ -184,6 +186,7 @@ pub fn spawn_snapshot_subscriber(
 fn subscribe_once(
     address: &str,
     compression: WireCompression,
+    gate: &Arc<PushGate>,
     bgworker_ch: &Sender<BgWorkerRequest>,
 ) -> Result<()> {
     let stream = TcpStream::connect(address).map_err(|e| {
@@ -201,10 +204,14 @@ fn subscribe_once(
     loop {
         match subscriber.next_frame()? {
             Some(PushedFrame::Stripe { stripe_id, data }) => {
+                // Waits while the worker is behind, so a fork that cannot keep
+                // up stops reading rather than holding prod's writes in memory.
+                let permit = gate.acquire();
                 if bgworker_ch
                     .send(BgWorkerRequest::PushedStripe {
                         stripe_id: stripe_id as usize,
                         data,
+                        permit,
                     })
                     .is_err()
                 {

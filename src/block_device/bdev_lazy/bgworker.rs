@@ -1,6 +1,6 @@
 use super::{
     metadata::shared_state::SharedMetadataState, metadata_flusher::MetadataFlusher,
-    stripe_fetcher::StripeFetcher,
+    push_gate::PushPermit, stripe_fetcher::StripeFetcher,
 };
 
 use crate::{block_device::BlockDevice, stripe_source::StripeSource, Result};
@@ -11,10 +11,13 @@ pub enum BgWorkerRequest {
     Fetch {
         stripe_id: usize,
     },
-    /// A stripe the snapshot server pushed to this fork.
+    /// A stripe the snapshot server pushed to this fork. The permit is the
+    /// subscriber's slot, released once this request has been handled, so the
+    /// fork stops reading pushes it cannot keep up with.
     PushedStripe {
         stripe_id: usize,
         data: Vec<u8>,
+        permit: PushPermit,
     },
     SetWritten {
         stripe_id: usize,
@@ -72,9 +75,13 @@ impl BgWorker {
             BgWorkerRequest::Fetch { stripe_id } => {
                 self.stripe_fetcher.handle_fetch_request(stripe_id)
             }
-            BgWorkerRequest::PushedStripe { stripe_id, data } => {
-                self.stripe_fetcher.accept_pushed_stripe(stripe_id, &data)
-            }
+            BgWorkerRequest::PushedStripe {
+                stripe_id,
+                data,
+                permit,
+            } => self
+                .stripe_fetcher
+                .accept_pushed_stripe(stripe_id, &data, permit),
             BgWorkerRequest::SetWritten { stripe_id } => {
                 self.metadata_flusher.set_stripe_written(stripe_id)
             }
