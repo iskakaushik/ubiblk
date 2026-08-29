@@ -1045,6 +1045,10 @@ mod tests {
 
     #[test]
     fn run_backend_loop_with_rpc_socket() {
+        // Creating the RPC socket sets the process's umask for a moment, which
+        // is not this thread's to change: a test creating a directory just then
+        // gets one without its execute bit and fails somewhere else entirely.
+        let _umask_guard = UMASK_LOCK.lock().unwrap();
         let disk_file = tempfile::NamedTempFile::new().unwrap();
         disk_file.as_file().set_len(10 * 1024 * 1024).unwrap();
 
