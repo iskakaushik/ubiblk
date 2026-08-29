@@ -23,8 +23,10 @@ const MAX_FETCH_RETRIES: u8 = 3;
 /// Prod stops serving a stripe the moment it copies it out, and the copy it
 /// pushed is already on the wire by then, so the pull that just failed will
 /// succeed as soon as that push has been written locally. Failing after three
-/// immediate retries loses that race and fails the guest's read.
-const PUSH_WAIT: Duration = Duration::from_secs(10);
+/// immediate retries loses that race and fails the guest's read — and a failed
+/// stripe is permanent, which on a fork means postgres cannot finish recovery.
+/// Wait long enough to cover a prod that is busy serving other forks.
+const PUSH_WAIT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FetchState {

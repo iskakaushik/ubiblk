@@ -34,10 +34,52 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 /// in that write. Everything else then waits on the worker — the copy-out never
 /// finishes, so prod's write stays blocked, and a new fork's subscription is not
 /// even processed. A fork must never be able to do that to prod.
-/// Kept short: a fork on the same network acknowledges a stripe in well under a
-/// second, while a fork whose VM was destroyed costs prod this long on every
-/// push until it is dropped, and prod's writes are waiting behind those pushes.
-const PUSH_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Generous, because it is the wrong tool for spotting a fork that has gone
+/// away: a fork that is merely busy must not be dropped, and a fork whose VM
+/// was destroyed is caught by keepalive below instead.
+const PUSH_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Keepalive settings for a push connection: a peer that stops answering is
+/// noticed in about ten seconds, so prod stops pushing to a fork whose VM was
+/// destroyed without having to guess from how long a write is taking.
+const KEEPALIVE_IDLE_SECS: libc::c_int = 5;
+const KEEPALIVE_INTERVAL_SECS: libc::c_int = 2;
+const KEEPALIVE_PROBES: libc::c_int = 3;
+
+fn set_keepalive(stream: &TcpStream) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let fd = stream.as_raw_fd();
+    let options: [(libc::c_int, libc::c_int, libc::c_int); 4] = [
+        (libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1),
+        (libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, KEEPALIVE_IDLE_SECS),
+        (
+            libc::IPPROTO_TCP,
+            libc::TCP_KEEPINTVL,
+            KEEPALIVE_INTERVAL_SECS,
+        ),
+        (libc::IPPROTO_TCP, libc::TCP_KEEPCNT, KEEPALIVE_PROBES),
+    ];
+
+    for (level, name, value) in options {
+        // SAFETY: fd is owned by `stream` and outlives this call, and value is a
+        // c_int as every one of these options expects.
+        let result = unsafe {
+            libc::setsockopt(
+                fd,
+                level,
+                name,
+                &value as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+
+    Ok(())
+}
 
 /// Serve snapshots of this device to forks.
 pub fn spawn_snapshot_server(
@@ -76,6 +118,11 @@ pub fn spawn_snapshot_server(
 
                 if let Err(e) = stream.set_write_timeout(Some(PUSH_WRITE_TIMEOUT)) {
                     error!("Failed to set the push write timeout: {e}");
+                    continue;
+                }
+
+                if let Err(e) = set_keepalive(&stream) {
+                    error!("Failed to set keepalive on a snapshot connection: {e}");
                     continue;
                 }
 
