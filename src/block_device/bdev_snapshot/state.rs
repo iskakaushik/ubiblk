@@ -168,11 +168,25 @@ impl SharedSnapshotState {
 
     /// Put a claimed stripe back: its copy-out is waiting for a destination.
     pub fn defer_copy(&self, stripe_id: usize) {
-        self.stripe_states[stripe_id].store(LOCKED, Ordering::Release);
+        let _ = self.stripe_states[stripe_id].compare_exchange(
+            COPYING,
+            LOCKED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 
-    pub fn finish_copy(&self, stripe_id: usize) {
-        self.stripe_states[stripe_id].store(COPIED, Ordering::Release);
+    /// Mark a claimed stripe as delivered. Returns false if it is no longer the
+    /// stripe that was claimed — a fresh snapshot locks every stripe, including
+    /// ones with a copy-out in flight, and such a copy-out belongs to the
+    /// generation it started in. Letting it report success here would tell the
+    /// new snapshot that a stripe had been handed over when it went to the
+    /// previous one's destinations, and the server would then refuse to serve a
+    /// stripe whose only copy is somewhere else.
+    pub fn finish_copy(&self, stripe_id: usize) -> bool {
+        self.stripe_states[stripe_id]
+            .compare_exchange(COPYING, COPIED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 
     /// Release every stripe, ending the snapshot. Used when the last

@@ -70,6 +70,36 @@ fn passes_io_through_when_no_snapshot_is_live() {
     assert_eq!(read_buf.borrow().as_slice()[0], 0xAB);
 }
 
+/// A copy-out still in flight when a second snapshot is taken belongs to the
+/// generation it started in. That generation's destinations were given the
+/// stripe; the new generation's have not been. If the straggler were allowed to
+/// report the stripe as copied, the server would refuse to serve a stripe whose
+/// only copy went to the previous fork — and the new fork can then never finish
+/// recovering, which is exactly what a benchmark run turned up.
+#[test]
+fn a_copy_out_that_outlives_its_snapshot_leaves_the_stripe_locked() {
+    let (_device, state) = setup(4);
+
+    state.lock_all();
+    assert!(
+        state.begin_copy(1),
+        "the stripe was locked, so it can be claimed"
+    );
+
+    // A second fork is taken while that copy-out is in flight.
+    state.lock_all();
+
+    assert!(
+        !state.finish_copy(1),
+        "a copy-out from the previous snapshot must not complete into this one"
+    );
+    assert_eq!(
+        state.stripe_state(1),
+        LOCKED,
+        "the stripe still owes this snapshot's destinations their copy"
+    );
+}
+
 #[test]
 fn write_to_locked_stripe_waits_for_the_copy_out() {
     let (device, state) = setup(4);
@@ -99,6 +129,7 @@ fn writes_to_other_stripes_are_not_blocked_by_a_locked_one() {
     let mut channel = device.create_channel().unwrap();
 
     state.lock_all();
+    assert!(state.begin_copy(1));
     state.finish_copy(1);
 
     channel.add_write(STRIPE_SECTORS, 1, buffer_of(0x11, 1), 1);
@@ -151,6 +182,7 @@ fn draining_holds_new_io_until_the_freeze_completes() {
 
     // The freeze happens here; afterwards the layer runs again and replays.
     state.lock_all();
+    assert!(state.begin_copy(0));
     state.finish_copy(0);
     state.resume();
 
@@ -181,6 +213,7 @@ fn a_write_spanning_stripes_waits_for_all_of_them() {
     let mut channel = device.create_channel().unwrap();
 
     state.lock_all();
+    assert!(state.begin_copy(0));
     state.finish_copy(0);
 
     // Spans stripes 0 and 1; stripe 1 is still locked.
@@ -188,6 +221,7 @@ fn a_write_spanning_stripes_waits_for_all_of_them() {
     channel.submit().unwrap();
     assert!(channel.poll().is_empty());
 
+    assert!(state.begin_copy(1));
     state.finish_copy(1);
     assert_eq!(channel.poll(), vec![(1, true)]);
 }
