@@ -121,6 +121,39 @@ fn fetch_with_reconnect(
     }))
 }
 
+/// One connection in this many serves demand fetches only.
+const DEMAND_CONNECTION_SHARE: usize = 8;
+
+/// What a fetch worker takes its work from.
+enum Lane {
+    /// Stripes a guest is waiting for, and nothing else.
+    DemandOnly(Receiver<usize>),
+    /// The background sweep.
+    Bulk(Receiver<usize>),
+    /// Both, demand first.
+    Both {
+        demand: Receiver<usize>,
+        bulk: Receiver<usize>,
+    },
+}
+
+impl Lane {
+    fn next(&self) -> Option<usize> {
+        match self {
+            Lane::DemandOnly(rx) | Lane::Bulk(rx) => rx.recv().ok(),
+            Lane::Both { demand, bulk } => {
+                if let Ok(stripe_id) = demand.try_recv() {
+                    return Some(stripe_id);
+                }
+                crossbeam_channel::select! {
+                    recv(demand) -> msg => msg.ok(),
+                    recv(bulk) -> msg => msg.ok(),
+                }
+            }
+        }
+    }
+}
+
 /// A stripe source backed by one or more connections to a remote stripe server.
 ///
 /// Fetching a stripe over a single connection is a synchronous request/response
@@ -138,6 +171,9 @@ pub struct RemoteStripeSource {
     source_sector_count: u64,
     remote_headers: Vec<u8>,
     request_tx: Sender<usize>,
+    /// Requests for stripes a guest is waiting for, served by their own
+    /// connections so they never queue behind the sweep.
+    demand_tx: Sender<usize>,
     result_rx: Receiver<FetchOutcome>,
     pending: HashMap<usize, SharedBuffer>,
     connection_count: usize,
@@ -200,16 +236,36 @@ impl RemoteStripeSource {
             stripe_count: remote_headers.len(),
         };
         let (request_tx, request_rx) = unbounded::<usize>();
+        // A few connections serve nothing but stripes a guest is waiting for.
+        // Without them a demand fetch is queued behind whatever the background
+        // sweep already has in flight — up to a connection's worth of transfer
+        // each — and a database opening does thousands of dependent reads, so
+        // that queue is the difference between a fork opening in seconds and in
+        // a minute. Both ends have the capacity; it is purely about not
+        // queueing behind bulk work.
+        let (demand_tx, demand_rx) = unbounded::<usize>();
+        let demand_connections = (connection_count / DEMAND_CONNECTION_SHARE).max(1);
         let (result_tx, result_rx) = unbounded::<FetchOutcome>();
 
         for (i, mut client) in clients.into_iter().enumerate() {
-            let rx: Receiver<usize> = request_rx.clone();
+            // With a single connection there is nobody to spare, so it serves
+            // both queues and prefers demand.
+            let lane = if connection_count == 1 {
+                Lane::Both {
+                    demand: demand_rx.clone(),
+                    bulk: request_rx.clone(),
+                }
+            } else if i < demand_connections {
+                Lane::DemandOnly(demand_rx.clone())
+            } else {
+                Lane::Bulk(request_rx.clone())
+            };
             let tx: Sender<FetchOutcome> = result_tx.clone();
             let connect = Arc::clone(&connect);
             thread::Builder::new()
                 .name(format!("remote-fetch-{i}"))
                 .spawn(move || {
-                    while let Ok(stripe_id) = rx.recv() {
+                    while let Some(stripe_id) = lane.next() {
                         let result = fetch_with_reconnect(
                             &mut client,
                             connect.as_ref(),
@@ -223,16 +279,35 @@ impl RemoteStripeSource {
                 })?;
         }
 
-        info!("RemoteStripeSource started with {connection_count} fetch connection(s)");
+        info!(
+            "RemoteStripeSource started with {connection_count} fetch connection(s), \
+             {demand_connections} of them reserved for demand fetches"
+        );
 
         Ok(Self {
             source_sector_count,
             remote_headers,
             request_tx,
+            demand_tx,
             result_rx,
             pending: HashMap::new(),
             connection_count,
         })
+    }
+
+    fn send(
+        &mut self,
+        channel: &Sender<usize>,
+        stripe_id: usize,
+        buffer: SharedBuffer,
+    ) -> Result<()> {
+        channel.send(stripe_id).map_err(|_| {
+            crate::ubiblk_error!(IoError {
+                source: std::io::Error::other("remote stripe fetch workers are gone"),
+            })
+        })?;
+        self.pending.insert(stripe_id, buffer);
+        Ok(())
     }
 
     /// Copy a fetched stripe's bytes into the caller's buffer, zero-filling any
@@ -269,13 +344,11 @@ impl RemoteStripeSource {
 
 impl StripeSource for RemoteStripeSource {
     fn request(&mut self, stripe_id: usize, buffer: SharedBuffer) -> Result<()> {
-        self.request_tx.send(stripe_id).map_err(|_| {
-            crate::ubiblk_error!(IoError {
-                source: std::io::Error::other("remote stripe fetch workers are gone"),
-            })
-        })?;
-        self.pending.insert(stripe_id, buffer);
-        Ok(())
+        self.send(&self.request_tx.clone(), stripe_id, buffer)
+    }
+
+    fn request_demand(&mut self, stripe_id: usize, buffer: SharedBuffer) -> Result<()> {
+        self.send(&self.demand_tx.clone(), stripe_id, buffer)
     }
 
     fn poll(&mut self) -> Vec<(usize, bool)> {
@@ -497,6 +570,58 @@ mod tests {
     fn test_sector_count() {
         let source = prep();
         assert_eq!(source.sector_count(), (STRIPE_SECTORS as u64) * 3);
+    }
+
+    /// A demand fetch must not be queued behind the sweep. Every connection
+    /// here takes 20 ms per stripe, so with a backlog already queued the only
+    /// way a guest's stripe comes back promptly is a connection kept for it.
+    #[test]
+    fn demand_fetches_do_not_queue_behind_the_sweep() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let clients: Vec<Box<dyn RemoteStripeProvider + Send>> = (0..8)
+            .map(|_| {
+                Box::new(ConcurrencyProvider {
+                    metadata: UbiMetadata::new(STRIPE_SECTOR_COUNT_SHIFT, TOTAL_STRIPES, 0),
+                    in_flight: in_flight.clone(),
+                    max_in_flight: max_in_flight.clone(),
+                }) as Box<dyn RemoteStripeProvider + Send>
+            })
+            .collect();
+        let mut source =
+            RemoteStripeSource::new(clients, mock_connect(), STRIPE_SECTORS as u64).unwrap();
+
+        for stripe_id in 0..TOTAL_STRIPES {
+            source
+                .request(stripe_id, shared_buffer(STRIPE_SIZE))
+                .unwrap();
+        }
+        source
+            .request_demand(TOTAL_STRIPES - 1, shared_buffer(STRIPE_SIZE))
+            .unwrap();
+
+        let mut served = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline && served.len() < TOTAL_STRIPES {
+            for (stripe_id, _) in source.poll() {
+                served.push(stripe_id);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        // Seven connections work through the backlog while one serves the
+        // guest, so its stripe is in the first round rather than the last.
+        let position = served
+            .iter()
+            .position(|stripe_id| *stripe_id == TOTAL_STRIPES - 1)
+            .expect("the demand fetch should have been served");
+        assert!(
+            position < 8,
+            "demand fetch came back {position} completions into the sweep's backlog"
+        );
     }
 
     #[test]

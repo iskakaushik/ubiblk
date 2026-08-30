@@ -4,6 +4,12 @@ use crate::{block_device::SharedBuffer, Result};
 pub trait StripeSource {
     /// Request to fetch a stripe.
     fn request(&mut self, stripe_id: usize, buffer: SharedBuffer) -> Result<()>;
+    /// Request a stripe a guest is waiting for. A source that can keep bulk
+    /// work out of its way should; one that cannot treats it as any other
+    /// request.
+    fn request_demand(&mut self, stripe_id: usize, buffer: SharedBuffer) -> Result<()> {
+        self.request(stripe_id, buffer)
+    }
     /// Poll for completed stripe fetch requests.
     fn poll(&mut self) -> Vec<(usize, bool)>;
     /// Check if there are any pending requests.

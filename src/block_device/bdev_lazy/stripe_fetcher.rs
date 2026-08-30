@@ -25,6 +25,8 @@ const FETCHES_PER_CONNECTION: usize = 2;
 /// Completion id for a batched flush. Stripe ids index the device, so this is
 /// past any of them.
 const FLUSH_BATCH_ID: usize = usize::MAX;
+/// Sweep requests kept in flight while a guest is waiting for a stripe.
+const SWEEP_DEPTH_WHILE_BUSY: usize = 2;
 const MAX_FETCH_RETRIES: u8 = 3;
 
 /// How long a fork keeps retrying a stripe its snapshot server refuses to serve.
@@ -63,6 +65,11 @@ pub struct StripeFetcher {
     expects_pushes: bool,
     first_failure: HashMap<usize, Instant>,
     allocated_buffers: HashMap<usize, SharedBuffer>,
+    /// Stripes a guest is waiting for. The background sweep stands aside while
+    /// any of these are outstanding: a fork is useful once postgres can open,
+    /// and postgres opening is a few thousand page reads that should not be
+    /// queued behind a sweep of the whole device.
+    demand_stripes: std::collections::HashSet<usize>,
     /// Stripes the snapshot server pushed while a pull for them was in flight.
     /// Applied once that pull finishes: after a copy-out the server refuses to
     /// serve the stripe, so the pushed copy is the only correct one.
@@ -144,6 +151,7 @@ impl StripeFetcher {
             expects_pushes: false,
             first_failure: HashMap::new(),
             allocated_buffers: HashMap::new(),
+            demand_stripes: std::collections::HashSet::new(),
             pending_pushes: HashMap::new(),
             push_permits: HashMap::new(),
             finished_fetches: Vec::new(),
@@ -181,6 +189,7 @@ impl StripeFetcher {
         }
 
         debug!("Enqueueing stripe {stripe_id} for fetch");
+        self.demand_stripes.insert(stripe_id);
         // A guest is waiting on this one, and the queue behind it is background
         // work, so it goes to the front.
         self.fetch_queue.push_front(stripe_id);
@@ -354,12 +363,19 @@ impl StripeFetcher {
             return;
         }
 
-        // Top the queue up rather than adding one stripe once it drains. The
-        // source fetches over several connections at once, and a queue that
-        // holds a single stripe leaves all but one of them idle: catch-up then
-        // runs at one stripe per round trip no matter how much bandwidth is
-        // there.
-        while self.fetch_queue.len() < self.concurrency {
+        // How deep to run the sweep. While a guest is waiting for something,
+        // nearly all of it stands aside: a fork that is opening its database
+        // needs a few thousand scattered reads served quickly, and a sweep
+        // running at full depth puts a device's worth of transfers in front of
+        // each one. A floor rather than zero, so a guest that reads constantly
+        // cannot stop the fork from ever catching up.
+        let depth = if self.demand_stripes.is_empty() {
+            self.concurrency
+        } else {
+            SWEEP_DEPTH_WHILE_BUSY
+        };
+
+        while self.fetch_queue.len() < depth {
             let Some(stripe_id) = self.autofetch_queue.pop_front() else {
                 break;
             };
@@ -387,7 +403,12 @@ impl StripeFetcher {
 
             let buf = self.buffer_pool.get_buffer().unwrap();
             self.allocated_buffers.insert(stripe_id, buf.clone());
-            if let Err(e) = self.stripe_source.request(stripe_id, buf.clone()) {
+            let request = if self.demand_stripes.contains(&stripe_id) {
+                StripeSource::request_demand
+            } else {
+                StripeSource::request
+            };
+            if let Err(e) = request(self.stripe_source.as_mut(), stripe_id, buf.clone()) {
                 error!("Failed to request stripe {stripe_id} from source: {e:?}");
                 self.fetch_completed(stripe_id, false);
                 continue;
@@ -498,6 +519,7 @@ impl StripeFetcher {
 
     fn fetch_completed(&mut self, stripe_id: usize, success: bool) {
         debug!("Fetch completed for stripe {stripe_id}, success={success}");
+        self.demand_stripes.remove(&stripe_id);
 
         // Whatever the outcome, this stripe is no longer waiting on a push.
         if !self.pending_pushes.contains_key(&stripe_id) {
