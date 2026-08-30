@@ -168,6 +168,7 @@ impl BgWorker {
             }
             BgWorkerRequest::FetchCompleted { stripe_id, success } => {
                 if success {
+                    self.metadata_state.mark_stripe_fetched(stripe_id);
                     self.metadata_flusher.set_stripe_fetched(stripe_id);
                 } else {
                     error!("Stripe {stripe_id} fetch failed");
@@ -210,6 +211,9 @@ impl BgWorker {
             fetcher.update();
             for (stripe_id, success) in fetcher.take_finished_fetches() {
                 if success {
+                    // Unblocks anything waiting on this stripe now, rather than
+                    // once the flusher has worked through the sweep's backlog.
+                    self.metadata_state.mark_stripe_fetched(stripe_id);
                     self.metadata_flusher.set_stripe_fetched(stripe_id);
                 } else {
                     error!("Stripe {stripe_id} fetch failed");
