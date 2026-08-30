@@ -131,10 +131,7 @@ impl IngestPool {
     }
 
     fn worker_for(&self, stripe_id: usize) -> usize {
-        match self.range_starts.binary_search(&stripe_id) {
-            Ok(index) => index,
-            Err(index) => index.saturating_sub(1),
-        }
+        worker_for(&self.range_starts, stripe_id)
     }
 
     pub fn send(&self, stripe_id: usize, request: IngestRequest) {
@@ -153,6 +150,14 @@ impl IngestPool {
         for handle in self.handles.drain(..) {
             let _ = handle.join();
         }
+    }
+}
+
+/// The worker owning `stripe_id`, given where each one's range starts.
+fn worker_for(range_starts: &[usize], stripe_id: usize) -> usize {
+    match range_starts.binary_search(&stripe_id) {
+        Ok(index) => index,
+        Err(index) => index.saturating_sub(1),
     }
 }
 
@@ -247,5 +252,47 @@ impl IngestWorker {
                 permit,
             } => fetcher.accept_pushed_stripe(stripe_id, &data, permit),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every stripe belongs to exactly one worker, and the ranges are
+    /// contiguous — two workers asking for the same stripe would each fetch it,
+    /// and a stripe owned by nobody would never be swept.
+    #[test]
+    fn every_stripe_belongs_to_exactly_one_worker() {
+        let stripe_count = 1000;
+        for workers in [1usize, 3, 4, 7, 16] {
+            let starts: Vec<usize> = (0..workers)
+                .map(|index| stripe_count * index / workers)
+                .collect();
+            let mut owner_counts = vec![0usize; workers];
+            for stripe_id in 0..stripe_count {
+                let owner = worker_for(&starts, stripe_id);
+                assert!(owner < workers, "stripe {stripe_id} went to worker {owner}");
+                let start = starts[owner];
+                let end = starts.get(owner + 1).copied().unwrap_or(stripe_count);
+                assert!(
+                    (start..end).contains(&stripe_id),
+                    "stripe {stripe_id} routed to worker {owner}, whose range is {start}..{end}"
+                );
+                owner_counts[owner] += 1;
+            }
+            assert_eq!(owner_counts.iter().sum::<usize>(), stripe_count);
+            assert!(
+                owner_counts.iter().all(|count| *count > 0),
+                "with {workers} workers one of them was given nothing to do"
+            );
+        }
+    }
+
+    /// A stripe past the last range still goes somewhere rather than panicking.
+    #[test]
+    fn a_stripe_past_the_end_lands_on_the_last_worker() {
+        let starts = vec![0, 50, 100];
+        assert_eq!(worker_for(&starts, 10_000), 2);
     }
 }
