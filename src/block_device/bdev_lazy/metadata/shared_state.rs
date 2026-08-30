@@ -94,6 +94,15 @@ impl SharedMetadataState {
         }
     }
 
+    /// Record that a stripe has been written, before the flusher has persisted
+    /// it. What this state says is what a fork is told the source holds, and a
+    /// fork told a stripe holds nothing reads zeros there for good — so it has
+    /// to be true the moment the write completes, not once the metadata has
+    /// been written down.
+    pub fn mark_stripe_written(&self, stripe_id: usize) {
+        self.stripe_write_states[stripe_id].store(Written, Ordering::Release)
+    }
+
     pub fn set_stripe_failed(&self, stripe_id: usize) {
         self.stripe_fetch_states[stripe_id].store(Failed, Ordering::Release)
     }

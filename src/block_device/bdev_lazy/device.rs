@@ -123,6 +123,11 @@ impl LazyIoChannel {
                     .context(format!(
                         "failed to send set written request for stripe {stripe_id}"
                     ))?;
+                // Persisting the bit is the flusher's job and happens later,
+                // but the in-memory state is what a fork is served, and a fork
+                // that is told this stripe holds nothing will read zeros there
+                // rather than fetch it. Say so now.
+                self.metadata_state.mark_stripe_written(stripe_id);
             }
         }
         Ok(())

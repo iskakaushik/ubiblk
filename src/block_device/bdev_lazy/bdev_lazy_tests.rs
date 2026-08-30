@@ -331,6 +331,30 @@ mod tests {
         assert_eq!(results, vec![(flush_id, true)]);
     }
 
+    /// A written stripe has to be visible in the shared state as soon as the
+    /// write is submitted, without the worker having run.
+    ///
+    /// That state is what a fork is told its source holds, and a fork told a
+    /// stripe holds nothing reads zeros there rather than fetching it — for
+    /// good. Leaving it to the worker left a window where a stripe prod had
+    /// just written looked empty, which is how a fork ended up with a
+    /// zero-filled postgres file and refused to start.
+    #[test]
+    fn a_written_stripe_is_visible_before_the_worker_runs() {
+        let env = setup_env(false, true, b"");
+        let mut chan = env.lazy.create_channel().unwrap();
+
+        let write_buf: SharedBuffer = shared_buffer(SECTOR_SIZE);
+        write_buf.borrow_mut().as_mut_slice()[..4].copy_from_slice(b"data");
+        chan.add_write(env.stripe_sectors, 1, write_buf, 1);
+        chan.submit().unwrap();
+
+        assert!(
+            env.metadata_state.stripe_written(1),
+            "the stripe must count as written before the worker has processed anything"
+        );
+    }
+
     /// Verify tracking of written stripes when an image device is present.
     #[test]
     fn test_track_written_true_with_image() {
