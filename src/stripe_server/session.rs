@@ -241,6 +241,20 @@ impl StripeServerSession {
                 .inspect_err(|_| self.notify_server_error())?
         };
 
+        // The check above happened before the read; the write it was guarding
+        // against can land while the read is in flight, and then this would
+        // serve content from after the snapshot. Writes to a locked stripe are
+        // held until its copy-out completes, so if the stripe still has not
+        // been copied out now, nothing has overwritten it and what was read is
+        // the snapshot's. If it has, the copy that was pushed is the good one
+        // and this pull must not contradict it.
+        if let Some(state) = self.snapshot_state.as_ref() {
+            if state.snapshot_live() && !state.write_allowed_before_copy(stripe_id as usize) {
+                info!("Stripe {stripe_id} was copied out while being read; deferring to the push");
+                return self.reply_status(STATUS_ALREADY_PUSHED);
+            }
+        }
+
         let compression = self.compression;
         let stripe = stripe_data.borrow();
         let payload = compression.compress(stripe.as_slice())?;

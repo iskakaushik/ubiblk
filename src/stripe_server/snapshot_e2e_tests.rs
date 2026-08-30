@@ -5,7 +5,7 @@
 use std::{
     io::Write,
     net::{TcpListener, TcpStream},
-    sync::{mpsc::channel, Arc},
+    sync::{mpsc::channel, Arc, Condvar, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -14,7 +14,7 @@ use crate::stripe_server::WireCompression;
 use crate::{
     backends::SECTOR_SIZE,
     block_device::{
-        metadata_flags, shared_buffer, BlockDevice, IoChannel, SharedSnapshotState,
+        metadata_flags, shared_buffer, BlockDevice, IoChannel, SharedBuffer, SharedSnapshotState,
         SnapshotBlockDevice, SnapshotWorker, SyncBlockDevice, UbiMetadata,
     },
     stripe_server::{
@@ -222,4 +222,140 @@ fn subscribing_without_a_snapshot_is_refused() {
         WireCompression::Zstd,
     );
     assert!(result.is_err());
+}
+
+/// A device whose reads do not complete until the test says so, so a copy-out
+/// can be made to land while a pull is in flight — the window the check before
+/// the read cannot cover.
+#[derive(Clone)]
+struct HeldReadDevice {
+    inner: Arc<dyn BlockDevice>,
+    release: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl BlockDevice for HeldReadDevice {
+    fn create_channel(&self) -> crate::Result<Box<dyn IoChannel>> {
+        Ok(Box::new(HeldReadChannel {
+            inner: self.inner.create_channel()?,
+            release: self.release.clone(),
+        }))
+    }
+
+    fn sector_count(&self) -> u64 {
+        self.inner.sector_count()
+    }
+
+    fn clone(&self) -> Box<dyn BlockDevice> {
+        Box::new(Clone::clone(self))
+    }
+}
+
+struct HeldReadChannel {
+    inner: Box<dyn IoChannel>,
+    release: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl IoChannel for HeldReadChannel {
+    fn add_read(&mut self, sector_offset: u64, sector_count: u32, buf: SharedBuffer, id: usize) {
+        self.inner.add_read(sector_offset, sector_count, buf, id)
+    }
+    fn add_write(&mut self, sector_offset: u64, sector_count: u32, buf: SharedBuffer, id: usize) {
+        self.inner.add_write(sector_offset, sector_count, buf, id)
+    }
+    fn add_flush(&mut self, id: usize) {
+        self.inner.add_flush(id)
+    }
+    fn submit(&mut self) -> crate::Result<()> {
+        self.inner.submit()
+    }
+    fn poll(&mut self) -> Vec<(usize, bool)> {
+        let (lock, condvar) = &*self.release;
+        let mut released = lock.lock().unwrap();
+        while !*released {
+            released = condvar.wait(released).unwrap();
+        }
+        self.inner.poll()
+    }
+    fn busy(&self) -> bool {
+        self.inner.busy()
+    }
+}
+
+/// A pull that is already reading when the stripe is copied out must not be
+/// answered with what the write left behind.
+///
+/// Writes to a locked stripe wait for its copy-out, so a stripe that has not
+/// been copied out by the time the read finishes cannot have been overwritten.
+/// One that has been is refused, and the fork keeps the copy that was pushed.
+#[test]
+fn a_pull_racing_a_copy_out_is_refused() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    file.as_file()
+        .write_all(&vec![pre_write_byte(0); STRIPES * STRIPE_BYTES])
+        .unwrap();
+    file.as_file().sync_all().unwrap();
+
+    let disk = SyncBlockDevice::new(file.path().to_path_buf(), false, false, false).unwrap();
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let held = HeldReadDevice {
+        inner: Arc::from(BlockDevice::clone(disk.as_ref())),
+        release: release.clone(),
+    };
+
+    let (snapshot_ch, _snapshot_requests) = channel();
+    let snapshot_device = SnapshotBlockDevice::new(
+        BlockDevice::clone(disk.as_ref()),
+        STRIPE_SHIFT,
+        snapshot_ch.clone(),
+    );
+    let state = snapshot_device.state();
+
+    let mut metadata = UbiMetadata::new(STRIPE_SHIFT, STRIPES, 0);
+    for stripe_id in 0..STRIPES {
+        metadata.stripe_headers[stripe_id] |= metadata_flags::WRITTEN;
+    }
+
+    let server = Arc::new(
+        StripeServer::new(Arc::new(held), Arc::from(metadata), None)
+            .with_snapshot(snapshot_ch, state.clone()),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { break };
+            let server = server.clone();
+            thread::spawn(move || {
+                let mut session = server.start_session(Box::new(stream)).unwrap();
+                session.handle_requests();
+            });
+        }
+    });
+
+    state.lock_all();
+
+    // Ask for a stripe, let the read start, then copy it out underneath the
+    // reader before releasing the read.
+    let state_for_writer = state.clone();
+    let release_for_writer = release.clone();
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(200));
+        assert!(state_for_writer.begin_copy(0));
+        state_for_writer.finish_copy(0);
+        let (lock, condvar) = &*release_for_writer;
+        *lock.lock().unwrap() = true;
+        condvar.notify_all();
+    });
+
+    let mut puller = StripeServerClient::new(Box::new(TcpStream::connect(address).unwrap()))
+        .wanting(WireCompression::None);
+    puller.hello().unwrap();
+    puller.fetch_metadata().unwrap();
+    let err = puller
+        .fetch_stripe(0)
+        .expect_err("a stripe copied out mid-read must not be served");
+    assert!(
+        format!("{err}").contains("already pushed"),
+        "expected the pull to defer to the push, got: {err}"
+    );
 }
