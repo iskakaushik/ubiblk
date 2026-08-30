@@ -671,7 +671,7 @@ pub fn build_block_device(
         PathBuf::from(path),
         config.tuning.queue_size,
         readonly,
-        true,
+        config.tuning.direct_io,
         config.tuning.write_through,
     )?;
 

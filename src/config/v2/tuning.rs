@@ -31,6 +31,15 @@ pub struct TuningSection {
     pub io_engine: IoEngine,
     #[serde(default)]
     pub write_through: bool,
+    /// Bypass the page cache for the device's own file.
+    ///
+    /// On by default, which is what a device serving a guest wants: no double
+    /// caching, and a write is on the medium when it completes. A fork catching
+    /// up is a different shape — its guest blocks on one stripe at a time while
+    /// it starts up, and the megabyte written for each of those is most of what
+    /// it waits for.
+    #[serde(default = "default_direct_io")]
+    pub direct_io: bool,
     /// Threads taking stripes in from the source, each owning a contiguous
     /// range of the device.
     ///
@@ -47,6 +56,10 @@ fn default_ingest_workers() -> usize {
     1
 }
 
+fn default_direct_io() -> bool {
+    true
+}
+
 impl Default for TuningSection {
     fn default() -> Self {
         Self {
@@ -59,6 +72,7 @@ impl Default for TuningSection {
             io_engine: IoEngine::default(),
             ingest_workers: default_ingest_workers(),
             write_through: false,
+            direct_io: default_direct_io(),
         }
     }
 }
