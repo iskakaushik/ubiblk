@@ -220,8 +220,20 @@ impl StripeFetcher {
             return;
         }
 
-        if self.stripe_states.contains_key(&stripe_id) {
-            debug!("Stripe {stripe_id} has already been requested");
+        if let Some(state) = self.stripe_states.get(&stripe_id).copied() {
+            // Already asked for. If the sweep asked and a guest is now waiting,
+            // it has to be promoted: left where it is, it sits behind however
+            // much of the device the sweep has queued ahead of it. This is what
+            // made a fork's filesystem take minutes to mount while completing
+            // barely a megabyte of reads — every one of them was waiting on a
+            // stripe the sweep had already claimed.
+            if state == FetchState::Queued && !self.demand_stripes.contains(&stripe_id) {
+                debug!("Promoting stripe {stripe_id}: a guest is waiting for it now");
+                self.demand_stripes.insert(stripe_id);
+                self.last_demand_at = Some(Instant::now());
+                self.fetch_queue.retain(|queued| *queued != stripe_id);
+                self.fetch_queue.push_front(stripe_id);
+            }
             return;
         }
 
@@ -879,6 +891,40 @@ mod tests {
         assert_eq!(
             state.target_dev.metrics.read().unwrap().writes,
             writes_before
+        );
+    }
+
+    /// A guest waiting for a stripe the sweep has already queued must not have
+    /// to wait its turn: the sweep's queue is as long as the device, so that is
+    /// the difference between a read served now and one served minutes from
+    /// now.
+    #[test]
+    fn a_guest_read_promotes_a_stripe_the_sweep_had_queued() {
+        let mut state = prep(true);
+
+        // Let the sweep fill its queue from the start of the device.
+        state.fetcher.update_autofetch();
+        let queued_by_sweep = state.fetcher.fetch_queue.len();
+        assert!(
+            queued_by_sweep > 1,
+            "the sweep should have queued a backlog"
+        );
+        let wanted = *state
+            .fetcher
+            .fetch_queue
+            .back()
+            .expect("the sweep queued something");
+
+        state.fetcher.handle_fetch_request(wanted);
+
+        assert_eq!(
+            state.fetcher.fetch_queue.front().copied(),
+            Some(wanted),
+            "the stripe a guest is waiting for should be next, not last"
+        );
+        assert!(
+            state.fetcher.demand_stripes.contains(&wanted),
+            "and it should count as demand, so the sweep stands aside"
         );
     }
 
