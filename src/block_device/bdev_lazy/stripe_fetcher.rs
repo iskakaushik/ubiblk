@@ -29,6 +29,10 @@ const FLUSH_BATCH_ID: usize = usize::MAX;
 const SWEEP_DEPTH_WHILE_BUSY: usize = 2;
 /// Stripes fetched past the one a guest asked for.
 const DEMAND_READAHEAD: usize = 7;
+/// How long after a guest's last read the sweep keeps out of the way. Long
+/// enough to cover the gap between one dependent read and the next, short
+/// enough that an idle guest gets the device fetched.
+const SWEEP_YIELD_WINDOW: Duration = Duration::from_millis(500);
 const MAX_FETCH_RETRIES: u8 = 3;
 
 /// How long a fork keeps retrying a stripe its snapshot server refuses to serve.
@@ -72,6 +76,12 @@ pub struct StripeFetcher {
     /// and postgres opening is a few thousand page reads that should not be
     /// queued behind a sweep of the whole device.
     demand_stripes: std::collections::HashSet<usize>,
+    /// When a guest last wanted something. Checking only whether one is
+    /// outstanding right now is not enough: a guest doing dependent reads has a
+    /// gap between each one, the sweep fills the pipe in that gap, and the next
+    /// read waits behind it. So the sweep stays out of the way for a while
+    /// after the last one, not just during it.
+    last_demand_at: Option<Instant>,
     /// Stripes the snapshot server pushed while a pull for them was in flight.
     /// Applied once that pull finishes: after a copy-out the server refuses to
     /// serve the stripe, so the pushed copy is the only correct one.
@@ -154,6 +164,7 @@ impl StripeFetcher {
             first_failure: HashMap::new(),
             allocated_buffers: HashMap::new(),
             demand_stripes: std::collections::HashSet::new(),
+            last_demand_at: None,
             pending_pushes: HashMap::new(),
             push_permits: HashMap::new(),
             finished_fetches: Vec::new(),
@@ -216,6 +227,7 @@ impl StripeFetcher {
 
         debug!("Enqueueing stripe {stripe_id} for fetch");
         self.demand_stripes.insert(stripe_id);
+        self.last_demand_at = Some(Instant::now());
         // A guest is waiting on this one, and the queue behind it is background
         // work, so it goes to the front.
         self.fetch_queue.push_front(stripe_id);
@@ -395,10 +407,14 @@ impl StripeFetcher {
         // running at full depth puts a device's worth of transfers in front of
         // each one. A floor rather than zero, so a guest that reads constantly
         // cannot stop the fork from ever catching up.
-        let depth = if self.demand_stripes.is_empty() {
-            self.concurrency
-        } else {
+        let guest_is_active = !self.demand_stripes.is_empty()
+            || self
+                .last_demand_at
+                .is_some_and(|at| at.elapsed() < SWEEP_YIELD_WINDOW);
+        let depth = if guest_is_active {
             SWEEP_DEPTH_WHILE_BUSY
+        } else {
+            self.concurrency
         };
 
         while self.fetch_queue.len() < depth {
