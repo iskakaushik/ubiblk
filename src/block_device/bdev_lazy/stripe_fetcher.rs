@@ -27,6 +27,8 @@ const FETCHES_PER_CONNECTION: usize = 2;
 const FLUSH_BATCH_ID: usize = usize::MAX;
 /// Sweep requests kept in flight while a guest is waiting for a stripe.
 const SWEEP_DEPTH_WHILE_BUSY: usize = 2;
+/// Stripes fetched past the one a guest asked for.
+const DEMAND_READAHEAD: usize = 7;
 const MAX_FETCH_RETRIES: u8 = 3;
 
 /// How long a fork keeps retrying a stripe its snapshot server refuses to serve.
@@ -175,6 +177,30 @@ impl StripeFetcher {
     }
 
     pub fn handle_fetch_request(&mut self, stripe_id: usize) {
+        // Read a little ahead of the guest. Every stripe fetched on demand
+        // costs a round trip, a megabyte written and a flush, and a guest doing
+        // that one stripe at a time — mounting a filesystem, say, or replaying
+        // a journal — spends all of its time waiting for the last one. Reading
+        // ahead puts several in flight for work that is nearly always
+        // sequential.
+        //
+        // Only where the whole device is being swept anyway: there these
+        // stripes are going to be fetched regardless and this only changes the
+        // order, while on a device that fetches purely on demand it would turn
+        // one stripe a guest wanted into eight it did not.
+        let readahead = if self.autofetch { DEMAND_READAHEAD } else { 0 };
+        let last = self
+            .shared_metadata_state
+            .stripe_count()
+            .saturating_sub(1)
+            .min(stripe_id + readahead);
+        for ahead in (stripe_id..=last).rev() {
+            self.enqueue_demand(ahead);
+        }
+    }
+
+    /// Queue a stripe a guest is waiting for, ahead of the background sweep.
+    fn enqueue_demand(&mut self, stripe_id: usize) {
         if self
             .shared_metadata_state
             .stripe_fetched_if_needed(stripe_id)
@@ -633,6 +659,8 @@ mod tests {
         for _ in 0..10 {
             state.fetcher.update();
         }
+        // No sweep on this device, so a request fetches exactly what was asked
+        // for.
         let finished = state.fetcher.take_finished_fetches();
         assert_eq!(finished.len(), 1);
         assert_eq!(finished[0], (0, true));
@@ -836,6 +864,28 @@ mod tests {
             state.target_dev.metrics.read().unwrap().writes,
             writes_before
         );
+    }
+
+    /// On a device that is sweeping anyway, a guest's read pulls the stripes
+    /// after it too. Those were going to be fetched regardless, and fetching
+    /// them now means a guest reading its way through a device — mounting a
+    /// filesystem, replaying a journal — has several in flight instead of
+    /// waiting for one at a time.
+    #[test]
+    fn a_guest_read_pulls_the_stripes_after_it_when_sweeping() {
+        let mut state = prep(true);
+        state.fetcher.handle_fetch_request(100);
+        for _ in 0..10 {
+            state.fetcher.update();
+        }
+
+        let finished = state.fetcher.take_finished_fetches();
+        for stripe_id in 100..=100 + DEMAND_READAHEAD {
+            assert!(
+                finished.contains(&(stripe_id, true)),
+                "stripe {stripe_id} should have been read ahead"
+            );
+        }
     }
 
     #[test]
