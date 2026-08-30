@@ -31,15 +31,20 @@ pub struct TuningSection {
     pub io_engine: IoEngine,
     #[serde(default)]
     pub write_through: bool,
-    /// Threads taking stripes in from the source. One is enough for a local
-    /// source; fetching over a network wants several, since each one spends
-    /// most of its time waiting.
+    /// Threads taking stripes in from the source, each owning a contiguous
+    /// range of the device.
+    ///
+    /// One by default, because measurement says so: on a pair of 8-vCPU VMs a
+    /// fork pulling a 16 GiB device managed 509 MB/s with one worker, 435 with
+    /// four and 368 with eight. Past one worker the fetching side is no longer
+    /// what a fork waits for — the server is — and the extra threads only cost
+    /// CPU. The knob is here because that balance depends on the deployment.
     #[serde(default = "default_ingest_workers")]
     pub ingest_workers: usize,
 }
 
 fn default_ingest_workers() -> usize {
-    4
+    1
 }
 
 impl Default for TuningSection {

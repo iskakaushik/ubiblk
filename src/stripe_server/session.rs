@@ -257,13 +257,21 @@ impl StripeServerSession {
         Ok(())
     }
 
+    /// This session's stripe buffer, allocated once and handed out again for
+    /// every stripe: a session serves one stripe at a time, so one is enough.
+    fn stripe_buffer(&mut self) -> SharedBuffer {
+        let stripe_len_bytes = self.metadata.stripe_size();
+        self.stripe_buffer
+            .get_or_insert_with(|| shared_buffer(stripe_len_bytes))
+            .clone()
+    }
+
     fn read_stripe(&mut self, stripe_id: u64) -> Result<SharedBuffer> {
         let stripe_sector_count = self.metadata.stripe_sector_count() as u32;
-        let stripe_len_bytes = self.metadata.stripe_size();
 
         let offset = stripe_id * (stripe_sector_count as u64);
 
-        let buffer = shared_buffer(stripe_len_bytes);
+        let buffer = self.stripe_buffer();
         self.stripe_channel
             .add_read(offset, stripe_sector_count, buffer.clone(), 0);
         self.stripe_channel.submit()?;
@@ -277,7 +285,7 @@ impl StripeServerSession {
     }
 
     fn read_stripe_from_source(&mut self, stripe_id: u64) -> Result<SharedBuffer> {
-        let buffer = shared_buffer(self.metadata.stripe_size());
+        let buffer = self.stripe_buffer();
         let source = self.source.as_mut().expect("caller checked source exists");
         source.request(stripe_id as usize, buffer.clone())?;
         source.wait_for_stripe(stripe_id as usize, std::time::Duration::from_secs(30))?;

@@ -4,6 +4,7 @@ use std::{
 };
 
 use crate::{
+    block_device::SharedBuffer,
     block_device::{
         BlockDevice, IoChannel, SharedMetadataState, SharedSnapshotState, SnapshotRequest,
         UbiMetadata,
@@ -67,6 +68,10 @@ pub struct StripeServer {
 
 pub struct StripeServerSession {
     stream: Option<DynStream>,
+    /// One buffer, reused for every stripe this session serves. Allocating a
+    /// megabyte per request means faulting in and zeroing a megabyte per
+    /// request, which the serving side pays on every stripe a fork pulls.
+    stripe_buffer: Option<SharedBuffer>,
     /// How stripe payloads are encoded on this session, agreed at hello or
     /// subscribe time. Uncompressed until then.
     compression: WireCompression,
@@ -137,6 +142,7 @@ impl StripeServer {
             .transpose()?;
         Ok(StripeServerSession {
             stream: Some(stream),
+            stripe_buffer: None,
             compression: WireCompression::default(),
             metadata: self.metadata.clone(),
             stripe_channel,
