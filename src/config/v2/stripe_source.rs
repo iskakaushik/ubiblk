@@ -34,6 +34,15 @@ pub enum StripeSourceConfig {
 }
 
 impl StripeSourceConfig {
+    /// How many connections this source may open, for callers sizing work
+    /// around it. Only a remote source has any.
+    pub fn connections(&self) -> usize {
+        match self {
+            StripeSourceConfig::Remote(config) => config.connections,
+            _ => 1,
+        }
+    }
+
     pub fn autofetch(&self) -> bool {
         match self {
             StripeSourceConfig::Raw { autofetch, .. } => *autofetch,

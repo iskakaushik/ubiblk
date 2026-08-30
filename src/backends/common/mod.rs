@@ -31,7 +31,7 @@ use std::sync::Arc;
 pub const SECTOR_SIZE: usize = 512;
 
 struct BgWorkerConfig {
-    target_dev: Box<dyn BlockDevice>,
+    target_dev: Arc<dyn BlockDevice>,
     stripe_source_builder: Box<StripeSourceBuilder>,
     metadata_dev: Box<dyn BlockDevice>,
     alignment: usize,
@@ -39,6 +39,11 @@ struct BgWorkerConfig {
     expects_pushes: bool,
     shared_state: SharedMetadataState,
     receiver: Receiver<BgWorkerRequest>,
+    /// A sender on `receiver`'s channel, for ingest workers to report finished
+    /// stripes to the coordinator that owns the metadata.
+    completions: Sender<BgWorkerRequest>,
+    workers: usize,
+    connections: usize,
 }
 
 /// The snapshot layer's shared state plus what is needed to start its worker.
@@ -291,7 +296,7 @@ impl BackendEnv {
         ));
 
         let bgworker_config = BgWorkerConfig {
-            target_dev: disk_device,
+            target_dev: Arc::from(disk_device),
             stripe_source_builder,
             metadata_dev: metadata_device,
             alignment,
@@ -304,6 +309,12 @@ impl BackendEnv {
             expects_pushes: config.device.snapshot_source.is_some(),
             shared_state,
             receiver: bgworker_receiver,
+            completions: bgworker_sender.clone(),
+            workers: config.tuning.ingest_workers,
+            connections: config
+                .stripe_source
+                .as_ref()
+                .map_or(1, |stripe_source| stripe_source.connections()),
         };
 
         Ok(BackendEnv {
@@ -403,7 +414,26 @@ impl BackendEnv {
             expects_pushes,
             shared_state,
             receiver,
+            completions,
+            workers,
+            connections,
         } = config;
+
+        if workers > 1 {
+            return BgWorker::with_ingest_pool(
+                target_dev,
+                *stripe_source_builder,
+                &*metadata_dev,
+                alignment,
+                autofetch,
+                expects_pushes,
+                shared_state,
+                receiver,
+                completions,
+                workers,
+                connections,
+            );
+        }
 
         let stripe_source = match stripe_source_builder.build() {
             Ok(source) => source,
@@ -835,13 +865,16 @@ mod tests {
         (
             BgWorkerConfig {
                 expects_pushes: false,
-                target_dev: Box::new(target_dev),
+                target_dev: Arc::new(target_dev),
                 stripe_source_builder,
                 metadata_dev: Box::new(metadata_dev),
                 alignment: 4096,
                 autofetch: false,
                 shared_state,
                 receiver,
+                completions: sender.clone(),
+                workers: 1,
+                connections: 1,
             },
             sender,
         )

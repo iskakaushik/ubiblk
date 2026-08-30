@@ -12,6 +12,12 @@ pub trait StripeSource {
     fn sector_count(&self) -> u64;
     /// Does the stripe source have the given stripe?
     fn has_stripe(&self, stripe_id: usize) -> bool;
+    /// How many requests this source can usefully have outstanding. A remote
+    /// source fetches over several connections at once and is idle unless the
+    /// fetcher keeps them all fed.
+    fn max_concurrent_requests(&self) -> usize {
+        1
+    }
 }
 
 mod archive;

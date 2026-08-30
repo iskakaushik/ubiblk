@@ -56,6 +56,10 @@ impl SharedMetadataState {
         1u64 << self.stripe_sector_count_shift
     }
 
+    pub fn stripe_count(&self) -> usize {
+        self.stripe_fetch_states.len()
+    }
+
     pub fn sector_to_stripe_id(&self, sector: u64) -> usize {
         (sector >> self.stripe_sector_count_shift) as usize
     }

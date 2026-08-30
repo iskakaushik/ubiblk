@@ -15,7 +15,16 @@ use crate::{
     Result,
 };
 
-const MAX_CONCURRENT_FETCHES: usize = 16;
+/// Fetches in flight when the source does not say what it can take. A local
+/// source answers immediately, so one at a time costs nothing there.
+const DEFAULT_CONCURRENT_FETCHES: usize = 16;
+/// Requests per connection to keep outstanding. Two means a connection has its
+/// next stripe to ask for the moment it finishes one, instead of waiting for
+/// the fetcher to come round again.
+const FETCHES_PER_CONNECTION: usize = 2;
+/// Completion id for a batched flush. Stripe ids index the device, so this is
+/// past any of them.
+const FLUSH_BATCH_ID: usize = usize::MAX;
 const MAX_FETCH_RETRIES: u8 = 3;
 
 /// How long a fork keeps retrying a stripe its snapshot server refuses to serve.
@@ -66,6 +75,18 @@ pub struct StripeFetcher {
     finished_fetches: Vec<(usize, bool)>,
     autofetch: bool,
     disconnected: bool,
+    /// How many stripes to keep in flight. Sized from the source: a fetcher
+    /// that asks for one stripe at a time leaves every connection but one idle
+    /// and turns each stripe's round trip into the whole cost of the transfer.
+    concurrency: usize,
+    /// Stripes written to the target and waiting for a flush to make them
+    /// durable. They are flushed together — one flush covers every write that
+    /// completed before it was issued, so a batch costs one flush, not one
+    /// each.
+    awaiting_flush: Vec<usize>,
+    /// The batch the in-flight flush will make durable, empty when no flush is
+    /// outstanding.
+    flushing_batch: Vec<usize>,
 }
 
 impl StripeFetcher {
@@ -88,7 +109,9 @@ impl StripeFetcher {
             })?;
         let stripe_size = stripe_size_u64 as usize;
 
-        let buffer_pool = AlignedBufferPool::new(alignment, MAX_CONCURRENT_FETCHES, stripe_size);
+        let concurrency = (stripe_source.max_concurrent_requests() * FETCHES_PER_CONNECTION)
+            .max(DEFAULT_CONCURRENT_FETCHES);
+        let buffer_pool = AlignedBufferPool::new(alignment, concurrency, stripe_size);
         let source_sector_count = stripe_source.sector_count();
         let target_sector_count = target_dev.sector_count();
         if target_sector_count < source_sector_count {
@@ -127,6 +150,9 @@ impl StripeFetcher {
             autofetch,
             autofetch_queue,
             disconnected: false,
+            concurrency,
+            awaiting_flush: Vec::new(),
+            flushing_batch: Vec::new(),
         })
     }
 
@@ -134,6 +160,8 @@ impl StripeFetcher {
         !self.fetch_queue.is_empty()
             || self.stripe_source.busy()
             || self.fetch_target_channel.busy()
+            || !self.awaiting_flush.is_empty()
+            || !self.flushing_batch.is_empty()
             || !self.finished_fetches.is_empty()
             || !self.autofetch_queue.is_empty()
     }
@@ -153,6 +181,30 @@ impl StripeFetcher {
         }
 
         debug!("Enqueueing stripe {stripe_id} for fetch");
+        // A guest is waiting on this one, and the queue behind it is background
+        // work, so it goes to the front.
+        self.fetch_queue.push_front(stripe_id);
+        self.stripe_states.insert(stripe_id, FetchState::Queued);
+    }
+
+    /// Sweep only this part of the device, so several fetchers can share the
+    /// work without ever asking for the same stripe. Contiguous, not striped:
+    /// each one then writes its own region in order instead of interleaving
+    /// with the others.
+    pub fn restrict_autofetch_to(&mut self, start: usize, end: usize) {
+        self.autofetch_queue = (start..end).collect();
+    }
+
+    /// Queue a stripe the background sweep wants, behind anything a guest is
+    /// waiting for.
+    fn enqueue_autofetch(&mut self, stripe_id: usize) {
+        if self
+            .shared_metadata_state
+            .stripe_fetched_if_needed(stripe_id)
+            || self.stripe_states.contains_key(&stripe_id)
+        {
+            return;
+        }
         self.fetch_queue.push_back(stripe_id);
         self.stripe_states.insert(stripe_id, FetchState::Queued);
     }
@@ -298,10 +350,20 @@ impl StripeFetcher {
     }
 
     pub fn update_autofetch(&mut self) {
-        if self.autofetch && self.fetch_queue.is_empty() {
-            if let Some(stripe_id) = self.autofetch_queue.pop_front() {
-                self.handle_fetch_request(stripe_id);
-            }
+        if !self.autofetch {
+            return;
+        }
+
+        // Top the queue up rather than adding one stripe once it drains. The
+        // source fetches over several connections at once, and a queue that
+        // holds a single stripe leaves all but one of them idle: catch-up then
+        // runs at one stripe per round trip no matter how much bandwidth is
+        // there.
+        while self.fetch_queue.len() < self.concurrency {
+            let Some(stripe_id) = self.autofetch_queue.pop_front() else {
+                break;
+            };
+            self.enqueue_autofetch(stripe_id);
         }
     }
 
@@ -358,32 +420,59 @@ impl StripeFetcher {
             }
         }
 
-        // Handle completions from the target channel. We'll start flushing the
-        // ones that were successfully written to the target.
-        for (stripe_id, success) in self.fetch_target_channel.poll() {
-            if !success {
-                self.fetch_completed(stripe_id, false);
+        // Handle completions from the target channel: writes join the next
+        // flush batch, and a finished flush completes everything it covered.
+        for (id, success) in self.fetch_target_channel.poll() {
+            if id == FLUSH_BATCH_ID {
+                let batch = std::mem::take(&mut self.flushing_batch);
+                for stripe_id in batch {
+                    self.fetch_completed(stripe_id, success);
+                }
                 continue;
             }
 
-            match self.stripe_states.get(&stripe_id) {
+            if !success {
+                self.fetch_completed(id, false);
+                continue;
+            }
+
+            match self.stripe_states.get(&id) {
                 Some(FetchState::Fetching) => {
-                    debug!("Stripe {stripe_id} write completed, flushing...");
-                    if self.start_flush(stripe_id) {
-                        self.stripe_states.insert(stripe_id, FetchState::Flushing);
-                    } else {
-                        self.fetch_completed(stripe_id, false);
-                        continue;
-                    }
-                }
-                Some(FetchState::Flushing) => {
-                    self.fetch_completed(stripe_id, success);
+                    debug!("Stripe {id} write completed, waiting for a flush");
+                    self.stripe_states.insert(id, FetchState::Flushing);
+                    self.awaiting_flush.push(id);
                 }
                 _ => {
-                    error!("Unexpected state for stripe {stripe_id} after write");
+                    error!("Unexpected state for stripe {id} after write");
                 }
             }
         }
+
+        self.start_flush_batch();
+    }
+
+    /// Flush everything written since the last flush, in one go. One flush
+    /// makes every write that completed before it durable, so a batch of
+    /// stripes costs one rather than one each — which is most of what a fetcher
+    /// running at full depth is doing.
+    fn start_flush_batch(&mut self) {
+        if self.awaiting_flush.is_empty() || !self.flushing_batch.is_empty() {
+            return;
+        }
+
+        let batch = std::mem::take(&mut self.awaiting_flush);
+        self.fetch_target_channel.add_flush(FLUSH_BATCH_ID);
+        if let Err(e) = self.fetch_target_channel.submit() {
+            error!(
+                "Failed to submit flush for {} stripe(s): {e:?}",
+                batch.len()
+            );
+            for stripe_id in batch {
+                self.fetch_completed(stripe_id, false);
+            }
+            return;
+        }
+        self.flushing_batch = batch;
     }
 
     fn start_write(&mut self, buf: SharedBuffer, stripe_id: usize) -> bool {
@@ -401,17 +490,6 @@ impl StripeFetcher {
 
         if let Err(e) = self.fetch_target_channel.submit() {
             error!("Failed to submit write for stripe {stripe_id}: {e:?}");
-            false
-        } else {
-            true
-        }
-    }
-
-    fn start_flush(&mut self, stripe_id: usize) -> bool {
-        self.fetch_target_channel.add_flush(stripe_id);
-
-        if let Err(e) = self.fetch_target_channel.submit() {
-            error!("Failed to submit flush for stripe {stripe_id}: {e:?}");
             false
         } else {
             true
@@ -794,9 +872,12 @@ mod tests {
         let mut finished = state.fetcher.take_finished_fetches();
         assert!(!finished.is_empty());
 
-        // We shouldn't have finished the following stripes in the first 20
-        // cycles yet.
-        let priority_list = vec![100, 110, 122];
+        // Stripes at the far end of the device, which the sweep works towards
+        // in order and cannot have reached yet. How far it has got by now
+        // depends on how many fetches it keeps in flight, so the test picks
+        // stripes it is nowhere near rather than assuming a pace.
+        let last = state.fetcher.source_stripe_count() as usize - 1;
+        let priority_list = vec![last - 2, last - 1, last];
         for stripe_id in &priority_list {
             assert!(finished.iter().all(|(sid, _)| *sid != *stripe_id));
         }
@@ -811,11 +892,15 @@ mod tests {
         }
         let finished_2nd_batch = state.fetcher.take_finished_fetches();
 
-        // The explicit requests should have been prioritized and completed.
+        // The explicit requests jump the sweep's backlog, so they are in the
+        // first handful to complete rather than in device order.
         for stripe_id in &priority_list {
-            assert!(finished_2nd_batch[..priority_list.len() + 1]
-                .iter()
-                .any(|(sid, _)| *sid == *stripe_id));
+            assert!(
+                finished_2nd_batch[..priority_list.len() + 1]
+                    .iter()
+                    .any(|(sid, _)| *sid == *stripe_id),
+                "stripe {stripe_id} should have been served ahead of the sweep"
+            );
         }
 
         finished.extend(finished_2nd_batch);

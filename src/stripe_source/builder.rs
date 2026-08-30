@@ -19,6 +19,7 @@ use crate::{
 
 use super::*;
 
+#[derive(Clone)]
 pub struct StripeSourceBuilder {
     device_config: v2::Config,
     stripe_sector_count: u64,
@@ -40,6 +41,17 @@ impl StripeSourceBuilder {
 
     #[error_context("Failed to build stripe source")]
     pub fn build(&self) -> Result<Box<dyn StripeSource>> {
+        self.build_with_connections(None)
+    }
+
+    /// Build a source that opens `connections` connections instead of what the
+    /// config asks for. Ingest workers share the configured budget rather than
+    /// each opening a full set.
+    #[error_context("Failed to build stripe source")]
+    pub fn build_with_connections(
+        &self,
+        connection_override: Option<usize>,
+    ) -> Result<Box<dyn StripeSource>> {
         // If already fetched all stripes, no need to build a real source
         if self.has_fetched_all_stripes {
             info!("All stripes have been fetched; using NullBlockDevice as stripe source");
@@ -63,7 +75,7 @@ impl StripeSourceBuilder {
                     // `connections` is validated (> 0) when the config is loaded;
                     // honor it as-is so a misconfiguration surfaces rather than
                     // being silently coerced.
-                    let connections = config.connections;
+                    let connections = connection_override.unwrap_or(config.connections).max(1);
                     // A factory that dials a fresh connection; reused both for
                     // the initial pool and for a worker to reconnect on failure.
                     let config = config.clone();

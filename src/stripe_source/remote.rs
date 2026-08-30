@@ -140,6 +140,7 @@ pub struct RemoteStripeSource {
     request_tx: Sender<usize>,
     result_rx: Receiver<FetchOutcome>,
     pending: HashMap<usize, SharedBuffer>,
+    connection_count: usize,
 }
 
 impl RemoteStripeSource {
@@ -230,6 +231,7 @@ impl RemoteStripeSource {
             request_tx,
             result_rx,
             pending: HashMap::new(),
+            connection_count,
         })
     }
 
@@ -308,6 +310,10 @@ impl StripeSource for RemoteStripeSource {
 
     fn sector_count(&self) -> u64 {
         self.source_sector_count
+    }
+
+    fn max_concurrent_requests(&self) -> usize {
+        self.connection_count
     }
 
     fn has_stripe(&self, stripe_id: usize) -> bool {

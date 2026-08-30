@@ -31,6 +31,15 @@ pub struct TuningSection {
     pub io_engine: IoEngine,
     #[serde(default)]
     pub write_through: bool,
+    /// Threads taking stripes in from the source. One is enough for a local
+    /// source; fetching over a network wants several, since each one spends
+    /// most of its time waiting.
+    #[serde(default = "default_ingest_workers")]
+    pub ingest_workers: usize,
+}
+
+fn default_ingest_workers() -> usize {
+    4
 }
 
 impl Default for TuningSection {
@@ -43,6 +52,7 @@ impl Default for TuningSection {
             poll_timeout_us: default_poll_timeout_us(),
             cpus: None,
             io_engine: IoEngine::default(),
+            ingest_workers: default_ingest_workers(),
             write_through: false,
         }
     }
@@ -55,6 +65,14 @@ impl TuningSection {
                 description: format!(
                     "num_queues {} is out of range (must be 1..={})",
                     self.num_queues, MAX_NUM_QUEUES
+                ),
+            }));
+        }
+        if self.ingest_workers == 0 || self.ingest_workers > 64 {
+            return Err(ubiblk_error!(InvalidParameter {
+                description: format!(
+                    "ingest_workers {} is out of range (must be 1..=64)",
+                    self.ingest_workers
                 ),
             }));
         }
