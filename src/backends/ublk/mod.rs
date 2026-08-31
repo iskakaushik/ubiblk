@@ -5,6 +5,7 @@ use libublk::{
 };
 use log::{error, info, warn};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use ubiblk_macros::error_context;
 
 use crate::{
@@ -17,6 +18,12 @@ use crate::{
 mod io_handler;
 
 use io_handler::UblkIoHandler;
+
+/// How long to wait for the kernel to complete UBLK_U_CMD_ADD_DEV.
+const DEVICE_CREATE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long to wait for the block device node before creating the symlink.
+const DEVICE_NODE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UblkOp {
@@ -66,16 +73,12 @@ fn serve_ublk(backend_env: &BackendEnv, device_symlink: Option<PathBuf>) -> Resu
     let queue_size = config.tuning.queue_size as u16;
     let io_buf_bytes = config.tuning.seg_size_max;
 
-    let ctrl = std::sync::Arc::new(
-        UblkCtrlBuilder::default()
-            .name(&device_name)
-            .nr_queues(num_queues)
-            .depth(queue_size)
-            .io_buf_bytes(io_buf_bytes)
-            // Add the device immediately so the backend can bind queues in run_target.
-            .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
-            .build()?,
-    );
+    let ctrl = std::sync::Arc::new(create_ublk_ctrl(
+        device_name,
+        num_queues,
+        queue_size,
+        io_buf_bytes,
+    )?);
 
     // Ensure the kernel device is torn down on Ctrl-C so we don't leave a stale
     // /dev/ublk* entry if the process exits without a clean shutdown.
@@ -110,6 +113,49 @@ fn serve_ublk(backend_env: &BackendEnv, device_symlink: Option<PathBuf>) -> Resu
     Ok(())
 }
 
+/// Create the ublk control device with a bounded wait. libublk issues
+/// ADD_DEV synchronously inside `UblkCtrlBuilder::build`, and on kernels with
+/// a broken ublk driver the completion never arrives and the wait is
+/// uninterruptible — so build on a separate thread and time out instead of
+/// hanging the backend forever.
+fn create_ublk_ctrl(
+    device_name: String,
+    num_queues: u16,
+    queue_size: u16,
+    io_buf_bytes: u32,
+) -> Result<UblkCtrl> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("ublk-add-dev".to_string())
+        .spawn(move || {
+            let result = UblkCtrlBuilder::default()
+                .name(&device_name)
+                .nr_queues(num_queues)
+                .depth(queue_size)
+                .io_buf_bytes(io_buf_bytes)
+                // Add the device immediately so the backend can bind queues in run_target.
+                .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
+                .build();
+            let _ = sender.send(result);
+        })
+        .map_err(|e| crate::ubiblk_error!(ThreadCreation { source: e }))?;
+
+    match receiver.recv_timeout(DEVICE_CREATE_TIMEOUT) {
+        Ok(result) => Ok(result?),
+        Err(_) => Err(crate::ubiblk_error!(Timeout {
+            description: format!(
+                "kernel did not complete ublk device creation (UBLK_U_CMD_ADD_DEV) \
+                 within {}s. This usually indicates a kernel ublk regression (for \
+                 example the NULL pointer dereference in ublk_init_queues on \
+                 6.17.0-*-aws kernels); check `dmesg | grep -i ublk`. The creation \
+                 thread is stuck in an uninterruptible io_uring wait and cannot be \
+                 cancelled; the ublk control device may stay wedged until reboot.",
+                DEVICE_CREATE_TIMEOUT.as_secs()
+            ),
+        })),
+    }
+}
+
 fn handle_ctrlc_shutdown(ctrl: &UblkCtrl, device_symlink: Option<&Path>) {
     let dev_id = ctrl.dev_info().dev_id;
     if let Err(e) = UblkCtrl::new_simple(dev_id as i32).and_then(|c| c.del_dev()) {
@@ -135,6 +181,17 @@ fn configure_ublk_device(
 
 fn announce_ublk_device(ctrl: &UblkCtrl, device_symlink: Option<&Path>) {
     let bdev_path = ctrl.get_bdev_path();
+
+    // Only create the symlink once the device node exists, so a kernel-side
+    // failure cannot leave a dangling symlink for callers to mkfs through.
+    if let Err(err) = wait_for_path(Path::new(&bdev_path), DEVICE_NODE_TIMEOUT) {
+        error!(
+            "ublk block device node {bdev_path} did not appear: {err}. \
+             Not creating device symlink; check `dmesg | grep -i ublk`."
+        );
+        return;
+    }
+
     info!("ublk device is available at {}", bdev_path);
     if let Some(symlink_path) = device_symlink {
         if let Err(err) = create_device_symlink(Path::new(&bdev_path), symlink_path) {
@@ -144,6 +201,26 @@ fn announce_ublk_device(ctrl: &UblkCtrl, device_symlink: Option<&Path>) {
                 bdev_path
             );
         }
+    }
+}
+
+/// Wait for a path to exist, polling until the timeout elapses.
+fn wait_for_path(path: &Path, timeout: Duration) -> Result<()> {
+    let start = Instant::now();
+    loop {
+        if path.exists() {
+            return Ok(());
+        }
+        if start.elapsed() >= timeout {
+            return Err(crate::ubiblk_error!(Timeout {
+                description: format!(
+                    "path {} did not appear within {}s",
+                    path.display(),
+                    timeout.as_secs()
+                ),
+            }));
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -336,6 +413,34 @@ mod tests {
         // Should succeed but leave the file in place
         remove_device_symlink(&link).expect("Should succeed for non-symlink");
         assert!(link.exists(), "Non-symlink file should be left in place");
+    }
+
+    #[test]
+    fn test_wait_for_path_existing() {
+        let tmp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        wait_for_path(tmp_dir.path(), Duration::from_secs(1)).expect("existing path should be Ok");
+    }
+
+    #[test]
+    fn test_wait_for_path_timeout() {
+        let tmp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let missing = tmp_dir.path().join("missing");
+        let result = wait_for_path(&missing, Duration::from_millis(100));
+        assert!(result.is_err());
+        assert!(result.err().unwrap().to_string().contains("did not appear"));
+    }
+
+    #[test]
+    fn test_wait_for_path_appears_later() {
+        let tmp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let path = tmp_dir.path().join("appears-later");
+        let path_clone = path.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            std::fs::write(&path_clone, b"ready").expect("Failed to create file");
+        });
+        wait_for_path(&path, Duration::from_secs(5)).expect("path should appear");
+        writer.join().unwrap();
     }
 
     #[test]
