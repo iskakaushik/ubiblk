@@ -15,6 +15,7 @@ A config file has these top-level sections:
 | `[encryption]` | yes* | Encryption key reference |
 | `[danger_zone]` | no | Safety overrides for development |
 | `[stripe_source]` | no | Where to fetch stripes from |
+| `[spill]` | no | Treat the local disk as a cache with a ceiling; spill the rest to an object store |
 | `[secrets.*]` | no | Named secret definitions |
 
 \* Encryption is required unless `danger_zone.allow_unencrypted_disk = true`.
@@ -255,9 +256,9 @@ autofetch = false                           # optional, default: false
 | `bucket` | string | yes | — | S3 bucket name |
 | `prefix` | string | no | — | Key prefix (must not contain `.` or `..` path components) |
 | `region` | string | no | — | AWS region |
-| `access_key_id.ref` | string | yes | — | Reference to AWS access key ID secret |
-| `secret_access_key.ref` | string | yes | — | Reference to AWS secret access key secret |
-| `session_token.ref` | string | no | — | Reference to AWS session token secret (for temporary credentials) |
+| `access_key_id.ref` | string | no | — | Reference to AWS access key ID secret. Set together with `secret_access_key.ref`, or omit both to use the SDK's default provider chain (instance role, `AWS_*` in the environment) |
+| `secret_access_key.ref` | string | no | — | Reference to AWS secret access key secret |
+| `session_token.ref` | string | no | — | Reference to AWS session token secret (for temporary credentials); needs both keys |
 | `archive_kek.ref` | string | yes | — | Reference to 32-byte archive KEK secret |
 | `endpoint` | string | no | — | Custom S3 endpoint URL |
 | `connections` | integer | no | 16 | Number of S3 connections (must be > 0) |
@@ -315,6 +316,98 @@ secret.ref = "psk-secret"
 
 PSK is required unless `danger_zone.allow_unencrypted_connection` is enabled.
 The PSK secret must be at least 16 bytes.
+
+## `[spill]`
+
+Turns the local `data_path` into a cache with a ceiling for a device that
+forks another one (see `docs/spill.md`). Once resident stripes exceed the
+ceiling, or the filesystem holding `data_path` runs low on free space, the
+background worker evicts stripes: clean copies of the live snapshot are
+dropped and pulled again on demand (only with `clean_eviction = true`), and
+everything else (written stripes, pushed pre-images) is uploaded to
+`[spill.store]` and then punched out of the file with `fallocate`. Reads of an
+evicted stripe come back through the fetch path, from the store or from the
+snapshot source.
+
+```toml
+[device]
+device_id = "fork-3f9c"          # required: part of every object key
+track_written = true             # required
+snapshot_source = "10.0.1.20:9500"
+
+[spill]
+max_local_bytes = 12884901888    # required; ceiling on resident stripes * stripe size
+low_water_bytes = 536870912      # default 512 MiB; evict down to max_local_bytes - low_water_bytes
+hard_margin_bytes = 268435456    # default 256 MiB; gate writes above max_local_bytes + hard_margin_bytes
+min_free_bytes = 536870912       # default 512 MiB; statfs watermark on data_path's filesystem
+on_full = "stall"                # default; or "fail"
+clean_eviction = false           # default; needs snapshot_source
+max_concurrent_evictions = 4     # default 4; also bounds uploads in flight
+compression = { zstd = { level = 3 } }   # default; or "none"
+# kek = { ref = "spill-kek" }    # optional; 32 bytes; encrypts objects with AES-XTS
+
+[spill.store]                    # optional; absent means clean-only
+storage = "s3"
+bucket = "pg-ubicloud-ci-forks"
+prefix = "forks"
+region = "us-west-2"
+connections = 16
+# access_key_id / secret_access_key omitted: default provider chain
+```
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `max_local_bytes` | integer (bytes) | yes | none | Ceiling on resident stripes times the stripe size |
+| `low_water_bytes` | integer (bytes) | no | 536870912 | Once over the ceiling, evict down to `max_local_bytes - low_water_bytes`; must be below `max_local_bytes` |
+| `hard_margin_bytes` | integer (bytes) | no | 268435456 | Guest writes are gated above `max_local_bytes + hard_margin_bytes` |
+| `min_free_bytes` | integer (bytes) | no | 536870912 | Evict while the filesystem has less free space than this; gate writes below half of it |
+| `on_full` | string | no | `"stall"` | What a guest write meets while the gate is closed: `"stall"` queues it, `"fail"` returns an I/O error |
+| `clean_eviction` | boolean | no | false | Drop clean stripes the live snapshot can serve again instead of uploading them. Needs `device.snapshot_source` |
+| `max_concurrent_evictions` | integer | no | 4 | Evictions, and so uploads, in flight at once (1 to 64) |
+| `compression` | table or string | no | `{ zstd = { level = 3 } }` | Compression applied to objects before encryption; `"none"` to disable |
+| `kek.ref` | string | no | none | 32-byte key-encryption key. `init-metadata` generates a random XTS key, wraps it under the KEK and stores it at `<prefix>/<device_id>/spill-key`; the backend unwraps it at startup |
+| `store` | table | no | none | Where dirty stripes go. Absent means clean-only, which requires `clean_eviction = true` |
+
+Sizes are plain integers in bytes; there is no unit suffix parser.
+
+### `[spill.store]`
+
+The same shape as an archive storage config (`storage = "s3"` or
+`storage = "filesystem"` with `path`), except that `archive_kek` and
+`autofetch` are not accepted. Objects are written as
+`<prefix>/<device_id>/<stripe_index>`. For S3, `connections` is the number
+of download workers each fetcher gets; the uploader gets
+`min(connections, max_concurrent_evictions)`.
+
+The S3 credentials are optional: omit both `access_key_id` and
+`secret_access_key` to use the SDK's default provider chain, which is the
+instance role through IMDS on EC2 or `AWS_ACCESS_KEY_ID` and
+`AWS_SECRET_ACCESS_KEY` in the environment. Note that the IMDS default hop
+limit of 1 does not reach a bridge-networked container; raise the hop limit
+on the instance or pass explicit keys there.
+
+A `storage = "filesystem"` store is meant for tests; put it on a different
+filesystem than `data_path`, or evicting frees no space.
+
+### Validation
+
+Every rule below is rejected when the config is loaded:
+
+- `device.metadata_path` must be set, `device.track_written` must be `true`,
+  and `device.device_id` must not be the default `"ubiblk"`.
+- `device.snapshot_server` must not be set on the same device: a served
+  stripe may be a hole.
+- A `[stripe_source]`, if present, must have `copy_on_read = true` and
+  `autofetch = false`.
+- `clean_eviction = true` needs `device.snapshot_source`; a missing `store`
+  needs `clean_eviction = true`.
+- `low_water_bytes < max_local_bytes`; `1 <= max_concurrent_evictions <= 64`.
+- `kek` must resolve to exactly 32 bytes.
+- `tuning.num_queues * tuning.queue_size` must not exceed 65535.
+
+At startup the backend additionally refuses a `data_path` that is not a
+regular file (a block device has nothing to punch), and `init-metadata`
+preallocates the metadata file so header writes never meet ENOSPC.
 
 ## Example Configs
 
