@@ -1333,6 +1333,7 @@ mod tests {
             cfg: EvictorConfig {
                 // Not a regular file: proves the puncher seam is what is used.
                 data_path: "/dev/null".into(),
+                device_id: "fork-1".to_string(),
                 stripe_sector_count: 1 << stripe_sector_count_shift,
                 target_sector_count: 16 << stripe_sector_count_shift,
                 max_local_bytes: 1 << 30,
@@ -1425,12 +1426,7 @@ mod tests {
         startup.worker.run();
     }
 
-    // The groundwork ships `Evictor::punch_all_evicted` as a stub that punches
-    // nothing (item C fills it), so this cannot pass until C lands. Once it
-    // does, drop the `#[ignore]`: the assertions are the spec's acceptance
-    // property, two EVICTED stripes coalesced into one punch over 2..3.
     #[test]
-    #[ignore = "needs Evictor::punch_all_evicted from item C; the groundwork stub punches nothing"]
     fn build_bgworker_runs_upgrade_and_punch_pass_before_returning() {
         let mut startup = build_bgworker_with_evicted_stripes_2_and_3();
 

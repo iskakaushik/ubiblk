@@ -94,6 +94,7 @@ pub fn build_spill_runtime(
 ) -> Result<SpillRuntime> {
     let cfg = EvictorConfig {
         data_path: config.device.data_path.clone(),
+        device_id: config.device.device_id.clone(),
         stripe_sector_count,
         target_sector_count,
         max_local_bytes: section.max_local_bytes,
