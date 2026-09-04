@@ -465,8 +465,17 @@ impl SharedMetadataState {
     /// Flusher completion. FETCHED -> `mark_stripe_fetched` (CAS semantics);
     /// WRITTEN -> store Written; HAS_SOURCE | IN_S3 | PUSHED -> OR into flags;
     /// EVICTED -> nothing (the evictor drives Evicting -> Evicted itself).
+    ///
+    /// FETCHED is also nothing while the stripe carries WAS_EVICTED: the
+    /// completion is then the coordinator's own {set FETCHED, clear EVICTED}
+    /// release op, and the coordinator lands the stripe itself with
+    /// `mark_stripe_resident` once it sees the Durable outcome. Calling
+    /// `mark_stripe_fetched` here would record a false anomaly on every such
+    /// recovery.
     pub fn set_stripe_header(&self, stripe_id: usize, header: u8) {
-        if header & metadata_flags::FETCHED != 0 {
+        if header & metadata_flags::FETCHED != 0
+            && self.stripe_flags(stripe_id) & stripe_flags::WAS_EVICTED == 0
+        {
             self.mark_stripe_fetched(stripe_id);
         }
         if header & metadata_flags::WRITTEN != 0 {
@@ -964,6 +973,34 @@ mod tests {
         state.mark_stripe_resident(4);
         assert_eq!(state.stripe_fetch_state(4), Failed);
         assert_eq!(state.spill().degraded_reasons.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn set_stripe_header_fetched_is_silent_while_was_evicted() {
+        let state = SharedMetadataState::new(&evicted_metadata());
+        state.set_stripe_failed(1);
+
+        // The flusher completing the coordinator's {set FETCHED, clear
+        // EVICTED} release op must neither land the stripe nor count an
+        // anomaly; the coordinator lands it on the Durable outcome.
+        state.set_stripe_header(1, metadata_flags::FETCHED | metadata_flags::HAS_SOURCE);
+        assert_eq!(state.stripe_fetch_state(1), Failed);
+        assert!(state.stripe_flags(1) & stripe_flags::WAS_EVICTED != 0);
+        assert_eq!(state.fetched_stripes(), 1);
+        assert_eq!(state.resident_stripes(), 1);
+        assert_eq!(state.spill().degraded_reasons.load(Ordering::Relaxed), 0);
+
+        state.mark_stripe_resident(1);
+        assert_eq!(state.stripe_fetch_state(1), Fetched);
+        assert_eq!(state.stripe_flags(1) & stripe_flags::WAS_EVICTED, 0);
+        assert_eq!(state.fetched_stripes(), 2);
+        assert_eq!(state.resident_stripes(), 2);
+
+        // Without the bit the same completion takes the plain landing path.
+        state.set_stripe_fetch_state_for_test(1, Failed);
+        state.set_stripe_header(1, metadata_flags::FETCHED | metadata_flags::HAS_SOURCE);
+        assert_eq!(state.stripe_fetch_state(1), Fetched);
+        assert_eq!(state.spill().degraded_reasons.load(Ordering::Relaxed), 0);
     }
 
     /// A channel writes a NoSource stripe while the evictor is hunting for a

@@ -894,6 +894,83 @@ mod tests {
     }
 
     #[test]
+    fn release_op_for_failed_was_evicted_stripe_lands_only_through_mark_stripe_resident() {
+        use crate::block_device::{
+            bdev_lazy::metadata::{Failed, Fetched},
+            stripe_flags,
+        };
+        use std::sync::atomic::Ordering;
+        let (metadata_dev, shared_state, mut flusher) = init_flusher();
+
+        // Stripe 5 goes resident, gets evicted (header and state), and its
+        // re-fetch then fails for good: Failed with WAS_EVICTED, header still
+        // EVICTED.
+        flusher.set_stripe_fetched(5);
+        wait_for_completion(&mut flusher);
+        let previous = shared_state.try_begin_evicting(5).expect("claim stripe 5");
+        flusher.update_stripe_header(5, metadata_flags::EVICTED, metadata_flags::FETCHED, 1);
+        wait_for_completion(&mut flusher);
+        assert_eq!(
+            flusher.take_persist_outcomes()[0].result,
+            PersistResult::Durable
+        );
+        shared_state.finish_evicting(5, previous, false);
+        shared_state.set_stripe_failed(5);
+        assert_eq!(shared_state.stripe_fetch_state(5), Failed);
+        assert!(shared_state.stripe_flags(5) & stripe_flags::WAS_EVICTED != 0);
+        let degraded = shared_state
+            .spill()
+            .degraded_reasons
+            .load(Ordering::Relaxed);
+        let (fetched, resident) = (
+            shared_state.fetched_stripes(),
+            shared_state.resident_stripes(),
+        );
+
+        // The coordinator's even-token release op. Its completion runs
+        // set_stripe_header, which must leave the landing to the coordinator
+        // without recording an anomaly.
+        flusher.update_stripe_header(5, metadata_flags::FETCHED, metadata_flags::EVICTED, 2);
+        wait_for_completion(&mut flusher);
+        assert_eq!(
+            flusher.take_persist_outcomes(),
+            vec![PersistOutcome {
+                stripe_id: 5,
+                token: 2,
+                result: PersistResult::Durable,
+            }]
+        );
+        let header = on_disk_header(&metadata_dev, 5);
+        assert_ne!(header & metadata_flags::FETCHED, 0);
+        assert_eq!(header & metadata_flags::EVICTED, 0);
+        assert_eq!(shared_state.stripe_fetch_state(5), Failed);
+        assert!(shared_state.stripe_flags(5) & stripe_flags::WAS_EVICTED != 0);
+        assert_eq!(
+            shared_state
+                .spill()
+                .degraded_reasons
+                .load(Ordering::Relaxed),
+            degraded
+        );
+        assert_eq!(shared_state.fetched_stripes(), fetched);
+        assert_eq!(shared_state.resident_stripes(), resident);
+
+        // The coordinator sees Durable and lands the stripe.
+        shared_state.mark_stripe_resident(5);
+        assert_eq!(shared_state.stripe_fetch_state(5), Fetched);
+        assert_eq!(shared_state.stripe_flags(5) & stripe_flags::WAS_EVICTED, 0);
+        assert_eq!(shared_state.fetched_stripes(), fetched + 1);
+        assert_eq!(shared_state.resident_stripes(), resident + 1);
+        assert_eq!(
+            shared_state
+                .spill()
+                .degraded_reasons
+                .load(Ordering::Relaxed),
+            degraded
+        );
+    }
+
+    #[test]
     fn masked_update_serialises_behind_set_written_in_same_sector() {
         let (metadata_dev, _shared_state, mut flusher) = init_flusher();
         let (writes, flushes) = io_counts(&metadata_dev);
