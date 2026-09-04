@@ -120,6 +120,7 @@ mod tests {
             encryption: None,
             danger_zone: test_danger_zone(),
             stripe_source: None,
+            spill: None,
             secrets: std::collections::HashMap::new(),
         }
     }

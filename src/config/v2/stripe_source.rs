@@ -201,8 +201,12 @@ pub enum ArchiveStorageConfig {
         #[serde(default)]
         prefix: Option<String>,
         region: Option<String>,
-        access_key_id: SecretRef,
-        secret_access_key: SecretRef,
+        /// Omit both keys to use the SDK's default provider chain (an instance
+        /// role, or `AWS_*` in the environment).
+        #[serde(default)]
+        access_key_id: Option<SecretRef>,
+        #[serde(default)]
+        secret_access_key: Option<SecretRef>,
         #[serde(default)]
         session_token: Option<SecretRef>,
         endpoint: Option<String>,
@@ -282,19 +286,37 @@ impl ArchiveStorageConfig {
                         resolved_secrets,
                     )?)?;
                 }
-                Self::validate_aws_access_key_id(get_resolved_secret(
-                    access_key_id,
-                    resolved_secrets,
-                )?)?;
-                Self::validate_aws_secret_access_key(get_resolved_secret(
-                    secret_access_key,
-                    resolved_secrets,
-                )?)?;
-                if let Some(session_token) = session_token {
-                    Self::validate_aws_session_token(get_resolved_secret(
-                        session_token,
-                        resolved_secrets,
-                    )?)?;
+                match (access_key_id, secret_access_key) {
+                    (Some(access_key_id), Some(secret_access_key)) => {
+                        Self::validate_aws_access_key_id(get_resolved_secret(
+                            access_key_id,
+                            resolved_secrets,
+                        )?)?;
+                        Self::validate_aws_secret_access_key(get_resolved_secret(
+                            secret_access_key,
+                            resolved_secrets,
+                        )?)?;
+                        if let Some(session_token) = session_token {
+                            Self::validate_aws_session_token(get_resolved_secret(
+                                session_token,
+                                resolved_secrets,
+                            )?)?;
+                        }
+                    }
+                    (None, None) => {
+                        if session_token.is_some() {
+                            return Err(ubiblk_error!(InvalidParameter {
+                                description:
+                                    "S3 session_token requires access_key_id and secret_access_key"
+                                        .to_string(),
+                            }));
+                        }
+                    }
+                    _ => {
+                        return Err(ubiblk_error!(InvalidParameter {
+                            description: "S3 access_key_id and secret_access_key must be set together (omit both to use the instance role)".to_string(),
+                        }));
+                    }
                 }
                 Self::validate_prefix(prefix)?;
                 Self::validate_connections(connections)?;
@@ -499,8 +521,8 @@ mod tests {
                 bucket: "encrypted-stripes".to_string(),
                 prefix: Some("v1/".to_string()),
                 region: Some("eu-west-1".to_string()),
-                access_key_id: SecretRef::Ref("aws-access-key-id".to_string()),
-                secret_access_key: SecretRef::Ref("aws-secret-access-key".to_string()),
+                access_key_id: Some(SecretRef::Ref("aws-access-key-id".to_string())),
+                secret_access_key: Some(SecretRef::Ref("aws-secret-access-key".to_string())),
                 session_token: Some(SecretRef::Ref("aws-session-token".to_string())),
                 archive_kek: Some(SecretRef::Ref("archive-kek".to_string())),
                 autofetch: false,
@@ -532,8 +554,8 @@ mod tests {
                 bucket: "encrypted-stripes".to_string(),
                 prefix: None,
                 region: Some("eu-west-1".to_string()),
-                access_key_id: SecretRef::Ref("aws-access-key-id".to_string()),
-                secret_access_key: SecretRef::Ref("aws-secret-access-key".to_string()),
+                access_key_id: Some(SecretRef::Ref("aws-access-key-id".to_string())),
+                secret_access_key: Some(SecretRef::Ref("aws-secret-access-key".to_string())),
                 session_token: None,
                 archive_kek: Some(SecretRef::Ref("archive-kek".to_string())),
                 autofetch: false,
@@ -568,8 +590,8 @@ mod tests {
                 bucket: "encrypted-stripes".to_string(),
                 prefix: None,
                 region: Some("eu-west-1".to_string()),
-                access_key_id: SecretRef::Ref("aws-access-key-id".to_string()),
-                secret_access_key: SecretRef::Ref("aws-secret-access-key".to_string()),
+                access_key_id: Some(SecretRef::Ref("aws-access-key-id".to_string())),
+                secret_access_key: Some(SecretRef::Ref("aws-secret-access-key".to_string())),
                 session_token: None,
                 archive_kek: Some(SecretRef::Ref("archive-kek".to_string())),
                 autofetch: false,
@@ -658,10 +680,13 @@ mod tests {
                 session_token,
                 ..
             }) => {
-                assert_eq!(access_key_id, SecretRef::Ref("my-access-key".to_string()));
+                assert_eq!(
+                    access_key_id,
+                    Some(SecretRef::Ref("my-access-key".to_string()))
+                );
                 assert_eq!(
                     secret_access_key,
-                    SecretRef::Ref("my-secret-key".to_string())
+                    Some(SecretRef::Ref("my-secret-key".to_string()))
                 );
                 assert_eq!(archive_kek, Some(SecretRef::Ref("my-kek".to_string())));
                 assert_eq!(session_token, None);
@@ -752,13 +777,112 @@ mod tests {
         let toml = r#"
             type = "archive"
             storage = "s3"
-            bucket = "bucket"
             region = "us-east-1"
             access_key_id.ref = "key"
+            secret_access_key.ref = "secret"
             archive_kek.ref = "kek"
         "#;
         let result = toml::from_str::<StripeSourceConfig>(toml);
-        assert!(result.is_err(), "should reject missing secret_access_key");
+        assert!(result.is_err(), "should reject missing bucket");
+    }
+
+    fn s3_with_credentials(
+        access_key_id: Option<&str>,
+        secret_access_key: Option<&str>,
+        session_token: Option<&str>,
+    ) -> ArchiveStorageConfig {
+        let secret_ref = |id: &str| SecretRef::Ref(id.to_string());
+        ArchiveStorageConfig::S3 {
+            bucket: "bucket".to_string(),
+            prefix: None,
+            region: Some("us-east-1".to_string()),
+            access_key_id: access_key_id.map(secret_ref),
+            secret_access_key: secret_access_key.map(secret_ref),
+            session_token: session_token.map(secret_ref),
+            endpoint: None,
+            connections: 4,
+            connect_timeout_ms: 5_000,
+            operation_attempt_timeout_ms: 20_000,
+            max_attempts: 3,
+            rate_limited_retry: RateLimitedRetryConfig::default(),
+            archive_kek: None,
+            autofetch: false,
+        }
+    }
+
+    fn aws_secrets() -> HashMap<String, ResolvedSecret> {
+        let inline = |value: &str| SecretDef {
+            source: SecretSource::Inline(b64_engine.encode(value)),
+            encrypted_by: None,
+            encoding: SecretEncoding::Base64,
+        };
+        let defs = HashMap::from([
+            ("key".to_string(), inline("AKIA1234567890123456")),
+            ("secret".to_string(), inline("super-secret")),
+            ("session".to_string(), inline("session-token")),
+        ]);
+        resolve_secrets(
+            &defs,
+            &DangerZone {
+                enabled: true,
+                allow_inline_plaintext_secrets: true,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn s3_credentials_both_or_neither() {
+        let secrets = aws_secrets();
+        let both_or_neither = "S3 access_key_id and secret_access_key must be set together (omit both to use the instance role)";
+
+        s3_with_credentials(Some("key"), Some("secret"), None)
+            .validate(&secrets)
+            .expect("both keys");
+        s3_with_credentials(None, None, None)
+            .validate(&secrets)
+            .expect("neither key: the default provider chain");
+
+        for (id, key) in [(Some("key"), None), (None, Some("secret"))] {
+            let err = s3_with_credentials(id, key, None)
+                .validate(&secrets)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(both_or_neither), "{err}");
+        }
+
+        // The TOML form with only one key parses and is caught by validation.
+        let toml = r#"
+            type = "archive"
+            storage = "s3"
+            bucket = "bucket"
+            region = "us-east-1"
+            access_key_id.ref = "key"
+        "#;
+        let config: StripeSourceConfig = toml::from_str(toml).unwrap();
+        let err = config
+            .validate(&DangerZone::default(), &secrets)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(both_or_neither), "{err}");
+    }
+
+    #[test]
+    fn s3_session_token_requires_keys() {
+        let secrets = aws_secrets();
+        s3_with_credentials(Some("key"), Some("secret"), Some("session"))
+            .validate(&secrets)
+            .expect("keys with a session token");
+
+        let err = s3_with_credentials(None, None, Some("session"))
+            .validate(&secrets)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("S3 session_token requires access_key_id and secret_access_key"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -907,8 +1031,8 @@ mod tests {
             bucket: "bucket".to_string(),
             prefix: Some("valid/../invalid/.".to_string()),
             region: Some("us-east-1".to_string()),
-            access_key_id: SecretRef::Ref("key".to_string()),
-            secret_access_key: SecretRef::Ref("secret".to_string()),
+            access_key_id: Some(SecretRef::Ref("key".to_string())),
+            secret_access_key: Some(SecretRef::Ref("secret".to_string())),
             session_token: None,
             archive_kek: Some(SecretRef::Ref("kek".to_string())),
             autofetch: false,
@@ -953,8 +1077,8 @@ mod tests {
             bucket: "bucket".to_string(),
             prefix: None,
             region: Some("us-east-1".to_string()),
-            access_key_id: SecretRef::Ref("key".to_string()),
-            secret_access_key: SecretRef::Ref("secret".to_string()),
+            access_key_id: Some(SecretRef::Ref("key".to_string())),
+            secret_access_key: Some(SecretRef::Ref("secret".to_string())),
             session_token: Some(SecretRef::Ref("session".to_string())),
             archive_kek: Some(SecretRef::Ref("kek".to_string())),
             autofetch: false,
@@ -978,8 +1102,8 @@ mod tests {
             bucket: "bucket".to_string(),
             prefix: None,
             region: Some("us-east-1".to_string()),
-            access_key_id: SecretRef::Ref("key".to_string()),
-            secret_access_key: SecretRef::Ref("secret".to_string()),
+            access_key_id: Some(SecretRef::Ref("key".to_string())),
+            secret_access_key: Some(SecretRef::Ref("secret".to_string())),
             session_token: None,
             archive_kek: Some(SecretRef::Ref("kek".to_string())),
             autofetch: false,
@@ -1003,8 +1127,8 @@ mod tests {
             bucket: "bucket".to_string(),
             prefix: None,
             region: Some("us-east-1".to_string()),
-            access_key_id: SecretRef::Ref("key".to_string()),
-            secret_access_key: SecretRef::Ref("secret".to_string()),
+            access_key_id: Some(SecretRef::Ref("key".to_string())),
+            secret_access_key: Some(SecretRef::Ref("secret".to_string())),
             session_token: None,
             archive_kek: Some(SecretRef::Ref("kek".to_string())),
             autofetch: false,
@@ -1027,8 +1151,8 @@ mod tests {
             bucket: "bucket".to_string(),
             prefix: None,
             region: Some("us-east-1".to_string()),
-            access_key_id: SecretRef::Ref("key".to_string()),
-            secret_access_key: SecretRef::Ref("secret".to_string()),
+            access_key_id: Some(SecretRef::Ref("key".to_string())),
+            secret_access_key: Some(SecretRef::Ref("secret".to_string())),
             session_token: None,
             archive_kek: Some(SecretRef::Ref("kek".to_string())),
             autofetch: false,
@@ -1051,8 +1175,8 @@ mod tests {
             bucket: "bucket".to_string(),
             prefix: None,
             region: Some("us-east-1".to_string()),
-            access_key_id: SecretRef::Ref("key".to_string()),
-            secret_access_key: SecretRef::Ref("secret".to_string()),
+            access_key_id: Some(SecretRef::Ref("key".to_string())),
+            secret_access_key: Some(SecretRef::Ref("secret".to_string())),
             session_token: None,
             archive_kek: Some(SecretRef::Ref("kek".to_string())),
             autofetch: false,
@@ -1118,8 +1242,8 @@ mod tests {
             bucket: "bucket".to_string(),
             prefix: None,
             region: Some("us-east-1".to_string()),
-            access_key_id: SecretRef::Ref("key".to_string()),
-            secret_access_key: SecretRef::Ref("secret".to_string()),
+            access_key_id: Some(SecretRef::Ref("key".to_string())),
+            secret_access_key: Some(SecretRef::Ref("secret".to_string())),
             session_token: None,
             archive_kek: Some(SecretRef::Ref("kek".to_string())),
             autofetch: false,

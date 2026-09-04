@@ -703,6 +703,7 @@ mod tests {
                 autofetch: false,
                 copy_on_read: false,
             }),
+            spill: None,
             secrets: HashMap::new(),
         };
 

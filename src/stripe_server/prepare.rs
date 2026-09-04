@@ -111,6 +111,7 @@ mod tests {
                 allow_env_secrets: false,
             },
             stripe_source: None,
+            spill: None,
             secrets: std::collections::HashMap::new(),
         }
     }

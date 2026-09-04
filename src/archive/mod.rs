@@ -67,9 +67,18 @@ pub trait ArchiveStore {
             description: format!("Timeout while getting object {}", name),
         }))
     }
+
+    /// Delete up to 1000 objects by name. Synchronous; for offline tools only.
+    /// Default: unsupported.
+    fn delete_objects(&mut self, names: &[String]) -> Result<()> {
+        let _ = names;
+        Err(crate::ubiblk_error!(ArchiveError {
+            description: "delete is not supported by this store".to_string(),
+        }))
+    }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ArchiveCompressionAlgorithm {
     #[default]
@@ -157,13 +166,28 @@ pub use stripe_hashes::{
 
 #[cfg(test)]
 mod mem_store;
+#[cfg(test)]
+mod test_store;
 
 #[cfg(test)]
 pub use mem_store::MemStore;
+#[cfg(test)]
+pub use test_store::TestObjectStore;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delete_objects_is_unsupported_by_default() {
+        let mut store = MemStore::new();
+        let err = store
+            .delete_objects(&["a".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("delete is not supported by this store"), "{err}");
+    }
+
     #[test]
     fn test_archive_metadata_debug_redaction() {
         let metadata = ArchiveMetadata {

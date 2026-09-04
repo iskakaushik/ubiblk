@@ -263,6 +263,7 @@ pub fn load_legacy_config(config_path: &Path, kek_path: Option<&Path>) -> Result
                 autofetch: false,
                 copy_on_read: false,
             }),
+        spill: None,
         secrets,
     })
 }

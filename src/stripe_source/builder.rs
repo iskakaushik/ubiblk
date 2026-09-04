@@ -118,12 +118,24 @@ impl StripeSourceBuilder {
         })
     }
 
+    /// Static credentials from the config, or `None` when both keys are
+    /// omitted so the SDK runs its default provider chain (instance role,
+    /// `AWS_*` environment).
     fn build_aws_credentials(
-        access_key_id: &SecretRef,
-        secret_access_key: &SecretRef,
+        access_key_id: Option<&SecretRef>,
+        secret_access_key: Option<&SecretRef>,
         session_token: Option<&SecretRef>,
         secrets: &std::collections::HashMap<String, ResolvedSecret>,
     ) -> Result<Option<aws_sdk_s3::config::Credentials>> {
+        let (access_key_id, secret_access_key) = match (access_key_id, secret_access_key) {
+            (Some(access_key_id), Some(secret_access_key)) => (access_key_id, secret_access_key),
+            (None, None) => return Ok(None),
+            _ => {
+                return Err(crate::ubiblk_error!(InvalidParameter {
+                    description: "S3 access_key_id and secret_access_key must be set together (omit both to use the instance role)".to_string(),
+                }))
+            }
+        };
         let access_key_id = Self::resolved_secret_to_string(access_key_id, secrets)?;
         let secret_access_key = Self::resolved_secret_to_string(secret_access_key, secrets)?;
         let session_token = session_token
@@ -174,6 +186,21 @@ impl StripeSourceBuilder {
         config: &ArchiveStorageConfig,
         secrets: &std::collections::HashMap<String, ResolvedSecret>,
     ) -> Result<Box<dyn ArchiveStore>> {
+        let worker_threads = match config {
+            ArchiveStorageConfig::S3 { connections, .. } => *connections,
+            ArchiveStorageConfig::Filesystem { .. } => 1,
+        };
+        Self::build_object_store(config, secrets, worker_threads)
+    }
+
+    /// Same as `build_archive_store` with an explicit worker count: a spill
+    /// store is built once per fetcher and once for the evictor, each with its
+    /// own share of the connection budget.
+    pub fn build_object_store(
+        config: &ArchiveStorageConfig,
+        secrets: &std::collections::HashMap<String, ResolvedSecret>,
+        worker_threads: usize,
+    ) -> Result<Box<dyn ArchiveStore>> {
         match config {
             ArchiveStorageConfig::Filesystem { path, .. } => {
                 Ok(Box::new(FileSystemStore::new(path.into())?))
@@ -185,7 +212,6 @@ impl StripeSourceBuilder {
                 access_key_id,
                 secret_access_key,
                 session_token,
-                connections,
                 endpoint,
                 connect_timeout_ms,
                 operation_attempt_timeout_ms,
@@ -194,8 +220,8 @@ impl StripeSourceBuilder {
                 ..
             } => {
                 let decrypted_credentials = Self::build_aws_credentials(
-                    access_key_id,
-                    secret_access_key,
+                    access_key_id.as_ref(),
+                    secret_access_key.as_ref(),
                     session_token.as_ref(),
                     secrets,
                 )?;
@@ -223,7 +249,7 @@ impl StripeSourceBuilder {
                     client,
                     bucket.to_string(),
                     prefix.clone(),
-                    *connections,
+                    worker_threads,
                 )?))
             }
         }
@@ -291,6 +317,7 @@ mod tests {
                 allow_env_secrets: false,
             },
             stripe_source,
+            spill: None,
             secrets: std::collections::HashMap::new(),
         }
     }
@@ -443,8 +470,8 @@ mod tests {
             bucket: "test-bucket".to_string(),
             prefix: None,
             region: Some("us-east-1".to_string()),
-            access_key_id: SecretRef::Ref("aws_key".to_string()),
-            secret_access_key: SecretRef::Ref("aws_secret".to_string()),
+            access_key_id: Some(SecretRef::Ref("aws_key".to_string())),
+            secret_access_key: Some(SecretRef::Ref("aws_secret".to_string())),
             session_token: None,
             endpoint: None,
             connections: 4,
@@ -491,14 +518,45 @@ mod tests {
         ]));
 
         let result = StripeSourceBuilder::build_aws_credentials(
-            &SecretRef::Ref("key_id".to_string()),
-            &SecretRef::Ref("secret_key".to_string()),
+            Some(&SecretRef::Ref("key_id".to_string())),
+            Some(&SecretRef::Ref("secret_key".to_string())),
             None,
             &secrets,
         );
         assert!(result.is_ok());
         let creds = result.unwrap();
         assert!(creds.is_some());
+    }
+
+    #[test]
+    fn build_aws_credentials_none_when_keys_absent() {
+        let result = StripeSourceBuilder::build_aws_credentials(None, None, None, &HashMap::new());
+        assert!(result.unwrap().is_none(), "default provider chain");
+
+        // One key without the other is a misconfiguration, not a fallback.
+        let key = SecretRef::Ref("key_id".to_string());
+        for (id, secret) in [(Some(&key), None), (None, Some(&key))] {
+            let err = StripeSourceBuilder::build_aws_credentials(id, secret, None, &HashMap::new())
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("must be set together"), "Got: {err}");
+        }
+    }
+
+    #[test]
+    fn build_object_store_filesystem_ignores_worker_count() {
+        let dir = tempdir().unwrap();
+        let config = ArchiveStorageConfig::Filesystem {
+            path: dir.path().join("spill"),
+            archive_kek: None,
+            autofetch: false,
+        };
+        let mut store =
+            StripeSourceBuilder::build_object_store(&config, &HashMap::new(), 7).unwrap();
+        store
+            .put_object("dev/1", b"data", std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(dir.path().join("spill/dev/1").is_file());
     }
 
     #[test]
@@ -516,8 +574,8 @@ mod tests {
         ]));
 
         let result = StripeSourceBuilder::build_aws_credentials(
-            &SecretRef::Ref("key_id".to_string()),
-            &SecretRef::Ref("secret_key".to_string()),
+            Some(&SecretRef::Ref("key_id".to_string())),
+            Some(&SecretRef::Ref("secret_key".to_string())),
             Some(&SecretRef::Ref("session".to_string())),
             &secrets,
         );
@@ -539,8 +597,8 @@ mod tests {
             ),
         ]));
         let result = StripeSourceBuilder::build_aws_credentials(
-            &SecretRef::Ref("key_id".to_string()),
-            &SecretRef::Ref("secret_key".to_string()),
+            Some(&SecretRef::Ref("key_id".to_string())),
+            Some(&SecretRef::Ref("secret_key".to_string())),
             Some(&SecretRef::Ref("missing_session".to_string())),
             &secrets,
         );
@@ -575,8 +633,8 @@ mod tests {
             ),
         ]));
         let result = StripeSourceBuilder::build_aws_credentials(
-            &SecretRef::Ref("key_id".to_string()),
-            &SecretRef::Ref("secret_key".to_string()),
+            Some(&SecretRef::Ref("key_id".to_string())),
+            Some(&SecretRef::Ref("secret_key".to_string())),
             Some(&SecretRef::Ref("session".to_string())),
             &secrets,
         );
@@ -596,8 +654,8 @@ mod tests {
         )]));
 
         let result = StripeSourceBuilder::build_aws_credentials(
-            &SecretRef::Ref("missing_key".to_string()),
-            &SecretRef::Ref("secret_key".to_string()),
+            Some(&SecretRef::Ref("missing_key".to_string())),
+            Some(&SecretRef::Ref("secret_key".to_string())),
             None,
             &secrets,
         );
@@ -617,8 +675,8 @@ mod tests {
         )]));
 
         let result = StripeSourceBuilder::build_aws_credentials(
-            &SecretRef::Ref("key_id".to_string()),
-            &SecretRef::Ref("missing_secret".to_string()),
+            Some(&SecretRef::Ref("key_id".to_string())),
+            Some(&SecretRef::Ref("missing_secret".to_string())),
             None,
             &secrets,
         );
@@ -644,8 +702,8 @@ mod tests {
         ]));
 
         let result = StripeSourceBuilder::build_aws_credentials(
-            &SecretRef::Ref("bad_key".to_string()),
-            &SecretRef::Ref("secret_key".to_string()),
+            Some(&SecretRef::Ref("bad_key".to_string())),
+            Some(&SecretRef::Ref("secret_key".to_string())),
             None,
             &secrets,
         );
@@ -671,8 +729,8 @@ mod tests {
         ]));
 
         let result = StripeSourceBuilder::build_aws_credentials(
-            &SecretRef::Ref("key_id".to_string()),
-            &SecretRef::Ref("bad_secret".to_string()),
+            Some(&SecretRef::Ref("key_id".to_string())),
+            Some(&SecretRef::Ref("bad_secret".to_string())),
             None,
             &secrets,
         );
