@@ -1,0 +1,91 @@
+name: Spill end-to-end
+
+# Drives a [spill] device past its ceiling on a loop-mounted ext4 image,
+# crashes the backend at the eviction commit points and restarts it, and breaks
+# the store mid-run (tests/spill/README.md). Needs root, ublk_drv and a build
+# with the crash hooks, so it is not part of the default CI matrix: run it by
+# hand before merging changes to bdev_lazy/spill, the coordinator, the channel
+# or the stripe sources.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: spill-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ISA_L_CRYPTO_VERSION: "v2.25.0"
+  MINIO_ROOT_USER: minioadmin
+  MINIO_ROOT_PASSWORD: minioadmin
+
+jobs:
+  spill-e2e:
+    runs-on: ubicloud-standard-4
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf libtool nasm clang build-essential e2fsprogs
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust (registry, git deps, target/)
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ runner.os }}-spill-e2e
+          cache-on-failure: true
+
+      - name: Install prebuilt isa-l_crypto
+        run: |
+          set -euo pipefail
+          arch="$(uname -m)"
+          archive="isa-l_crypto-${ISA_L_CRYPTO_VERSION}-${arch}.tar.gz"
+          url="https://github.com/ubicloud/ubiblk/releases/download/prebuilt-ci-deps/${archive}"
+          curl -fL -o "${archive}" "${url}"
+          sudo tar -xzf "${archive}" -C /
+
+      - name: Build ubiblk binaries with the crash hooks
+        run: cargo build --features fault-injection --bin ublk-backend --bin init-metadata --bin dump-metadata
+
+      - name: Load ublk_drv
+        run: sudo modprobe ublk_drv
+
+      - name: Ensure aws CLI (lists and purges the S3 cases' objects)
+        run: |
+          command -v aws >/dev/null 2>&1 && exit 0
+          curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o /tmp/awscli.zip
+          (cd /tmp && unzip -q awscli.zip && sudo ./aws/install)
+
+      - name: Start MinIO for the S3 cases
+        run: |
+          set -euo pipefail
+          arch="$(uname -m)"; case "$arch" in x86_64) arch=amd64 ;; aarch64) arch=arm64 ;; esac
+          curl -fsSL -o "$RUNNER_TEMP/minio" "https://dl.min.io/server/minio/release/linux-${arch}/minio"
+          chmod +x "$RUNNER_TEMP/minio"
+          mkdir -p "$RUNNER_TEMP/minio-data"
+          nohup "$RUNNER_TEMP/minio" server "$RUNNER_TEMP/minio-data" --address 127.0.0.1:9000 \
+            > "$RUNNER_TEMP/minio.log" 2>&1 &
+          for _ in $(seq 1 50); do curl -sf http://127.0.0.1:9000/minio/health/live && break; sleep 0.2; done
+          AWS_ACCESS_KEY_ID=$MINIO_ROOT_USER AWS_SECRET_ACCESS_KEY=$MINIO_ROOT_PASSWORD \
+            aws --endpoint-url http://127.0.0.1:9000 --region us-east-1 s3 mb s3://spill-e2e
+
+      - name: Run the spill end-to-end tests
+        env:
+          SPILL_E2E_S3_ENDPOINT: http://127.0.0.1:9000
+          SPILL_E2E_S3_BUCKET: spill-e2e
+          SPILL_E2E_S3_ACCESS_KEY_ID: ${{ env.MINIO_ROOT_USER }}
+          SPILL_E2E_S3_SECRET_ACCESS_KEY: ${{ env.MINIO_ROOT_PASSWORD }}
+        run: sudo -E env PYTHONDONTWRITEBYTECODE=1 python3 tests/spill/run_all.py --keep
+
+      - name: Upload backend logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: spill-e2e-logs
+          path: target/spill-e2e/b/run/*.log
+          if-no-files-found: ignore
