@@ -1,18 +1,21 @@
 use super::{
     ingest_pool::{IngestPool, IngestPoolConfig, IngestRequest},
-    metadata::shared_state::SharedMetadataState,
-    metadata_flusher::MetadataFlusher,
+    metadata::shared_state::{stripe_flags, Evicted, SharedMetadataState},
+    metadata_flusher::{MetadataFlusher, PersistOutcome, PersistResult},
     push_gate::PushPermit,
-    spill::Evictor,
+    spill::{Evictor, FetchDisposition, PushDisposition},
     stripe_fetcher::StripeFetcher,
 };
 
+#[cfg(feature = "fault-injection")]
+use super::spill::evictor::CrashPoint;
+
 use crate::{
-    block_device::BlockDevice,
+    block_device::{metadata_flags, BlockDevice},
     stripe_source::{StripeSource, StripeSourceBuilder},
     Result,
 };
-use log::{error, info};
+use log::{debug, error, info, warn};
 use std::{
     collections::HashMap,
     sync::{
@@ -26,6 +29,10 @@ use std::{
 /// nothing is busy. The evictor has deadlines of its own (statfs refresh,
 /// upload backoff), so the loop must come round without a request.
 const EVICTOR_IDLE_WAIT: Duration = Duration::from_millis(250);
+
+/// Re-issues of a re-materialised stripe's EVICTED-clearing header before the
+/// coordinator gives up and leaves the stripe Evicted for the next fetch.
+const MAX_RELEASE_RETRIES: u8 = 3;
 
 pub enum BgWorkerRequest {
     Fetch {
@@ -63,7 +70,6 @@ enum Ingest {
 /// A re-materialised stripe whose EVICTED-clearing header is in the flusher.
 /// The guest may not see it as resident before that header is durable: the
 /// startup pass punches every stripe whose header says EVICTED.
-#[allow(dead_code)]
 struct PendingRelease {
     stripe_id: usize,
     retries: u8,
@@ -76,13 +82,10 @@ pub struct BgWorker {
     metadata_state: SharedMetadataState,
     /// Present when `[spill]` is configured.
     evictor: Option<Evictor>,
-    // Driven by the coordinator logic that lands with the evictor body.
     /// Evicted stripes whose data has landed and whose EVICTED-clearing header
     /// is in the flusher, keyed by even token.
-    #[allow(dead_code)]
     pending_release: HashMap<u64, PendingRelease>,
     /// Even tokens are the coordinator's; odd ones the evictor's.
-    #[allow(dead_code)]
     next_release_token: u64,
     done: bool,
 }
@@ -183,39 +186,183 @@ impl BgWorker {
 
     pub fn process_request(&mut self, req: BgWorkerRequest) {
         match req {
-            BgWorkerRequest::Fetch { stripe_id } => match &mut self.ingest {
-                Ingest::Inline(fetcher) => fetcher.handle_fetch_request(stripe_id),
-                Ingest::Pool(pool) => pool.send(stripe_id, IngestRequest::Fetch { stripe_id }),
-            },
+            BgWorkerRequest::Fetch { stripe_id } => {
+                if self
+                    .pending_release
+                    .values()
+                    .any(|pending| pending.stripe_id == stripe_id)
+                {
+                    // The data is local and the header clearing EVICTED is in
+                    // flight; the channel's re-send finds the stripe resident
+                    // once that header is durable.
+                    debug!("Fetch for stripe {stripe_id} dropped: its release is pending");
+                    return;
+                }
+                if let Some(evictor) = &mut self.evictor {
+                    match evictor.on_fetch_request(stripe_id) {
+                        FetchDisposition::Forward => {}
+                        FetchDisposition::Aborted
+                        | FetchDisposition::Deferred
+                        | FetchDisposition::HeldForSpace
+                        | FetchDisposition::Refused => return,
+                    }
+                }
+                self.route_fetch(stripe_id);
+            }
             BgWorkerRequest::PushedStripe {
                 stripe_id,
                 data,
                 permit,
-            } => match &mut self.ingest {
-                Ingest::Inline(fetcher) => fetcher.accept_pushed_stripe(stripe_id, &data, permit),
-                Ingest::Pool(pool) => pool.send(
-                    stripe_id,
-                    IngestRequest::Pushed {
+            } => {
+                if self.evictor.is_some() {
+                    // Recorded for every push, whatever becomes of it: the
+                    // server refuses a re-pull after copy-out regardless of
+                    // who holds the stripe, so it is dirty from now on.
+                    self.metadata_state
+                        .set_stripe_flags(stripe_id, stripe_flags::PUSHED);
+                    self.metadata_flusher.update_stripe_header(
                         stripe_id,
-                        data,
-                        permit,
+                        metadata_flags::PUSHED,
+                        0,
+                        0,
+                    );
+                }
+                let permit = match &mut self.evictor {
+                    None => permit,
+                    Some(evictor) => match evictor.on_pushed_stripe(stripe_id, &data, permit) {
+                        (PushDisposition::Forward, Some(permit)) => permit,
+                        _ => return,
                     },
-                ),
-            },
+                };
+                self.route_push(stripe_id, data, permit);
+            }
             BgWorkerRequest::SetWritten { stripe_id } => {
                 self.metadata_flusher.set_stripe_written(stripe_id)
             }
             BgWorkerRequest::FetchCompleted { stripe_id, success } => {
-                if success {
-                    self.metadata_state.mark_stripe_fetched(stripe_id);
-                    self.metadata_flusher.set_stripe_fetched(stripe_id);
-                } else {
-                    error!("Stripe {stripe_id} fetch failed");
-                }
+                self.stripe_landed(stripe_id, success)
             }
             BgWorkerRequest::Shutdown => {
                 info!("Received shutdown request, stopping worker");
                 self.done = true;
+            }
+        }
+    }
+
+    fn route_fetch(&mut self, stripe_id: usize) {
+        match &mut self.ingest {
+            Ingest::Inline(fetcher) => fetcher.handle_fetch_request(stripe_id),
+            Ingest::Pool(pool) => pool.send(stripe_id, IngestRequest::Fetch { stripe_id }),
+        }
+    }
+
+    fn route_push(&mut self, stripe_id: usize, data: Vec<u8>, permit: PushPermit) {
+        match &mut self.ingest {
+            Ingest::Inline(fetcher) => fetcher.accept_pushed_stripe(stripe_id, &data, permit),
+            Ingest::Pool(pool) => pool.send(
+                stripe_id,
+                IngestRequest::Pushed {
+                    stripe_id,
+                    data,
+                    permit,
+                },
+            ),
+        }
+    }
+
+    /// The ingest finished with a stripe. A stripe that was not evicted lands
+    /// at once; an evicted one (or a Failed one whose header still says
+    /// EVICTED) is released only when the header clearing EVICTED is durable,
+    /// because the startup pass punches every stripe whose header says so.
+    fn stripe_landed(&mut self, stripe_id: usize, success: bool) {
+        if !success {
+            error!("Stripe {stripe_id} fetch failed");
+            return;
+        }
+        let state = self.metadata_state.stripe_fetch_state(stripe_id);
+        if state == Evicted
+            || self.metadata_state.stripe_flags(stripe_id) & stripe_flags::WAS_EVICTED != 0
+        {
+            if self
+                .pending_release
+                .values()
+                .any(|pending| pending.stripe_id == stripe_id)
+            {
+                // Landed twice (a released push written behind the re-fetch,
+                // with the same content): the op in flight releases it once.
+                debug!("Stripe {stripe_id} landed again while its release is pending");
+                return;
+            }
+            let token = self.next_release_token;
+            self.next_release_token += 2;
+            self.pending_release.insert(
+                token,
+                PendingRelease {
+                    stripe_id,
+                    retries: 0,
+                },
+            );
+            self.metadata_flusher.update_stripe_header(
+                stripe_id,
+                metadata_flags::FETCHED,
+                metadata_flags::EVICTED,
+                token,
+            );
+            #[cfg(feature = "fault-injection")]
+            if let Some(evictor) = &self.evictor {
+                evictor.crash_if_at(CrashPoint::DuringRefetch);
+            }
+        } else {
+            // Unblocks anything waiting on this stripe now, rather than once
+            // the flusher has worked through the sweep's backlog.
+            self.metadata_state.mark_stripe_fetched(stripe_id);
+            self.metadata_flusher.set_stripe_fetched(stripe_id);
+        }
+    }
+
+    /// The flusher finished a release op. Durable lands the stripe; anything
+    /// else is retried a few times with a fresh token and then given up on,
+    /// leaving the stripe Evicted for the guest's next fetch to re-write.
+    fn apply_release_outcome(&mut self, outcome: &PersistOutcome) {
+        let Some(pending) = self.pending_release.remove(&outcome.token) else {
+            error!(
+                "Release outcome for stripe {} with unknown token {}",
+                outcome.stripe_id, outcome.token
+            );
+            return;
+        };
+        let stripe_id = pending.stripe_id;
+        match outcome.result {
+            PersistResult::Durable => {
+                debug!("Stripe {stripe_id} re-materialised");
+                self.metadata_state.mark_stripe_resident(stripe_id);
+            }
+            result if pending.retries < MAX_RELEASE_RETRIES => {
+                warn!("Release header for stripe {stripe_id} ended {result:?}; retrying");
+                let token = self.next_release_token;
+                self.next_release_token += 2;
+                self.pending_release.insert(
+                    token,
+                    PendingRelease {
+                        stripe_id,
+                        retries: pending.retries + 1,
+                    },
+                );
+                self.metadata_flusher.update_stripe_header(
+                    stripe_id,
+                    metadata_flags::FETCHED,
+                    metadata_flags::EVICTED,
+                    token,
+                );
+            }
+            result => {
+                error!(
+                    "Release header for stripe {stripe_id} ended {result:?} after                      {MAX_RELEASE_RETRIES} retries; leaving it evicted"
+                );
+                self.metadata_state
+                    .spill()
+                    .degraded_reasons
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }
@@ -275,20 +422,36 @@ impl BgWorker {
     }
 
     pub fn update(&mut self) {
-        if let Ingest::Inline(fetcher) = &mut self.ingest {
-            fetcher.update();
-            for (stripe_id, success) in fetcher.take_finished_fetches() {
-                if success {
-                    // Unblocks anything waiting on this stripe now, rather than
-                    // once the flusher has worked through the sweep's backlog.
-                    self.metadata_state.mark_stripe_fetched(stripe_id);
-                    self.metadata_flusher.set_stripe_fetched(stripe_id);
-                } else {
-                    error!("Stripe {stripe_id} fetch failed");
-                }
+        let finished = match &mut self.ingest {
+            Ingest::Inline(fetcher) => {
+                fetcher.update();
+                fetcher.take_finished_fetches()
             }
+            Ingest::Pool(_) => Vec::new(),
+        };
+        for (stripe_id, success) in finished {
+            self.stripe_landed(stripe_id, success);
         }
         self.metadata_flusher.update();
+        let outcomes = self.metadata_flusher.take_persist_outcomes();
+        for outcome in outcomes
+            .iter()
+            .filter(|outcome| !Evictor::owns_token(outcome.token))
+        {
+            self.apply_release_outcome(outcome);
+        }
+        let released = self.evictor.as_mut().map(|evictor| {
+            evictor.update(&mut self.metadata_flusher, &outcomes);
+            evictor.take_released()
+        });
+        if let Some((fetches, pushes)) = released {
+            for stripe_id in fetches {
+                self.route_fetch(stripe_id);
+            }
+            for (stripe_id, data, permit) in pushes {
+                self.route_push(stripe_id, data, permit);
+            }
+        }
         if let Ingest::Inline(fetcher) = &mut self.ingest {
             fetcher.disconnect_from_source_if_all_fetched();
         }
@@ -327,8 +490,12 @@ mod tests {
     use super::*;
     use crate::{
         block_device::{
-            bdev_lazy::SharedMetadataState, bdev_test::TestBlockDevice, NullBlockDevice,
-            UbiMetadata,
+            bdev_lazy::{
+                metadata::{Fetched, NotFetched},
+                SharedMetadataState,
+            },
+            bdev_test::TestBlockDevice,
+            Evicting, NullBlockDevice, UbiMetadata,
         },
         stripe_source,
     };
@@ -366,38 +533,61 @@ mod tests {
         )
     }
 
-    /// A coordinator with the stub evictor attached, so the evictor branches of
-    /// the run loop are exercised.
-    fn build_bg_worker_with_evictor() -> (BgWorker, std::sync::mpsc::Sender<BgWorkerRequest>) {
+    /// A coordinator with a real evictor over a `TestObjectStore` and a
+    /// `RecordingPuncher`, and the devices a test asserts through.
+    struct EvictorRig {
+        worker: BgWorker,
+        sender: std::sync::mpsc::Sender<BgWorkerRequest>,
+        state: SharedMetadataState,
+        source_dev: TestBlockDevice,
+        target_dev: TestBlockDevice,
+        metadata_dev: TestBlockDevice,
+    }
+
+    const RIG_STRIPE_SECTORS: u64 = 8;
+    const RIG_STRIPES: usize = 8;
+    const RIG_STRIPE_BYTES: u64 = RIG_STRIPE_SECTORS * crate::backends::SECTOR_SIZE as u64;
+
+    fn rig_devices(
+        headers: &[(usize, u8)],
+    ) -> (TestBlockDevice, TestBlockDevice, SharedMetadataState) {
+        let size = RIG_STRIPES as u64 * RIG_STRIPE_BYTES;
+        let target_dev = TestBlockDevice::new(size);
+        let metadata_dev = TestBlockDevice::new(16 * 1024);
+        let mut metadata = UbiMetadata::new(3, RIG_STRIPES, RIG_STRIPES);
+        for (stripe_id, header) in headers {
+            metadata.set_stripe_header(*stripe_id, *header);
+        }
+        metadata.save_to_bdev(&metadata_dev).unwrap();
+        let state = SharedMetadataState::new(&UbiMetadata::load_from_bdev(&metadata_dev).unwrap());
+        (target_dev, metadata_dev, state)
+    }
+
+    fn rig_evictor(
+        target_dev: &TestBlockDevice,
+        state: &SharedMetadataState,
+        max_local_bytes: u64,
+        free_bytes: u64,
+    ) -> Evictor {
         use crate::{
-            archive::ArchiveCompressionAlgorithm,
+            archive::{ArchiveCompressionAlgorithm, TestObjectStore},
             block_device::spill::{EvictorConfig, RecordingPuncher, SpillCodec},
             config::v2::spill::OnFull,
         };
 
-        let stripe_sector_count_shift = 11;
-        let stripe_sector_count = 1u64 << stripe_sector_count_shift;
-        let source_dev = TestBlockDevice::new(1024 * 1024);
-        let stripe_source = Box::new(
-            stripe_source::BlockDeviceStripeSource::new(source_dev.clone(), stripe_sector_count)
-                .unwrap(),
-        );
-        let target_dev = TestBlockDevice::new(1024 * 1024);
-        let metadata_dev = TestBlockDevice::new(1024 * 1024);
-        let metadata = UbiMetadata::new(stripe_sector_count_shift, 16, 16);
-        metadata.save_to_bdev(&metadata_dev).unwrap();
-        let metadata_state = {
-            let metadata = UbiMetadata::load_from_bdev(&metadata_dev).expect("load metadata");
-            SharedMetadataState::new(&metadata)
-        };
-        let evictor = Evictor::new(
+        let puncher = RecordingPuncher::default();
+        puncher
+            .free
+            .store(free_bytes, std::sync::atomic::Ordering::SeqCst);
+        Evictor::new(
             EvictorConfig {
                 data_path: "/tmp/device.raw".into(),
-                stripe_sector_count,
+                device_id: "fork-1".to_string(),
+                stripe_sector_count: RIG_STRIPE_SECTORS,
                 target_sector_count: target_dev.sector_count(),
-                max_local_bytes: 1 << 20,
-                low_water_bytes: 4096,
-                hard_margin_bytes: 4096,
+                max_local_bytes,
+                low_water_bytes: 0,
+                hard_margin_bytes: RIG_STRIPES as u64 * RIG_STRIPE_BYTES,
                 min_free_bytes: 4096,
                 clean_eviction: false,
                 on_full: OnFull::Stall,
@@ -406,29 +596,436 @@ mod tests {
                 alignment: 4096,
             },
             target_dev.create_channel().unwrap(),
-            None,
-            SpillCodec::new(ArchiveCompressionAlgorithm::None, None, stripe_sector_count),
-            Box::new(RecordingPuncher::default()),
-            metadata_state.clone(),
+            Some(Box::new(TestObjectStore::new())),
+            SpillCodec::new(ArchiveCompressionAlgorithm::None, None, RIG_STRIPE_SECTORS),
+            Box::new(puncher),
+            state.clone(),
         )
-        .unwrap();
+        .unwrap()
+    }
 
-        let (tx, rx) = channel();
-        (
-            BgWorker::new(
-                stripe_source,
-                &target_dev,
-                &metadata_dev,
-                4096,
-                false,
-                false,
-                metadata_state,
-                rx,
-                Some(evictor),
+    /// Inline ingest over a `TestBlockDevice` source.
+    fn build_bg_worker_with_evictor(headers: &[(usize, u8)], max_local_bytes: u64) -> EvictorRig {
+        let (target_dev, metadata_dev, state) = rig_devices(headers);
+        let source_dev = TestBlockDevice::new(RIG_STRIPES as u64 * RIG_STRIPE_BYTES);
+        let stripe_source = Box::new(
+            stripe_source::BlockDeviceStripeSource::new(
+                BlockDevice::clone(&source_dev),
+                RIG_STRIPE_SECTORS,
             )
             .unwrap(),
-            tx,
+        );
+        let evictor = rig_evictor(&target_dev, &state, max_local_bytes, 1 << 40);
+        let (sender, receiver) = channel();
+        let worker = BgWorker::new(
+            stripe_source,
+            &target_dev,
+            &metadata_dev,
+            4096,
+            false,
+            false,
+            state.clone(),
+            receiver,
+            Some(evictor),
         )
+        .unwrap();
+        EvictorRig {
+            worker,
+            sender,
+            state,
+            source_dev,
+            target_dev,
+            metadata_dev,
+        }
+    }
+
+    /// The smallest config the builder accepts; with `has_fetched_all` the
+    /// workers build a null source from it and never look at the paths.
+    fn pool_config() -> crate::config::v2::Config {
+        use crate::config::v2;
+        v2::Config {
+            device: v2::DeviceSection {
+                snapshot_server: None,
+                snapshot_source: None,
+                snapshot_compression: Default::default(),
+                data_path: "/tmp/non-existent-disk".into(),
+                metadata_path: None,
+                vhost_socket: None,
+                rpc_socket: None,
+                device_id: "fork-1".to_string(),
+                track_written: true,
+            },
+            tuning: v2::tuning::TuningSection::default(),
+            encryption: None,
+            danger_zone: v2::DangerZone {
+                enabled: true,
+                allow_unencrypted_disk: true,
+                allow_inline_plaintext_secrets: true,
+                allow_secret_over_regular_file: true,
+                allow_unencrypted_connection: true,
+                allow_env_secrets: false,
+            },
+            stripe_source: None,
+            spill: None,
+            secrets: HashMap::new(),
+        }
+    }
+
+    /// Pool ingest: one worker over a null source, reporting completions
+    /// back on the coordinator's own channel.
+    fn build_bg_worker_with_pool_and_evictor(
+        headers: &[(usize, u8)],
+        max_local_bytes: u64,
+    ) -> EvictorRig {
+        let (target_dev, metadata_dev, state) = rig_devices(headers);
+        let evictor = rig_evictor(&target_dev, &state, max_local_bytes, 1 << 40);
+        let builder = StripeSourceBuilder::new(pool_config(), RIG_STRIPE_SECTORS, true, None);
+        let (sender, receiver) = channel();
+        let shared_target: Arc<dyn BlockDevice> = Arc::from(BlockDevice::clone(&target_dev));
+        let worker = BgWorker::with_ingest_pool(
+            shared_target,
+            builder,
+            &metadata_dev,
+            4096,
+            false,
+            false,
+            state.clone(),
+            receiver,
+            sender.clone(),
+            1,
+            1,
+            Some(evictor),
+        )
+        .unwrap();
+        EvictorRig {
+            worker,
+            sender,
+            state,
+            source_dev: TestBlockDevice::new(RIG_STRIPE_BYTES),
+            target_dev,
+            metadata_dev,
+        }
+    }
+
+    const RIG_DIRTY: u8 = crate::block_device::metadata_flags::FETCHED
+        | crate::block_device::metadata_flags::WRITTEN
+        | crate::block_device::metadata_flags::HAS_SOURCE;
+
+    #[test]
+    fn fetch_for_evicting_stripe_never_reaches_inline_fetcher() {
+        let mut rig = build_bg_worker_with_evictor(&[(0, RIG_DIRTY)], 0);
+        // Pinned guest I/O keeps the eviction draining, where a fetch aborts it.
+        rig.state.pin_inflight(0, 0);
+        for _ in 0..5 {
+            rig.worker.update();
+        }
+        assert_eq!(rig.state.stripe_fetch_state(0), Evicting);
+
+        rig.sender
+            .send(BgWorkerRequest::Fetch { stripe_id: 0 })
+            .unwrap();
+        rig.worker.receive_requests(false);
+        assert_eq!(
+            rig.state.stripe_fetch_state(0),
+            Fetched,
+            "aborted, resident again"
+        );
+        let Ingest::Inline(fetcher) = &rig.worker.ingest else {
+            panic!("inline ingest expected");
+        };
+        assert!(!fetcher.busy(), "nothing was queued for the fetcher");
+        for _ in 0..5 {
+            rig.worker.update();
+        }
+        assert_eq!(rig.source_dev.metrics.read().unwrap().reads, 0);
+        assert_eq!(rig.target_dev.metrics.read().unwrap().writes, 0);
+        assert_eq!(
+            rig.state
+                .spill()
+                .evictions_aborted
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
+    fn fetch_for_evicting_stripe_never_reaches_pool_worker() {
+        let mut rig = build_bg_worker_with_pool_and_evictor(
+            &[
+                (0, RIG_DIRTY),
+                (1, crate::block_device::metadata_flags::HAS_SOURCE),
+            ],
+            0,
+        );
+        rig.state.pin_inflight(0, 0);
+        for _ in 0..5 {
+            rig.worker.update();
+        }
+        assert_eq!(rig.state.stripe_fetch_state(0), Evicting);
+
+        rig.worker
+            .process_request(BgWorkerRequest::Fetch { stripe_id: 0 });
+        assert_eq!(rig.state.stripe_fetch_state(0), Fetched);
+        // A worker that had been given the stripe would pull it (zeros from
+        // the null source) and report back; nothing arrives.
+        assert!(matches!(
+            rig.worker
+                .req_receiver
+                .recv_timeout(Duration::from_millis(300)),
+            Err(RecvTimeoutError::Timeout)
+        ));
+        assert_eq!(rig.target_dev.metrics.read().unwrap().writes, 0);
+
+        // Control: a fetch for a stripe that is not being evicted does reach
+        // the worker, which reports back (the null source has nothing for
+        // it, so unsuccessfully); that is how the silence above is known to
+        // mean something.
+        rig.worker
+            .process_request(BgWorkerRequest::Fetch { stripe_id: 1 });
+        match rig.worker.req_receiver.recv_timeout(Duration::from_secs(5)) {
+            Ok(BgWorkerRequest::FetchCompleted { stripe_id, .. }) => assert_eq!(stripe_id, 1),
+            _ => panic!("the pool worker should have reported stripe 1"),
+        }
+        rig.worker.process_request(BgWorkerRequest::Shutdown);
+        rig.worker.run();
+    }
+
+    #[test]
+    fn pushed_stripe_records_pushed_before_disposition() {
+        use crate::block_device::{metadata_flags, PushGate};
+
+        let mut rig = build_bg_worker_with_evictor(&[(0, RIG_DIRTY)], 0);
+        rig.state.pin_inflight(0, 0);
+        for _ in 0..5 {
+            rig.worker.update();
+        }
+        assert_eq!(rig.state.stripe_fetch_state(0), Evicting);
+        assert!(!rig.state.stripe_pushed(0));
+
+        let gate = PushGate::new(2);
+        rig.worker.process_request(BgWorkerRequest::PushedStripe {
+            stripe_id: 0,
+            data: vec![0xEE; RIG_STRIPE_BYTES as usize],
+            permit: gate.acquire(),
+        });
+        // Ignored (the fork's own data is newer), yet recorded.
+        assert!(rig.state.stripe_pushed(0));
+        assert_eq!(gate.queued(), 0, "the permit went with the dropped push");
+        assert_eq!(rig.state.stripe_fetch_state(0), Evicting);
+        for _ in 0..3 {
+            rig.worker.update();
+        }
+        let header = UbiMetadata::load_from_bdev(&rig.metadata_dev)
+            .unwrap()
+            .stripe_header(0);
+        assert_ne!(header & metadata_flags::PUSHED, 0, "PUSHED persisted");
+        assert_eq!(rig.target_dev.metrics.read().unwrap().writes, 0);
+
+        // Without an evictor nothing is recorded and the push goes through.
+        let (mut plain, _sender) = build_bg_worker();
+        plain.process_request(BgWorkerRequest::PushedStripe {
+            stripe_id: 0,
+            data: vec![0xEE; RIG_STRIPE_BYTES as usize],
+            permit: gate.acquire(),
+        });
+        assert!(!plain.shared_state().stripe_pushed(0));
+    }
+
+    #[test]
+    fn stripe_landed_on_evicted_stripe_uses_even_token_and_does_not_mark_fetched() {
+        use crate::block_device::metadata_flags;
+
+        let evicted = metadata_flags::EVICTED | metadata_flags::HAS_SOURCE;
+        let mut rig = build_bg_worker_with_evictor(&[(0, evicted), (1, evicted)], 1 << 30);
+        assert_eq!(rig.state.stripe_fetch_state(0), Evicted);
+        let (fetched, resident) = (rig.state.fetched_stripes(), rig.state.resident_stripes());
+
+        rig.worker.process_request(BgWorkerRequest::FetchCompleted {
+            stripe_id: 0,
+            success: true,
+        });
+        assert_eq!(rig.state.stripe_fetch_state(0), Evicted, "not released yet");
+        assert_eq!(rig.state.fetched_stripes(), fetched);
+        assert_eq!(rig.state.resident_stripes(), resident);
+        assert_eq!(rig.worker.pending_release.len(), 1);
+        assert_eq!(rig.worker.pending_release[&2].stripe_id, 0);
+        assert_eq!(rig.worker.pending_release[&2].retries, 0);
+        assert_eq!(rig.worker.next_release_token, 4);
+
+        // A fetch for it while the header is in flight is dropped.
+        rig.worker
+            .process_request(BgWorkerRequest::Fetch { stripe_id: 0 });
+        let Ingest::Inline(fetcher) = &rig.worker.ingest else {
+            panic!("inline ingest expected");
+        };
+        assert!(!fetcher.busy());
+
+        for _ in 0..4 {
+            rig.worker.update();
+        }
+        assert_eq!(rig.state.stripe_fetch_state(0), Fetched);
+        assert_eq!(rig.state.fetched_stripes(), fetched + 1);
+        assert_eq!(rig.state.resident_stripes(), resident + 1);
+        assert!(rig.worker.pending_release.is_empty());
+        let header = UbiMetadata::load_from_bdev(&rig.metadata_dev)
+            .unwrap()
+            .stripe_header(0);
+        assert_ne!(header & metadata_flags::FETCHED, 0);
+        assert_eq!(header & metadata_flags::EVICTED, 0);
+
+        // A stripe that was never evicted lands at once, untokened.
+        rig.state.set_stripe_fetch_state_for_test(1, NotFetched);
+        rig.worker.process_request(BgWorkerRequest::FetchCompleted {
+            stripe_id: 1,
+            success: true,
+        });
+        assert_eq!(rig.state.stripe_fetch_state(1), Fetched);
+        assert!(rig.worker.pending_release.is_empty());
+        assert_eq!(rig.worker.next_release_token, 4);
+    }
+
+    #[test]
+    fn second_landing_while_release_is_pending_issues_no_second_op() {
+        use crate::block_device::metadata_flags;
+
+        let evicted = metadata_flags::EVICTED | metadata_flags::HAS_SOURCE;
+        let mut rig = build_bg_worker_with_evictor(&[(0, evicted)], 1 << 30);
+        let degraded_before = rig
+            .state
+            .spill()
+            .degraded_reasons
+            .load(std::sync::atomic::Ordering::Relaxed);
+        for _ in 0..2 {
+            rig.worker.process_request(BgWorkerRequest::FetchCompleted {
+                stripe_id: 0,
+                success: true,
+            });
+        }
+        assert_eq!(rig.worker.pending_release.len(), 1);
+        assert_eq!(rig.worker.next_release_token, 4);
+
+        for _ in 0..4 {
+            rig.worker.update();
+        }
+        assert_eq!(rig.state.stripe_fetch_state(0), Fetched);
+        assert!(rig.worker.pending_release.is_empty());
+        assert_eq!(
+            rig.state
+                .spill()
+                .degraded_reasons
+                .load(std::sync::atomic::Ordering::Relaxed),
+            degraded_before,
+            "one release, no false anomaly"
+        );
+    }
+
+    #[test]
+    fn release_op_is_retried_then_given_up_leaving_the_stripe_evicted() {
+        use crate::block_device::metadata_flags;
+
+        let evicted = metadata_flags::EVICTED | metadata_flags::HAS_SOURCE;
+        let mut rig = build_bg_worker_with_evictor(&[(0, evicted)], 1 << 30);
+        let degraded_before = rig
+            .state
+            .spill()
+            .degraded_reasons
+            .load(std::sync::atomic::Ordering::Relaxed);
+        rig.worker.process_request(BgWorkerRequest::FetchCompleted {
+            stripe_id: 0,
+            success: true,
+        });
+
+        // Every header write fails: the first attempt and three retries.
+        for attempt in 0..4u64 {
+            assert_eq!(rig.worker.pending_release.len(), 1);
+            assert_eq!(
+                rig.worker.pending_release[&(2 + 2 * attempt)].retries,
+                attempt as u8
+            );
+            rig.metadata_dev
+                .fail_next
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            rig.worker.update();
+        }
+        assert!(rig.worker.pending_release.is_empty(), "given up");
+        assert_eq!(rig.worker.next_release_token, 10);
+        assert_eq!(rig.state.stripe_fetch_state(0), Evicted);
+        assert_eq!(
+            rig.state
+                .spill()
+                .degraded_reasons
+                .load(std::sync::atomic::Ordering::Relaxed),
+            degraded_before + 1
+        );
+        let header = UbiMetadata::load_from_bdev(&rig.metadata_dev)
+            .unwrap()
+            .stripe_header(0);
+        assert_eq!(header, evicted, "the disk still says evicted");
+
+        // The next fetch is forwarded again rather than dropped.
+        rig.worker
+            .process_request(BgWorkerRequest::Fetch { stripe_id: 0 });
+        let Ingest::Inline(fetcher) = &rig.worker.ingest else {
+            panic!("inline ingest expected");
+        };
+        assert!(fetcher.busy());
+    }
+
+    #[test]
+    fn run_loop_ticks_without_requests_when_evictor_present() {
+        let (target_dev, metadata_dev, state) = rig_devices(&[]);
+        let source_dev = TestBlockDevice::new(RIG_STRIPES as u64 * RIG_STRIPE_BYTES);
+        let stripe_source = Box::new(
+            stripe_source::BlockDeviceStripeSource::new(
+                BlockDevice::clone(&source_dev),
+                RIG_STRIPE_SECTORS,
+            )
+            .unwrap(),
+        );
+        // The puncher's free-space answer only reaches the counters through
+        // an evictor tick, so seeing it proves the loop ticked unprompted.
+        let evictor = rig_evictor(&target_dev, &state, 1 << 30, 12345);
+        let (sender, receiver) = channel();
+        let mut worker = BgWorker::new(
+            stripe_source,
+            &target_dev,
+            &metadata_dev,
+            4096,
+            false,
+            false,
+            state.clone(),
+            receiver,
+            Some(evictor),
+        )
+        .unwrap();
+        assert_eq!(
+            state
+                .spill()
+                .free_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+
+        let observer_state = state.clone();
+        let observer = std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            let mut seen = 0;
+            while start.elapsed() < Duration::from_secs(5) {
+                seen = observer_state
+                    .spill()
+                    .free_bytes
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                if seen == 12345 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            sender.send(BgWorkerRequest::Shutdown).unwrap();
+            seen
+        });
+        worker.run();
+        assert_eq!(observer.join().unwrap(), 12345);
+        assert!(worker.done);
     }
 
     #[test]
@@ -453,15 +1050,18 @@ mod tests {
 
     #[test]
     fn run_loop_with_evictor_waits_and_shuts_down() {
-        let (mut bg_worker, sender) = build_bg_worker_with_evictor();
-        assert!(bg_worker.evictor.is_some());
+        let rig = build_bg_worker_with_evictor(&[], 1 << 30);
+        let EvictorRig {
+            mut worker, sender, ..
+        } = rig;
+        assert!(worker.evictor.is_some());
         let stop = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(30));
             sender.send(BgWorkerRequest::Shutdown).unwrap();
         });
-        bg_worker.run();
+        worker.run();
         stop.join().unwrap();
-        assert!(bg_worker.done);
+        assert!(worker.done);
     }
 
     fn build_bg_worker() -> (BgWorker, std::sync::mpsc::Sender<BgWorkerRequest>) {
