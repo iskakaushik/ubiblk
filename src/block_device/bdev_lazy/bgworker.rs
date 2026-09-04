@@ -17,7 +17,7 @@ use crate::{
 };
 use log::{debug, error, info, warn};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError},
         Arc,
@@ -87,6 +87,16 @@ pub struct BgWorker {
     pending_release: HashMap<u64, PendingRelease>,
     /// Even tokens are the coordinator's; odd ones the evictor's.
     next_release_token: u64,
+    /// Stripes that were not local (Evicted, or Failed with the header still
+    /// saying EVICTED) when a fetch or push for them was handed to the ingest,
+    /// until the ingest reports back. A re-sent `Fetch` for one of them is
+    /// dropped here rather than forwarded: it could reach the fetcher after
+    /// the pull or push has landed but before this thread has taken the
+    /// completion in (a pool worker's `FetchCompleted` may sit behind the
+    /// re-send on this channel), and the fetcher reads a `Fetched` entry under
+    /// a still-Evicted stripe as stale and pulls again, a write that lands
+    /// after the guest has the stripe back (`StripeFetcher::drop_stale_entry`).
+    landing: HashSet<usize>,
     done: bool,
 }
 
@@ -124,6 +134,7 @@ impl BgWorker {
             evictor,
             pending_release: HashMap::new(),
             next_release_token: 2,
+            landing: HashSet::new(),
             done: false,
         })
     }
@@ -176,6 +187,7 @@ impl BgWorker {
             evictor,
             pending_release: HashMap::new(),
             next_release_token: 2,
+            landing: HashSet::new(),
             done: false,
         })
     }
@@ -196,6 +208,12 @@ impl BgWorker {
                     // flight; the channel's re-send finds the stripe resident
                     // once that header is durable.
                     debug!("Fetch for stripe {stripe_id} dropped: its release is pending");
+                    return;
+                }
+                if self.landing.contains(&stripe_id) {
+                    // Its re-fetch, or a push, is with the ingest already; a
+                    // second pull would land after the release.
+                    debug!("Fetch for stripe {stripe_id} dropped: it is being taken in");
                     return;
                 }
                 if let Some(evictor) = &mut self.evictor {
@@ -249,7 +267,18 @@ impl BgWorker {
         }
     }
 
+    /// Remember a stripe that is not local when it goes to the ingest, so
+    /// re-sent fetches for it are dropped until `stripe_landed` sees it.
+    fn note_landing(&mut self, stripe_id: usize) {
+        if self.metadata_state.stripe_fetch_state(stripe_id) == Evicted
+            || self.metadata_state.stripe_flags(stripe_id) & stripe_flags::WAS_EVICTED != 0
+        {
+            self.landing.insert(stripe_id);
+        }
+    }
+
     fn route_fetch(&mut self, stripe_id: usize) {
+        self.note_landing(stripe_id);
         match &mut self.ingest {
             Ingest::Inline(fetcher) => fetcher.handle_fetch_request(stripe_id),
             Ingest::Pool(pool) => pool.send(stripe_id, IngestRequest::Fetch { stripe_id }),
@@ -257,6 +286,7 @@ impl BgWorker {
     }
 
     fn route_push(&mut self, stripe_id: usize, data: Vec<u8>, permit: PushPermit) {
+        self.note_landing(stripe_id);
         match &mut self.ingest {
             Ingest::Inline(fetcher) => fetcher.accept_pushed_stripe(stripe_id, &data, permit),
             Ingest::Pool(pool) => pool.send(
@@ -275,6 +305,7 @@ impl BgWorker {
     /// EVICTED) is released only when the header clearing EVICTED is durable,
     /// because the startup pass punches every stripe whose header says so.
     fn stripe_landed(&mut self, stripe_id: usize, success: bool) {
+        self.landing.remove(&stripe_id);
         if !success {
             error!("Stripe {stripe_id} fetch failed");
             return;
@@ -917,6 +948,137 @@ mod tests {
             degraded_before,
             "one release, no false anomaly"
         );
+    }
+
+    /// The fetcher cannot tell an evicted stripe that needs a pull from one
+    /// whose pull has landed and is waiting on its header (both are a
+    /// `Fetched` entry under an Evicted stripe), so the coordinator must not
+    /// forward a re-sent Fetch in that window. Modelled the way a pool worker
+    /// runs ahead of this thread: the fetcher is driven on its own until the
+    /// pull lands, and the re-send arrives before the completion is taken in.
+    #[test]
+    fn re_sent_fetch_is_dropped_until_the_re_fetch_has_been_taken_in() {
+        use crate::block_device::metadata_flags;
+
+        let evicted = metadata_flags::EVICTED | metadata_flags::HAS_SOURCE;
+        let mut rig = build_bg_worker_with_evictor(&[(0, evicted)], 1 << 30);
+
+        rig.worker
+            .process_request(BgWorkerRequest::Fetch { stripe_id: 0 });
+        assert!(rig.worker.landing.contains(&0));
+
+        let Ingest::Inline(fetcher) = &mut rig.worker.ingest else {
+            panic!("inline ingest expected");
+        };
+        for _ in 0..10 {
+            fetcher.update();
+        }
+        assert_eq!(rig.source_dev.metrics.read().unwrap().reads, 1);
+        assert_eq!(
+            rig.state.stripe_fetch_state(0),
+            Evicted,
+            "landed, not yet taken in"
+        );
+
+        rig.worker
+            .process_request(BgWorkerRequest::Fetch { stripe_id: 0 });
+        let Ingest::Inline(fetcher) = &mut rig.worker.ingest else {
+            panic!("inline ingest expected");
+        };
+        for _ in 0..10 {
+            fetcher.update();
+        }
+        assert_eq!(
+            rig.source_dev.metrics.read().unwrap().reads,
+            1,
+            "the re-send must not start a second pull"
+        );
+
+        for _ in 0..4 {
+            rig.worker.update();
+        }
+        assert!(!rig.worker.landing.contains(&0));
+        assert_eq!(rig.state.stripe_fetch_state(0), Fetched);
+    }
+
+    /// A pull that fails for good clears the way for the guest's next Fetch.
+    #[test]
+    fn a_failed_re_fetch_lets_the_next_fetch_through() {
+        use crate::block_device::metadata_flags;
+
+        let evicted = metadata_flags::EVICTED | metadata_flags::HAS_SOURCE;
+        let mut rig = build_bg_worker_with_evictor(&[(0, evicted)], 1 << 30);
+
+        rig.worker
+            .process_request(BgWorkerRequest::Fetch { stripe_id: 0 });
+        assert!(rig.worker.landing.contains(&0));
+
+        rig.worker.process_request(BgWorkerRequest::FetchCompleted {
+            stripe_id: 0,
+            success: false,
+        });
+        assert!(!rig.worker.landing.contains(&0));
+        assert!(rig.worker.pending_release.is_empty());
+
+        // A stripe that is local when forwarded is never held.
+        rig.state.set_stripe_fetch_state_for_test(0, NotFetched);
+        rig.worker
+            .process_request(BgWorkerRequest::Fetch { stripe_id: 0 });
+        assert!(!rig.worker.landing.contains(&0));
+    }
+
+    /// A push forwarded to an evicted stripe is that stripe's only copy. A
+    /// Fetch arriving while its write is with the ingest would be forwarded
+    /// to a fetcher that sees a `Fetched` entry under an Evicted stripe and
+    /// pulls, and the pull's write (here, the source's zeros) would replace
+    /// the pushed bytes.
+    #[test]
+    fn a_forwarded_push_holds_off_a_pull_until_it_has_been_taken_in() {
+        use crate::block_device::{metadata_flags, PushGate};
+
+        let evicted = metadata_flags::EVICTED | metadata_flags::HAS_SOURCE;
+        let mut rig = build_bg_worker_with_evictor(&[(0, evicted)], 1 << 30);
+        let pushed = vec![0xEE; RIG_STRIPE_BYTES as usize];
+        let gate = PushGate::new(2);
+
+        rig.worker.process_request(BgWorkerRequest::PushedStripe {
+            stripe_id: 0,
+            data: pushed.clone(),
+            permit: gate.acquire(),
+        });
+        assert!(rig.state.stripe_pushed(0));
+        assert!(rig.worker.landing.contains(&0), "forwarded, and remembered");
+
+        let Ingest::Inline(fetcher) = &mut rig.worker.ingest else {
+            panic!("inline ingest expected");
+        };
+        for _ in 0..10 {
+            fetcher.update();
+        }
+        assert_eq!(rig.state.stripe_fetch_state(0), Evicted);
+
+        rig.worker
+            .process_request(BgWorkerRequest::Fetch { stripe_id: 0 });
+        let Ingest::Inline(fetcher) = &mut rig.worker.ingest else {
+            panic!("inline ingest expected");
+        };
+        for _ in 0..10 {
+            fetcher.update();
+        }
+        assert_eq!(
+            rig.source_dev.metrics.read().unwrap().reads,
+            0,
+            "nothing is pulled over the pushed copy"
+        );
+
+        for _ in 0..4 {
+            rig.worker.update();
+        }
+        assert_eq!(rig.state.stripe_fetch_state(0), Fetched);
+        assert!(!rig.worker.landing.contains(&0));
+        let mut written = vec![0u8; pushed.len()];
+        rig.target_dev.read(0, &mut written, pushed.len());
+        assert_eq!(written, pushed);
     }
 
     #[test]
