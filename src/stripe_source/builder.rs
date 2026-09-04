@@ -4,17 +4,24 @@ use log::info;
 use ubiblk_macros::error_context;
 
 use crate::{
-    archive::{ArchiveStore, FileSystemStore, S3Store},
+    archive::{ArchiveStore, FileSystemStore, S3Store, DEFAULT_ARCHIVE_TIMEOUT},
     backends::build_raw_image_device,
-    block_device::{spill::SpillRuntime, NullBlockDevice, SharedMetadataState},
+    block_device::{
+        spill::{
+            codec::{spill_kek, spill_key_object_name, unwrap_spill_key},
+            SpillCodec, SpillRuntime,
+        },
+        NullBlockDevice, SharedMetadataState,
+    },
     config::v2::{
         self,
         secrets::{get_resolved_secret, ResolvedSecret, SecretRef},
+        spill::SpillSection,
         stripe_source::ArchiveStorageConfig,
     },
     stripe_server::{connect_to_stripe_server, RemoteStripeProvider},
     utils::s3::{build_s3_client, create_runtime, RateLimitedRetry, S3ClientTuning},
-    CipherMethod, KeyEncryptionCipher, Result,
+    CipherMethod, KeyEncryptionCipher, Result, ResultExt,
 };
 
 use super::*;
@@ -236,6 +243,49 @@ impl StripeSourceBuilder {
             key: Some(key),
             auth_data: Some(b"ubiblk_archive".to_vec()),
         })
+    }
+
+    /// Builds the codec for a device: compression from the section, cipher from
+    /// the wrapped key object when `kek` is set (synchronous GET, construction
+    /// time only). Used by the backend for the `SpillRuntime`.
+    #[error_context("Failed to build spill codec")]
+    pub fn build_spill_codec(
+        section: &SpillSection,
+        device_id: &str,
+        stripe_sector_count: u64,
+        secrets: &std::collections::HashMap<String, ResolvedSecret>,
+    ) -> Result<SpillCodec> {
+        let Some(kek) = &section.kek else {
+            return Ok(SpillCodec::new(
+                section.compression.clone(),
+                None,
+                stripe_sector_count,
+            ));
+        };
+        let Some(store_config) = &section.store else {
+            return Err(crate::ubiblk_error!(InvalidParameter {
+                description:
+                    "spill.kek needs spill.store: the wrapped spill key is an object in the store"
+                        .to_string(),
+            }));
+        };
+        let kek = spill_kek(get_resolved_secret(kek, secrets)?.as_bytes());
+        // One worker: a single GET at construction, then the store is dropped.
+        let mut store = Self::build_object_store(store_config, secrets, 1)?;
+        let name = spill_key_object_name(device_id);
+        let wrapped = store
+            .get_object(&name, DEFAULT_ARCHIVE_TIMEOUT)
+            .context(format!(
+                "spill key object '{name}' is missing or unreadable; the device was not initialised with this spill store"
+            ))?;
+        let cipher = unwrap_spill_key(&kek, &wrapped).context(format!(
+            "spill key object '{name}' does not unwrap with spill.kek; wrong key or a foreign object"
+        ))?;
+        Ok(SpillCodec::new(
+            section.compression.clone(),
+            Some(cipher),
+            stripe_sector_count,
+        ))
     }
 
     pub fn build_archive_store(
@@ -584,22 +634,15 @@ mod tests {
         assert!(creds.is_some());
     }
 
-    #[test]
-    fn build_with_connections_wraps_base_when_spill_parts_given() {
+    fn spill_runtime(
+        factory: Option<Arc<crate::block_device::spill::StoreFactory>>,
+    ) -> SpillRuntime {
         use crate::{
-            archive::{ArchiveCompressionAlgorithm, TestObjectStore},
-            block_device::{
-                spill::{EvictorConfig, SpillCodec},
-                UbiMetadata,
-            },
+            archive::ArchiveCompressionAlgorithm,
+            block_device::spill::{EvictorConfig, SpillCodec},
             config::v2::spill::OnFull,
         };
-        use std::sync::{Arc, Mutex};
-
-        let state = SharedMetadataState::new(&UbiMetadata::new(3, 4, 4));
-        let factory_calls = Arc::new(Mutex::new(Vec::new()));
-        let recorded = factory_calls.clone();
-        let runtime = SpillRuntime {
+        SpillRuntime {
             cfg: EvictorConfig {
                 data_path: "/tmp/device.raw".into(),
                 stripe_sector_count: 8,
@@ -615,15 +658,44 @@ mod tests {
                 alignment: 4096,
             },
             device_id: "fork-1".to_string(),
-            store_factory: Some(Arc::new(move |workers| {
-                recorded.lock().unwrap().push(workers);
-                Ok(Box::new(TestObjectStore::new()) as Box<dyn ArchiveStore>)
-            })),
+            store_factory: factory,
             codec: SpillCodec::new(ArchiveCompressionAlgorithm::None, None, 8),
             puncher_factory: None,
-        };
+        }
+    }
+
+    /// A store factory that records the worker count it was asked for.
+    fn recording_factory() -> (
+        Arc<crate::block_device::spill::StoreFactory>,
+        Arc<std::sync::Mutex<Vec<usize>>>,
+    ) {
+        use crate::archive::TestObjectStore;
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+        let factory: Arc<crate::block_device::spill::StoreFactory> = Arc::new(move |workers| {
+            recorded.lock().unwrap().push(workers);
+            Ok(Box::new(TestObjectStore::new()) as Box<dyn ArchiveStore>)
+        });
+        (factory, calls)
+    }
+
+    /// Four source stripes, stripe 1 evicted with its data in the store.
+    fn state_with_spilled_stripe() -> SharedMetadataState {
+        use crate::block_device::{metadata_flags, UbiMetadata};
+        let mut metadata = UbiMetadata::new(3, 4, 4);
+        metadata.set_stripe_header(
+            1,
+            metadata_flags::HAS_SOURCE | metadata_flags::EVICTED | metadata_flags::IN_S3,
+        );
+        SharedMetadataState::new(&metadata)
+    }
+
+    #[test]
+    fn build_with_connections_wraps_in_spilling_source_when_spill_configured() {
+        let state = state_with_spilled_stripe();
+        let (factory, factory_calls) = recording_factory();
         let parts = SpillSourceParts {
-            runtime,
+            runtime: spill_runtime(Some(factory)),
             state: state.clone(),
         };
 
@@ -634,6 +706,9 @@ mod tests {
         // Null base plus the three spill connections.
         assert_eq!(source.max_concurrent_requests(), 1 + 3);
         assert_eq!(source.sector_count(), 0);
+        // The null base has nothing; the composite knows stripe 1 is spilled.
+        assert!(source.has_stripe(1));
+        assert!(!source.has_stripe(2));
 
         // Without a store (clean-only) the base is still wrapped but no store
         // is built.
@@ -644,6 +719,276 @@ mod tests {
         let source = clean_only.build().unwrap();
         assert_eq!(*factory_calls.lock().unwrap(), vec![3]);
         assert_eq!(source.max_concurrent_requests(), 1);
+    }
+
+    #[test]
+    fn build_with_connections_is_unwrapped_without_spill() {
+        // Without spill parts the builder hands out base alone: nothing
+        // consults the metadata, so no stripe is known to be spilled.
+        let builder = StripeSourceBuilder::new(create_test_config(None, None), 8, false, None);
+        let source = builder.build_with_connections(Some(3)).unwrap();
+        assert_eq!(source.max_concurrent_requests(), 1);
+        assert!(!source.has_stripe(1));
+    }
+
+    #[test]
+    fn build_with_connections_defaults_spill_connections_to_the_store_config() {
+        use crate::config::v2::spill::{OnFull, SpillSection};
+
+        let state = state_with_spilled_stripe();
+        let (factory, factory_calls) = recording_factory();
+        let parts = SpillSourceParts {
+            runtime: spill_runtime(Some(factory)),
+            state,
+        };
+        let mut config = create_test_config(None, None);
+        config.spill = Some(SpillSection {
+            max_local_bytes: 1 << 20,
+            low_water_bytes: 4096,
+            hard_margin_bytes: 4096,
+            min_free_bytes: 4096,
+            on_full: OnFull::Stall,
+            clean_eviction: false,
+            max_concurrent_evictions: 1,
+            compression: Default::default(),
+            kek: None,
+            store: Some(ArchiveStorageConfig::S3 {
+                bucket: "bucket".to_string(),
+                prefix: Some("forks".to_string()),
+                region: Some("us-east-1".to_string()),
+                access_key_id: None,
+                secret_access_key: None,
+                session_token: None,
+                endpoint: None,
+                connections: 5,
+                connect_timeout_ms: 5_000,
+                operation_attempt_timeout_ms: 20_000,
+                max_attempts: 3,
+                rate_limited_retry: RateLimitedRetryConfig::default(),
+                archive_kek: None,
+                autofetch: false,
+            }),
+        });
+
+        let builder = StripeSourceBuilder::new(config, 8, false, Some(parts));
+        // No override: the store's own connection count, shared by pool
+        // workers the way a remote source's is.
+        let source = builder.build().unwrap();
+        assert_eq!(*factory_calls.lock().unwrap(), vec![5]);
+        assert_eq!(source.max_concurrent_requests(), 1 + 5);
+        // A zero override is clamped to one connection.
+        builder.build_with_connections(Some(0)).unwrap();
+        assert_eq!(*factory_calls.lock().unwrap(), vec![5, 1]);
+    }
+
+    fn spill_section(store: Option<ArchiveStorageConfig>, kek: Option<&str>) -> SpillSection {
+        use crate::config::v2::spill::OnFull;
+        SpillSection {
+            max_local_bytes: 1 << 20,
+            low_water_bytes: 4096,
+            hard_margin_bytes: 4096,
+            min_free_bytes: 4096,
+            on_full: OnFull::Stall,
+            clean_eviction: false,
+            max_concurrent_evictions: 1,
+            compression: crate::archive::ArchiveCompressionAlgorithm::None,
+            kek: kek.map(|id| SecretRef::Ref(id.to_string())),
+            store,
+        }
+    }
+
+    fn filesystem_store(dir: &std::path::Path) -> ArchiveStorageConfig {
+        ArchiveStorageConfig::Filesystem {
+            path: dir.join("spill"),
+            archive_kek: None,
+            autofetch: false,
+        }
+    }
+
+    const KEK_BYTES: [u8; 32] = [0x33; 32];
+
+    fn kek_secrets() -> HashMap<String, ResolvedSecret> {
+        resolve(HashMap::from([(
+            "spill-kek".to_string(),
+            make_inline_secret_bytes(&KEK_BYTES),
+        )]))
+    }
+
+    /// The error's message; the Ok side has no Debug.
+    fn err_string<T>(result: Result<T>) -> String {
+        match result {
+            Ok(_) => panic!("expected an error"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    fn data_cipher() -> crate::crypt::XtsBlockCipher {
+        crate::crypt::XtsBlockCipher::new(vec![0x11; 32], vec![0x22; 32]).unwrap()
+    }
+
+    /// Write the wrapped data key where `build_spill_codec` will look for it.
+    fn seed_key_object(store: &ArchiveStorageConfig, kek: &[u8], device_id: &str) {
+        use crate::block_device::spill::codec::wrap_spill_key;
+        let wrapped = wrap_spill_key(&spill_kek(kek), &data_cipher()).unwrap();
+        StripeSourceBuilder::build_object_store(store, &HashMap::new(), 1)
+            .unwrap()
+            .put_object(
+                &spill_key_object_name(device_id),
+                &wrapped,
+                DEFAULT_ARCHIVE_TIMEOUT,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn build_spill_codec_unwraps_key_object() {
+        use crate::{archive::ArchiveCompressionAlgorithm, backends::SECTOR_SIZE};
+
+        let dir = tempdir().unwrap();
+        let store = filesystem_store(dir.path());
+        seed_key_object(&store, &KEK_BYTES, "fork-1");
+        let section = spill_section(Some(store), Some("spill-kek"));
+
+        let mut codec =
+            StripeSourceBuilder::build_spill_codec(&section, "fork-1", 8, &kek_secrets()).unwrap();
+
+        // The built codec reads what a codec over the original data key wrote,
+        // so the unwrapped key is the one that was wrapped.
+        let data: Vec<u8> = (0..8 * SECTOR_SIZE).map(|i| i as u8).collect();
+        let mut writer = SpillCodec::new(ArchiveCompressionAlgorithm::None, Some(data_cipher()), 8);
+        let object = writer.encode(2, &data, None).unwrap();
+        let mut dst = vec![0u8; data.len()];
+        codec.decode_into(2, &object, &mut dst, None).unwrap();
+        assert_eq!(dst, data);
+    }
+
+    #[test]
+    fn build_spill_codec_without_kek_stores_in_the_clear() {
+        use crate::{backends::SECTOR_SIZE, block_device::spill::SpillObjectHeader};
+
+        let section = spill_section(None, None);
+        let mut codec =
+            StripeSourceBuilder::build_spill_codec(&section, "fork-1", 8, &HashMap::new()).unwrap();
+        let data = vec![7u8; SECTOR_SIZE];
+        let object = codec.encode(0, &data, None).unwrap();
+        let header = SpillObjectHeader::decode(&object).unwrap();
+        assert_eq!(header.flags, 0, "neither compressed nor encrypted");
+    }
+
+    #[test]
+    fn build_spill_codec_fails_without_key_object() {
+        let dir = tempdir().unwrap();
+        let store = filesystem_store(dir.path());
+        let secrets = kek_secrets();
+
+        // No key object in the store.
+        let section = spill_section(Some(store.clone()), Some("spill-kek"));
+        let err = err_string(StripeSourceBuilder::build_spill_codec(
+            &section, "fork-1", 8, &secrets,
+        ));
+        assert!(err.contains("fork-1/spill-key"), "Got: {err}");
+        assert!(err.contains("missing or unreadable"), "Got: {err}");
+
+        // A key object wrapped under a different KEK.
+        seed_key_object(&store, &[0x44; 32], "fork-1");
+        let err = err_string(StripeSourceBuilder::build_spill_codec(
+            &section, "fork-1", 8, &secrets,
+        ));
+        assert!(err.contains("does not unwrap"), "Got: {err}");
+
+        // A KEK with nowhere to keep the wrapped key.
+        let section = spill_section(None, Some("spill-kek"));
+        let err = err_string(StripeSourceBuilder::build_spill_codec(
+            &section, "fork-1", 8, &secrets,
+        ));
+        assert!(err.contains("spill.kek needs spill.store"), "Got: {err}");
+
+        // A KEK secret that is not in the resolved set.
+        let section = spill_section(Some(store), Some("other-kek"));
+        let err = err_string(StripeSourceBuilder::build_spill_codec(
+            &section, "fork-1", 8, &secrets,
+        ));
+        assert!(err.contains("other-kek"), "Got: {err}");
+    }
+
+    fn s3_config(
+        access_key_id: Option<SecretRef>,
+        secret_access_key: Option<SecretRef>,
+    ) -> ArchiveStorageConfig {
+        ArchiveStorageConfig::S3 {
+            bucket: "bucket".to_string(),
+            prefix: Some("forks".to_string()),
+            region: Some("us-east-1".to_string()),
+            access_key_id,
+            secret_access_key,
+            session_token: None,
+            // Never dialled: nothing is requested from the store.
+            endpoint: Some("http://127.0.0.1:1".to_string()),
+            connections: 1,
+            connect_timeout_ms: 1_000,
+            operation_attempt_timeout_ms: 1_000,
+            max_attempts: 1,
+            rate_limited_retry: RateLimitedRetryConfig::default(),
+            archive_kek: None,
+            autofetch: false,
+        }
+    }
+
+    #[test]
+    fn build_object_store_passes_none_credentials_when_keys_absent() {
+        // With both keys omitted no secret is looked up: the client is built
+        // on the SDK's default provider chain and construction succeeds with
+        // an empty secret set.
+        let store =
+            StripeSourceBuilder::build_object_store(&s3_config(None, None), &HashMap::new(), 1);
+        assert!(store.is_ok(), "Got: {:?}", store.err());
+        drop(store);
+
+        // With keys configured the secrets are required, so the same empty
+        // set is an error rather than a silent fallback to the default chain.
+        let keyed = s3_config(
+            Some(SecretRef::Ref("key_id".to_string())),
+            Some(SecretRef::Ref("secret_key".to_string())),
+        );
+        let err = err_string(StripeSourceBuilder::build_object_store(
+            &keyed,
+            &HashMap::new(),
+            1,
+        ));
+        assert!(
+            err.contains("key_id") && err.contains("not found"),
+            "Got: {err}"
+        );
+    }
+
+    #[test]
+    fn s3_object_key_is_prefix_device_id_index() {
+        use crate::block_device::spill::codec::spill_object_name;
+        use aws_sdk_s3::{operation::get_object::GetObjectOutput, primitives::ByteStream};
+        use aws_smithy_mocks::{mock, mock_client};
+
+        let rule = mock!(aws_sdk_s3::Client::get_object)
+            .match_requests(|req| {
+                req.bucket() == Some("bucket") && req.key() == Some("forks/fork-1/7")
+            })
+            .then_output(|| {
+                GetObjectOutput::builder()
+                    .body(ByteStream::from_static(b"object"))
+                    .build()
+            });
+        let mut store = S3Store::new(
+            mock_client!(aws_sdk_s3, &[&rule]),
+            "bucket".to_string(),
+            Some("forks".to_string()),
+            1,
+        )
+        .unwrap();
+
+        let object = store
+            .get_object(&spill_object_name("fork-1", 7), DEFAULT_ARCHIVE_TIMEOUT)
+            .unwrap();
+        assert_eq!(object, b"object");
+        assert_eq!(rule.num_calls(), 1);
     }
 
     #[test]
