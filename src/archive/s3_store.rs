@@ -1,6 +1,6 @@
 use std::{sync::Arc, thread::JoinHandle};
 
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use log::{debug, error, info};
 
 use super::ArchiveStore;
@@ -12,6 +12,9 @@ type S3ByteStream = aws_sdk_s3::primitives::ByteStream;
 
 mod s3_store_workers;
 
+/// The most keys one `DeleteObjects` request may carry (an S3 limit).
+pub const DELETE_BATCH_SIZE: usize = 1000;
+
 enum S3Request {
     Put {
         name: String,
@@ -21,6 +24,12 @@ enum S3Request {
     Get {
         name: String,
         key: String,
+    },
+    /// One `DeleteObjects` call. The reply goes straight back to the caller,
+    /// which blocks on it: deletes are for offline tools, not the I/O path.
+    Delete {
+        keys: Vec<String>,
+        reply: Sender<Result<()>>,
     },
 }
 
@@ -171,6 +180,40 @@ impl ArchiveStore for S3Store {
         self.drain_results();
         std::mem::take(&mut self.finished_gets)
     }
+
+    /// One `DeleteObjects` request per `DELETE_BATCH_SIZE` names, each run on a
+    /// worker and waited for. Stops at the first failed batch.
+    fn delete_objects(&mut self, names: &[String]) -> Result<()> {
+        let sender = self.request_tx.as_ref().ok_or_else(|| {
+            crate::ubiblk_error!(ArchiveError {
+                description: "S3 worker queue is unavailable".to_string(),
+            })
+        })?;
+        for batch in names.chunks(DELETE_BATCH_SIZE) {
+            debug!("Queueing S3 delete of {} objects", batch.len());
+            let keys = batch
+                .iter()
+                .map(|name| key_with_prefix(&self.prefix, name))
+                .collect();
+            let (reply_tx, reply_rx) = bounded(1);
+            sender
+                .send(S3Request::Delete {
+                    keys,
+                    reply: reply_tx,
+                })
+                .map_err(|err| {
+                    crate::ubiblk_error!(ArchiveError {
+                        description: format!("Failed to enqueue S3 delete request: {err}"),
+                    })
+                })?;
+            reply_rx.recv().map_err(|_| {
+                crate::ubiblk_error!(ArchiveError {
+                    description: "S3 worker exited before answering the delete request".to_string(),
+                })
+            })??;
+        }
+        Ok(())
+    }
 }
 
 fn key_with_prefix(prefix: &Option<String>, name: &str) -> String {
@@ -185,7 +228,10 @@ fn key_with_prefix(prefix: &Option<String>, name: &str) -> String {
 mod tests {
     use std::time::Duration;
 
-    use aws_sdk_s3::operation::{get_object::GetObjectOutput, put_object::PutObjectOutput};
+    use aws_sdk_s3::operation::{
+        delete_objects::DeleteObjectsOutput, get_object::GetObjectOutput,
+        put_object::PutObjectOutput,
+    };
     use aws_smithy_mocks::{mock, mock_client, Rule};
 
     use super::*;
@@ -268,5 +314,82 @@ mod tests {
             err.to_string().contains("S3 worker queue is unavailable"),
             "unexpected error: {err}"
         );
+    }
+
+    /// A rule that answers one `DeleteObjects` carrying exactly `expected`
+    /// keys, all under the test prefix.
+    fn delete_rule(expected: usize) -> Rule {
+        mock!(S3Client::delete_objects)
+            .match_requests(move |req| {
+                let keys: Vec<&str> = req
+                    .delete()
+                    .map(|d| d.objects().iter().map(|o| o.key()).collect())
+                    .unwrap_or_default();
+                keys.len() == expected && keys.iter().all(|k| k.starts_with("test-prefix/dev/"))
+            })
+            .then_output(|| DeleteObjectsOutput::builder().build())
+    }
+
+    fn names(count: usize) -> Vec<String> {
+        (0..count).map(|i| format!("dev/{i}")).collect()
+    }
+
+    #[test]
+    fn delete_objects_batches_by_1000() {
+        // 2001 names: two full batches and one of a single key, in order.
+        let rules = [delete_rule(1000), delete_rule(1000), delete_rule(1)];
+        let mut store = prepare_s3_store("test-bucket", Some("test-prefix"), &rules);
+
+        store.delete_objects(&names(2001)).unwrap();
+
+        for rule in &rules {
+            assert_eq!(rule.num_calls(), 1);
+        }
+    }
+
+    #[test]
+    fn delete_objects_with_no_names_sends_nothing() {
+        let rules = [delete_rule(0)];
+        let mut store = prepare_s3_store("test-bucket", Some("test-prefix"), &rules);
+        store.delete_objects(&[]).unwrap();
+        assert_eq!(rules[0].num_calls(), 0);
+    }
+
+    #[test]
+    fn delete_objects_reports_per_key_errors() {
+        let rule = mock!(S3Client::delete_objects).then_output(|| {
+            DeleteObjectsOutput::builder()
+                .errors(
+                    aws_sdk_s3::types::Error::builder()
+                        .key("test-prefix/dev/1")
+                        .code("AccessDenied")
+                        .message("no")
+                        .build(),
+                )
+                .build()
+        });
+        let mut store = prepare_s3_store("test-bucket", Some("test-prefix"), &[rule]);
+
+        let err = store.delete_objects(&names(2)).unwrap_err().to_string();
+        assert!(err.contains("test-prefix/dev/1"), "{err}");
+        assert!(err.contains("AccessDenied"), "{err}");
+    }
+
+    #[test]
+    fn delete_objects_errors_when_queue_missing() {
+        let mut store = test_store(None);
+        let err = store.delete_objects(&names(1)).unwrap_err().to_string();
+        assert!(err.contains("S3 worker queue is unavailable"), "{err}");
+    }
+
+    #[test]
+    fn delete_objects_errors_when_workers_are_gone() {
+        // A live sender whose receiver was dropped: the request cannot be
+        // enqueued, which is how a store with dead workers looks.
+        let (request_tx, request_rx) = unbounded();
+        drop(request_rx);
+        let mut store = test_store(Some(request_tx));
+        let err = store.delete_objects(&names(1)).unwrap_err().to_string();
+        assert!(err.contains("Failed to enqueue S3 delete request"), "{err}");
     }
 }
