@@ -1,4 +1,4 @@
-use std::sync::{atomic::AtomicBool, Arc, RwLock};
+use std::sync::{atomic::AtomicBool, Arc, Mutex, RwLock};
 
 use crate::backends::SECTOR_SIZE;
 
@@ -10,16 +10,25 @@ pub struct TestDeviceMetrics {
     pub flushes: usize,
 }
 
+/// Called from inside `TestIoChannel::add_read` with the sector offset, so a
+/// test can change shared state at the moment a request reaches the device.
+pub type ReadHook = dyn Fn(u64) + Send;
+
 struct TestIoChannel {
     mem: Arc<RwLock<Vec<u8>>>,
     fail_next: Arc<AtomicBool>,
     fail_submit: Arc<AtomicBool>,
+    hold_completions: Arc<AtomicBool>,
+    on_add_read: Arc<Mutex<Option<Box<ReadHook>>>>,
     finished_requests: Vec<(usize, bool)>,
     metrics: Arc<RwLock<TestDeviceMetrics>>,
 }
 
 impl IoChannel for TestIoChannel {
     fn add_read(&mut self, sector_offset: u64, sector_count: u32, _buf: SharedBuffer, _id: usize) {
+        if let Some(hook) = self.on_add_read.lock().unwrap().as_ref() {
+            hook(sector_offset);
+        }
         if self
             .fail_next
             .swap(false, std::sync::atomic::Ordering::SeqCst)
@@ -94,6 +103,12 @@ impl IoChannel for TestIoChannel {
     }
 
     fn poll(&mut self) -> Vec<(usize, bool)> {
+        if self
+            .hold_completions
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Vec::new();
+        }
         std::mem::take(&mut self.finished_requests)
     }
 
@@ -108,6 +123,11 @@ pub struct TestBlockDevice {
     pub metrics: Arc<RwLock<TestDeviceMetrics>>,
     pub fail_next: Arc<AtomicBool>,
     pub fail_submit: Arc<AtomicBool>,
+    /// While set, completions accumulate in the channel instead of being
+    /// returned by `poll`, so a test can look at a request in flight.
+    pub hold_completions: Arc<AtomicBool>,
+    /// Invoked inside every `add_read` with the sector offset.
+    pub on_add_read: Arc<Mutex<Option<Box<ReadHook>>>>,
 }
 
 impl TestBlockDevice {
@@ -130,7 +150,14 @@ impl TestBlockDevice {
             })),
             fail_next,
             fail_submit,
+            hold_completions: Arc::new(AtomicBool::new(false)),
+            on_add_read: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Install (or with `None`, remove) the `add_read` hook.
+    pub fn set_on_add_read(&self, hook: Option<Box<ReadHook>>) {
+        *self.on_add_read.lock().unwrap() = hook;
     }
 
     pub fn read(&self, offset: usize, buf: &mut [u8], len: usize) {
@@ -160,6 +187,8 @@ impl BlockDevice for TestBlockDevice {
             metrics: self.metrics.clone(),
             fail_next: self.fail_next.clone(),
             fail_submit: self.fail_submit.clone(),
+            hold_completions: self.hold_completions.clone(),
+            on_add_read: self.on_add_read.clone(),
         }))
     }
 
@@ -174,6 +203,8 @@ impl BlockDevice for TestBlockDevice {
             metrics: self.metrics.clone(),
             fail_next: self.fail_next.clone(),
             fail_submit: self.fail_submit.clone(),
+            hold_completions: self.hold_completions.clone(),
+            on_add_read: self.on_add_read.clone(),
         })
     }
 }
@@ -229,6 +260,50 @@ mod tests {
         assert_eq!(metrics.flushes, 1);
         drop(metrics);
         assert_eq!(device.flushes(), 1);
+    }
+
+    #[test]
+    // Completions stay in the channel while held and come out once released.
+    fn hold_completions_delays_poll_until_released() {
+        let device = TestBlockDevice::new(SECTOR_SIZE as u64);
+        let mut channel = device.create_channel().unwrap();
+        device
+            .hold_completions
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let buf: SharedBuffer = shared_buffer(SECTOR_SIZE);
+        channel.add_read(0, 1, buf, 1);
+        channel.submit().unwrap();
+        assert!(channel.poll().is_empty());
+        assert!(channel.busy());
+
+        device
+            .hold_completions
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(channel.poll(), vec![(1, true)]);
+        assert!(!channel.busy());
+    }
+
+    #[test]
+    // The read hook sees the sector offset of every read, and can be removed.
+    fn on_add_read_hook_sees_each_read() {
+        let device = TestBlockDevice::new(4 * SECTOR_SIZE as u64);
+        let mut channel = device.create_channel().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = seen.clone();
+        device.set_on_add_read(Some(Box::new(move |sector| {
+            record.lock().unwrap().push(sector)
+        })));
+
+        let buf: SharedBuffer = shared_buffer(SECTOR_SIZE);
+        channel.add_read(2, 1, buf.clone(), 1);
+        channel.add_read(3, 1, buf.clone(), 2);
+        channel.submit().unwrap();
+        assert_eq!(*seen.lock().unwrap(), vec![2, 3]);
+
+        device.set_on_add_read(None);
+        channel.add_read(0, 1, buf, 3);
+        assert_eq!(*seen.lock().unwrap(), vec![2, 3]);
     }
 
     #[test]
