@@ -110,13 +110,41 @@ source.env = "UBIBLK_ARCHIVE_KEK"
 | `region` | string | no | — | AWS region |
 | `endpoint` | string | no | — | Custom S3 endpoint URL |
 | `connections` | integer | no | 16 | Number of S3 connections (must be > 0) |
-| `access_key_id.ref` | string | yes | — | Reference to AWS access key ID secret |
-| `secret_access_key.ref` | string | yes | — | Reference to AWS secret access key secret |
-| `session_token.ref` | string | no | — | Reference to AWS session token secret (for temporary credentials) |
+| `access_key_id.ref` | string | no | - | Reference to AWS access key ID secret. Set together with `secret_access_key.ref`, or omit both (see below) |
+| `secret_access_key.ref` | string | no | - | Reference to AWS secret access key secret |
+| `session_token.ref` | string | no | - | Reference to AWS session token secret (for temporary credentials); requires both keys |
 | `archive_kek.ref` | string | no | — | Reference to a 32-byte AES-256-GCM KEK secret |
 | `autofetch` | boolean | no | false | Fetch stripes in the background |
 | `max_attempts` | integer | no | 3 | Max S3 operation attempts (initial attempt + retries) |
 | `rate_limited_retry` | table | no | disabled | Jittered retry delay for rate-limited responses. See below. |
+
+#### Credentials
+
+`access_key_id.ref` and `secret_access_key.ref` are either both set or both
+omitted. When both are omitted, the client uses the AWS SDK default provider
+chain: `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` in the environment, the
+shared config and credentials files, and finally the instance role through
+IMDS. That is the intended setup on EC2, where the role attached to the
+instance grants access to the bucket and no key material lives in the config.
+
+```toml
+[target]
+storage = "s3"
+bucket = "my-bucket"
+prefix = "ubiblk/"
+region = "us-west-2"
+# no access_key_id / secret_access_key: instance role via IMDS
+```
+
+Setting one key without the other is rejected at config load
+(`S3 access_key_id and secret_access_key must be set together (omit both to
+use the instance role)`), as is a `session_token.ref` without both keys. IMDS
+answers with a hop limit of 1 by default, so a process in a bridge-networked
+container does not reach it; raise the hop limit on the instance or pass keys.
+
+The same rules apply to every S3 section that uses this schema: `[target]`
+here, `[stripe_source]` with `type = "archive"`, and `[spill.store]` (see
+[config.md](config.md)).
 
 #### `[target.rate_limited_retry]`
 
@@ -266,3 +294,36 @@ No other top-level keys are allowed.
 
 `[archive]` uses the same field schema as the archive storage definitions in
 [config.md#archive-filesystem](config.md#archive-filesystem) and [config.md#archive-s3](config.md#archive-s3).
+
+## Spill Purge
+
+`spill-purge` deletes every object a device may have written to its
+`[spill.store]`. Run it when a fork is destroyed; the bucket does not clean
+itself up.
+
+### Usage
+
+```bash
+spill-purge --config <CONFIG_TOML> [--dry-run]
+```
+
+| Flag | Short | Required | Description |
+|------|-------|----------|-------------|
+| `--config` | `-f` | yes | Path to the ubiblk config TOML with a `[spill.store]` section |
+| `--dry-run` | - | no | Print every object name that would be deleted; delete nothing |
+
+The tool loads the metadata file to learn the stripe count and then deletes
+`<device_id>/<index>` for every stripe index plus `<device_id>/spill-key`, in
+batches of 1000 (one `DeleteObjects` request per batch on S3). It names every
+index, not only the stripes marked IN_S3, because a crash between a PUT and
+the header write leaves an object the metadata does not point at. It never
+opens `device.raw`, so it is safe to run after the data file is gone.
+
+**Examples:**
+```bash
+# See what would be deleted
+spill-purge -f fork.toml --dry-run
+
+# Delete it
+spill-purge -f fork.toml
+```

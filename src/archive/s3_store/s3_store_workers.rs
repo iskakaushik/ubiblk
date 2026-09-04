@@ -115,6 +115,85 @@ async fn process_request(ctx: &WorkerContext, req: S3Request, tx: &Sender<S3Resu
                 error!("Failed to send S3Result::Get for {}: {}", name, e);
             }
         }
+        S3Request::Delete { keys, reply } => {
+            debug!("Deleting {} objects from S3", keys.len());
+            let result = delete_objects(ctx, &keys).await;
+            if reply.send(result).is_err() {
+                error!("Failed to send DeleteObjects result: caller is gone");
+            }
+        }
+    }
+}
+
+/// One `DeleteObjects` call in quiet mode, so the reply only lists the keys
+/// that failed. Any such key fails the whole batch: the caller is an offline
+/// tool that must not report a partial purge as complete.
+async fn delete_objects(ctx: &WorkerContext, keys: &[String]) -> Result<()> {
+    let describe = || {
+        format!(
+            "{} keys from '{}'",
+            keys.len(),
+            keys.first().map(String::as_str).unwrap_or("")
+        )
+    };
+    let build_error = |err: aws_sdk_s3::error::BuildError| {
+        crate::ubiblk_error!(ArchiveError {
+            description: format!("Failed to build DeleteObjects request: {err}"),
+        })
+    };
+
+    let objects = keys
+        .iter()
+        .map(|key| {
+            aws_sdk_s3::types::ObjectIdentifier::builder()
+                .key(key)
+                .build()
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(build_error)?;
+    let delete = aws_sdk_s3::types::Delete::builder()
+        .set_objects(Some(objects))
+        .quiet(true)
+        .build()
+        .map_err(build_error)?;
+
+    let output = ctx
+        .client
+        .delete_objects()
+        .bucket(ctx.bucket.as_str())
+        .delete(delete)
+        .send()
+        .await
+        .map_err(|err| {
+            let status = err.raw_response().map(|r| r.status().as_u16());
+            crate::ubiblk_error!(ArchiveError {
+                description: format_s3_error("DeleteObjects", &describe(), &err, status),
+            })
+        })?;
+
+    let failed: Vec<String> = output
+        .errors()
+        .iter()
+        .map(|e| {
+            format!(
+                "'{}': {} {}",
+                e.key().unwrap_or("?"),
+                e.code().unwrap_or("?"),
+                e.message().unwrap_or("")
+            )
+        })
+        .collect();
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(crate::ubiblk_error!(ArchiveError {
+            description: format!(
+                "DeleteObjects left {} of {} keys undeleted: {}",
+                failed.len(),
+                keys.len(),
+                failed.join("; ")
+            ),
+        }))
     }
 }
 
@@ -164,9 +243,13 @@ mod tests {
     use std::time::Duration;
 
     use aws_sdk_s3::error::ErrorMetadata;
-    use aws_sdk_s3::operation::{get_object::GetObjectOutput, put_object::PutObjectOutput};
+    use aws_sdk_s3::operation::{
+        delete_objects::{DeleteObjectsError, DeleteObjectsOutput},
+        get_object::GetObjectOutput,
+        put_object::PutObjectOutput,
+    };
     use aws_smithy_mocks::{mock, mock_client, Rule};
-    use crossbeam_channel::unbounded;
+    use crossbeam_channel::{bounded, unbounded};
 
     use super::*;
 
@@ -299,5 +382,75 @@ mod tests {
 
         drop(request_tx);
         join_workers(workers);
+    }
+
+    fn worker_delete(rules: &[Rule], keys: &[&str]) -> Result<()> {
+        let (request_tx, _result_rx, workers) = spawn_test_workers(rules);
+        let (reply_tx, reply_rx) = bounded(1);
+        request_tx
+            .send(S3Request::Delete {
+                keys: keys.iter().map(|k| k.to_string()).collect(),
+                reply: reply_tx,
+            })
+            .expect("failed to send delete request");
+        let result = reply_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("missing delete reply");
+        drop(request_tx);
+        join_workers(workers);
+        result
+    }
+
+    #[test]
+    fn test_worker_delete_replies_on_its_own_channel() {
+        let rule = mock!(S3Client::delete_objects)
+            .match_requests(|req| {
+                let delete = req.delete().expect("delete body");
+                delete.quiet() == Some(true)
+                    && delete.objects().iter().map(|o| o.key()).collect::<Vec<_>>()
+                        == ["prefix/dev/0", "prefix/dev/1"]
+            })
+            .then_output(|| DeleteObjectsOutput::builder().build());
+
+        worker_delete(&[rule], &["prefix/dev/0", "prefix/dev/1"]).expect("delete succeeds");
+    }
+
+    #[test]
+    fn test_worker_delete_reports_service_error() {
+        let rule = mock!(S3Client::delete_objects).then_error(|| {
+            DeleteObjectsError::generic(
+                ErrorMetadata::builder()
+                    .code("AccessDenied")
+                    .message("Access Denied")
+                    .build(),
+            )
+        });
+
+        let err = worker_delete(&[rule], &["prefix/dev/0"])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("DeleteObjects failed"), "{err}");
+        assert!(err.contains("1 keys from 'prefix/dev/0'"), "{err}");
+        assert!(err.contains("code=AccessDenied"), "{err}");
+    }
+
+    #[test]
+    fn test_worker_delete_fails_the_batch_on_a_failed_key() {
+        let rule = mock!(S3Client::delete_objects).then_output(|| {
+            DeleteObjectsOutput::builder()
+                .errors(
+                    aws_sdk_s3::types::Error::builder()
+                        .key("prefix/dev/1")
+                        .code("InternalError")
+                        .build(),
+                )
+                .build()
+        });
+
+        let err = worker_delete(&[rule], &["prefix/dev/0", "prefix/dev/1"])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("left 1 of 2 keys undeleted"), "{err}");
+        assert!(err.contains("'prefix/dev/1': InternalError"), "{err}");
     }
 }
