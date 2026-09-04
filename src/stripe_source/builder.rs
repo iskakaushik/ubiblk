@@ -602,6 +602,7 @@ mod tests {
         let runtime = SpillRuntime {
             cfg: EvictorConfig {
                 data_path: "/tmp/device.raw".into(),
+                device_id: "fork-1".to_string(),
                 stripe_sector_count: 8,
                 target_sector_count: 32,
                 max_local_bytes: 1 << 20,

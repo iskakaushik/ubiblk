@@ -60,6 +60,9 @@ pub enum PushDisposition {
 pub struct EvictorConfig {
     /// The file whose blocks are punched.
     pub data_path: PathBuf,
+    /// Prefix of every object this device writes: the key is
+    /// `<device_id>/<stripe_index>`.
+    pub device_id: String,
     /// Sectors per stripe.
     pub stripe_sector_count: u64,
     /// Sectors on the device, so the last stripe's punch can be shortened.
@@ -187,6 +190,7 @@ mod tests {
     fn config() -> EvictorConfig {
         EvictorConfig {
             data_path: "/tmp/device.raw".into(),
+            device_id: "fork-1".to_string(),
             stripe_sector_count: 8,
             target_sector_count: 64,
             max_local_bytes: 1 << 20,

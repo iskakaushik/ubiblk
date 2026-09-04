@@ -393,6 +393,7 @@ mod tests {
         let evictor = Evictor::new(
             EvictorConfig {
                 data_path: "/tmp/device.raw".into(),
+                device_id: "fork-1".to_string(),
                 stripe_sector_count,
                 target_sector_count: target_dev.sector_count(),
                 max_local_bytes: 1 << 20,
