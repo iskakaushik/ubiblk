@@ -855,6 +855,71 @@ mod tests {
     }
 
     #[test]
+    fn masked_update_write_submit_failure_reports_not_written_and_restores_previous_byte() {
+        let (metadata_dev, _shared_state, mut flusher) = init_flusher();
+        flusher.set_stripe_fetched(5);
+        wait_for_completion(&mut flusher);
+        let original = flusher.header(5);
+
+        // The write SQE never reaches the kernel: the disk provably still
+        // holds the old byte, so the caller must hear NotWritten rather than
+        // wait forever for an outcome that would otherwise be dropped.
+        metadata_dev
+            .fail_submit
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        flusher.update_stripe_header(5, metadata_flags::EVICTED, metadata_flags::FETCHED, 3);
+        flusher.update();
+
+        assert_eq!(
+            flusher.take_persist_outcomes(),
+            vec![PersistOutcome {
+                stripe_id: 5,
+                token: 3,
+                result: PersistResult::NotWritten,
+            }]
+        );
+        // The test device applies a write at add time, so its memory is not
+        // consulted here: what a failed submit guarantees is the flusher's
+        // own byte, which the next write starts from.
+        assert_eq!(flusher.header(5), original);
+        assert!(!flusher.busy());
+    }
+
+    #[test]
+    fn masked_update_flush_submit_failure_reports_uncertain_and_keeps_new_byte() {
+        let (metadata_dev, _shared_state, mut flusher) = init_flusher();
+        flusher.set_stripe_fetched(5);
+        wait_for_completion(&mut flusher);
+        let old = flusher.header(5);
+
+        flusher.update_stripe_header(5, metadata_flags::EVICTED, metadata_flags::FETCHED, 3);
+        flusher.start_writes();
+        // The sector write has completed; the flush SQE it triggers is never
+        // submitted, so the disk may hold either byte.
+        metadata_dev
+            .fail_submit
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        flusher.poll_channel();
+
+        assert_eq!(
+            flusher.take_persist_outcomes(),
+            vec![PersistOutcome {
+                stripe_id: 5,
+                token: 3,
+                result: PersistResult::Uncertain,
+            }]
+        );
+        let new = (old | metadata_flags::EVICTED) & !metadata_flags::FETCHED;
+        assert_eq!(
+            flusher.header(5),
+            new,
+            "memory keeps the new byte for the retry"
+        );
+        assert_eq!(on_disk_header(&metadata_dev, 5), new);
+        assert!(!flusher.busy());
+    }
+
+    #[test]
     fn masked_update_is_never_deduplicated() {
         let (metadata_dev, _shared_state, mut flusher) = init_flusher();
         flusher.set_stripe_fetched(5);

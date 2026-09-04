@@ -545,13 +545,20 @@ impl SharedMetadataState {
         }
     }
 
-    /// Evicting -> Evicted after the punch. Sets IN_S3 if `in_s3`, before the
-    /// state changes so nobody sees an Evicted stripe without knowing where
-    /// its data went. FETCHED_LIVE describes how the stripe became resident,
-    /// so it is cleared with the residency.
+    /// Evicting -> Evicted after the punch. Makes IN_S3 match `in_s3`, before
+    /// the state changes so nobody sees an Evicted stripe without knowing
+    /// where its data went. A clean eviction clears the bit rather than
+    /// leaving it: a stripe evicted dirty earlier and re-materialised still
+    /// carries IN_S3 as a purge hint, and once EVICTED is set again that hint
+    /// would be read as authoritative (I5) and route the re-fetch to an
+    /// object that may not hold the current data, while the counter this
+    /// method keeps would never have counted it. FETCHED_LIVE describes how
+    /// the stripe became resident, so it is cleared with the residency.
     pub fn finish_evicting(&self, stripe_id: usize, previous: u8, in_s3: bool) {
         if in_s3 {
             self.set_stripe_flags(stripe_id, stripe_flags::IN_S3);
+        } else {
+            self.clear_stripe_flags(stripe_id, stripe_flags::IN_S3);
         }
         self.clear_stripe_flags(stripe_id, stripe_flags::FETCHED_LIVE);
         if let Err(actual) = self.stripe_fetch_states[stripe_id].compare_exchange(
@@ -1145,6 +1152,33 @@ mod tests {
         assert_eq!(state.stripe_fetch_state(3), NoSource);
         assert_eq!(state.evicted_stripes(), 3);
         assert_eq!(state.spill().degraded_reasons.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn clean_eviction_clears_a_stale_in_s3_hint() {
+        // Stripe 1 was evicted dirty in an earlier run; its header says
+        // EVICTED | IN_S3. Re-materialising it keeps IN_S3 as a purge hint.
+        let state = SharedMetadataState::new(&evicted_metadata());
+        state.set_source_live(true);
+        state.mark_stripe_resident(1);
+        assert!(state.stripe_in_s3(1), "IN_S3 stays as a purge hint");
+        assert_eq!(state.in_s3_stripes(), 1);
+
+        // A clean eviction never PUT, so the hint must go: with EVICTED set
+        // again it would be read as authoritative, and the counter never
+        // counted it.
+        let previous = state.try_begin_evicting(1).unwrap();
+        state.finish_evicting(1, previous, false);
+        assert_eq!(state.stripe_fetch_state(1), Evicted);
+        assert!(!state.stripe_in_s3(1));
+        assert_eq!(state.in_s3_stripes(), 1);
+
+        // Landing it again adjusts nothing in the in_s3 count, so it cannot
+        // wrap below zero.
+        state.mark_stripe_resident(1);
+        assert_eq!(state.stripe_fetch_state(1), Fetched);
+        assert_eq!(state.in_s3_stripes(), 1);
+        assert!(!state.stripe_in_s3(1));
     }
 
     #[test]
