@@ -1288,8 +1288,20 @@ mod tests {
         }
     }
 
-    #[test]
-    fn build_bgworker_runs_upgrade_and_punch_pass_before_returning() {
+    /// `build_bgworker` over a 2.0 metadata file whose stripes 2 and 3 carry
+    /// EVICTED, with a `RecordingPuncher` injected through the test seam on
+    /// `SpillRuntime`, plus everything the tests read back afterwards.
+    struct EvictedStartup {
+        stripe_size: u64,
+        metadata_handle: Box<dyn BlockDevice>,
+        loaded_metadata: Box<UbiMetadata>,
+        shared_state: SharedMetadataState,
+        punches: Arc<std::sync::Mutex<Vec<(u64, u64)>>>,
+        factory_calls: Arc<AtomicUsize>,
+        worker: BgWorker,
+    }
+
+    fn build_bgworker_with_evicted_stripes_2_and_3() -> EvictedStartup {
         use crate::archive::ArchiveCompressionAlgorithm;
         use crate::block_device::{
             metadata_flags,
@@ -1370,29 +1382,81 @@ mod tests {
             spill: Some(runtime),
         };
 
+        // Queued before the worker exists so `run()` returns at once; the
+        // startup work under test happens inside `build_bgworker` itself.
         sender.send(BgWorkerRequest::Shutdown).unwrap();
-        let mut worker = BackendEnv::build_bgworker(config).unwrap();
+        let worker = BackendEnv::build_bgworker(config).unwrap();
+
+        EvictedStartup {
+            stripe_size,
+            metadata_handle,
+            loaded_metadata,
+            shared_state,
+            punches,
+            factory_calls,
+            worker,
+        }
+    }
+
+    #[test]
+    fn build_bgworker_upgrades_version_sector_and_opens_puncher_before_returning() {
+        let mut startup = build_bgworker_with_evicted_stripes_2_and_3();
 
         // Version sector rewritten, header sectors untouched.
-        let upgraded = UbiMetadata::load_from_bdev(&*metadata_handle).unwrap();
+        let upgraded = UbiMetadata::load_from_bdev(&*startup.metadata_handle).unwrap();
         assert_eq!(upgraded.version_minor_u16(), 1);
-        assert_eq!(upgraded.stripe_headers, loaded_metadata.stripe_headers);
+        assert_eq!(
+            upgraded.stripe_headers,
+            startup.loaded_metadata.stripe_headers
+        );
         assert_eq!(upgraded.evicted_stripe_ids(), vec![2, 3]);
 
-        // The evictor was built with the injected puncher and ran its startup
-        // pass against it: every run it counted is a punch the recorder saw,
-        // and each one lies exactly over the run of stripes 2 and 3.
-        assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
-        let punches = punches.lock().unwrap().clone();
-        assert_eq!(
-            shared_state.spill().startup_punches.load(Ordering::Relaxed),
-            punches.len() as u64
-        );
-        for (offset, len) in &punches {
+        // The evictor was built with the injected puncher, not FilePuncher
+        // over /dev/null, which would have refused to open.
+        assert_eq!(startup.factory_calls.load(Ordering::SeqCst), 1);
+
+        // Whatever the startup pass punched lies over stripes 2 and 3 only;
+        // a hole anywhere else would free blocks the state says are local.
+        let stripe_size = startup.stripe_size;
+        for (offset, len) in startup.punches.lock().unwrap().iter() {
             assert_eq!((*offset, *len), (2 * stripe_size, 2 * stripe_size));
         }
 
-        worker.run();
+        startup.worker.run();
+    }
+
+    // The groundwork ships `Evictor::punch_all_evicted` as a stub that punches
+    // nothing (item C fills it), so this cannot pass until C lands. Once it
+    // does, drop the `#[ignore]`: the assertions are the spec's acceptance
+    // property, two EVICTED stripes coalesced into one punch over 2..3.
+    #[test]
+    #[ignore = "needs Evictor::punch_all_evicted from item C; the groundwork stub punches nothing"]
+    fn build_bgworker_runs_upgrade_and_punch_pass_before_returning() {
+        let mut startup = build_bgworker_with_evicted_stripes_2_and_3();
+
+        let upgraded = UbiMetadata::load_from_bdev(&*startup.metadata_handle).unwrap();
+        assert_eq!(upgraded.version_minor_u16(), 1);
+        assert_eq!(upgraded.evicted_stripe_ids(), vec![2, 3]);
+
+        // The startup pass ran inside build_bgworker, hence before the ack:
+        // the two consecutive EVICTED stripes became a single punch, and the
+        // counter reports runs, matching the `startup_punches` row in
+        // docs/rpc.md.
+        let stripe_size = startup.stripe_size;
+        assert_eq!(
+            startup
+                .shared_state
+                .spill()
+                .startup_punches
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            startup.punches.lock().unwrap().clone(),
+            vec![(2 * stripe_size, 2 * stripe_size)]
+        );
+
+        startup.worker.run();
     }
 
     #[test]
