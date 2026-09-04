@@ -6,7 +6,11 @@
 //! from base only while the snapshot is live and the stripe was not pushed,
 //! and everything else is refused rather than guessed at.
 
-use std::{collections::HashMap, sync::atomic::Ordering, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::atomic::Ordering,
+    sync::Arc,
+};
 
 use log::{error, warn};
 
@@ -140,6 +144,11 @@ pub struct SpillingStripeSource {
     state: SharedMetadataState,
     /// Immediate refusals.
     finished: Vec<(usize, bool)>,
+    /// Stripes refused since they were last routed to a side. On a fork the
+    /// fetcher waits for a push before it starts counting retries and asks
+    /// again on every pass until then, so one refusal comes back thousands of
+    /// times; it is counted and logged once.
+    refused: HashSet<usize>,
 }
 
 impl SpillingStripeSource {
@@ -155,6 +164,7 @@ impl SpillingStripeSource {
             spill,
             state,
             finished: Vec::new(),
+            refused: HashSet::new(),
         }
     }
 
@@ -173,26 +183,40 @@ impl SpillingStripeSource {
         self.formerly_or_still_evicted(stripe_id) && self.state.stripe_in_s3(stripe_id)
     }
 
-    fn refuse(&mut self, stripe_id: usize) {
+    /// Complete `stripe_id` with `(id, false)`. True the first time the stripe
+    /// is refused since it was last routed somewhere, so the caller counts and
+    /// logs the refusal once rather than once per fetcher retry.
+    fn refuse(&mut self, stripe_id: usize) -> bool {
         self.finished.push((stripe_id, false));
+        self.refused.insert(stripe_id)
     }
 
-    /// The immediate `(id, false)` refusals below go through the fetcher's
-    /// retry path and end in Failed: an I/O error for the guest rather than
-    /// wrong data.
+    /// The immediate `(id, false)` refusals below end in Failed through the
+    /// fetcher: an I/O error for the guest rather than wrong data. On a fork
+    /// the fetcher first waits PUSH_WAIT for a push, re-asking on every pass,
+    /// and only then runs its bounded retries; a refusal is decided by
+    /// metadata and comes back the same way each time, so `refuse` reports
+    /// whether it is new and only a new one is counted or logged.
     fn route(&mut self, stripe_id: usize, buffer: SharedBuffer, demand: bool) -> Result<()> {
         if self.spilled(stripe_id) {
             return match &mut self.spill {
-                Some(spill) => spill.request(stripe_id, buffer),
+                Some(spill) => {
+                    self.refused.remove(&stripe_id);
+                    spill.request(stripe_id, buffer)
+                }
                 None => {
-                    // A clean-only configuration never uploads, so an IN_S3
-                    // stripe here is an invariant violation, not a miss.
-                    error!("Stripe {stripe_id} is marked IN_S3 but no spill store is configured");
-                    self.state
-                        .spill()
-                        .degraded_reasons
-                        .fetch_add(1, Ordering::Relaxed);
-                    self.refuse(stripe_id);
+                    if self.refuse(stripe_id) {
+                        // A clean-only configuration never uploads, so an
+                        // IN_S3 stripe here is an invariant violation, not a
+                        // miss.
+                        error!(
+                            "Stripe {stripe_id} is marked IN_S3 but no spill store is configured"
+                        );
+                        self.state
+                            .spill()
+                            .degraded_reasons
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                     Ok(())
                 }
             };
@@ -203,22 +227,27 @@ impl SpillingStripeSource {
             // Never ask the replica for post-snapshot data: a pushed stripe
             // is refused by the server, and a dead subscription means the
             // stripe may have been copied out since.
-            self.state
-                .spill()
-                .clean_unrecoverable
-                .fetch_add(1, Ordering::Relaxed);
-            self.refuse(stripe_id);
+            if self.refuse(stripe_id) {
+                self.state
+                    .spill()
+                    .clean_unrecoverable
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             return Ok(());
         }
         if self.state.stripe_fetch_state(stripe_id) == Evicting {
-            error!("Stripe {stripe_id} requested while Evicting; refusing to pull over local data");
-            self.state
-                .spill()
-                .degraded_reasons
-                .fetch_add(1, Ordering::Relaxed);
-            self.refuse(stripe_id);
+            if self.refuse(stripe_id) {
+                error!(
+                    "Stripe {stripe_id} requested while Evicting; refusing to pull over local data"
+                );
+                self.state
+                    .spill()
+                    .degraded_reasons
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             return Ok(());
         }
+        self.refused.remove(&stripe_id);
         if demand {
             self.base.request_demand(stripe_id, buffer)
         } else {
@@ -576,6 +605,72 @@ mod tests {
         assert!(base.lock().unwrap().requests.is_empty());
         assert_eq!(state.spill().degraded_reasons.load(Ordering::Relaxed), 1);
         assert_eq!(state.spill().clean_unrecoverable.load(Ordering::Relaxed), 0);
+    }
+
+    /// On a fork the fetcher re-asks for a refused stripe on every pass for
+    /// PUSH_WAIT before its bounded retries begin. The refusal is decided by
+    /// metadata, so every pass gets the same answer; the counters and the
+    /// error log record the stripe once, not once per pass, until the stripe
+    /// is routed somewhere again.
+    #[test]
+    fn a_repeated_refusal_is_counted_once_until_the_stripe_is_routed_again() {
+        let objects = objects();
+        let state = state_with(&[
+            (1, metadata_flags::HAS_SOURCE | metadata_flags::FETCHED),
+            (2, EVICTED_CLEAN),
+            (3, EVICTED_CLEAN | metadata_flags::PUSHED),
+        ]);
+        let (mut source, base) = composite(&objects, &state);
+        let counters = state.spill();
+
+        // Dead source: stripe 2 is refused on every pass, counted once.
+        for _ in 0..5 {
+            source.request(2, shared_buffer(STRIPE_SIZE)).unwrap();
+            assert_eq!(source.poll(), vec![(2, false)]);
+        }
+        assert_eq!(counters.clean_unrecoverable.load(Ordering::Relaxed), 1);
+
+        // A different stripe is a different refusal.
+        source.request(3, shared_buffer(STRIPE_SIZE)).unwrap();
+        assert_eq!(source.poll(), vec![(3, false)]);
+        assert_eq!(counters.clean_unrecoverable.load(Ordering::Relaxed), 2);
+
+        // The source comes back for stripe 2 (the flag never does in
+        // production, but a route to base is what ends a refusal): the next
+        // refusal after that counts again.
+        state.set_source_live(true);
+        source.request(2, shared_buffer(STRIPE_SIZE)).unwrap();
+        assert_eq!(poll_until_done(&mut source), vec![(2, true)]);
+        assert_eq!(base.lock().unwrap().requests, vec![(2, false)]);
+        state.set_source_live(false);
+        source.request(2, shared_buffer(STRIPE_SIZE)).unwrap();
+        assert_eq!(source.poll(), vec![(2, false)]);
+        assert_eq!(counters.clean_unrecoverable.load(Ordering::Relaxed), 3);
+
+        // The Evicting arm counts degraded_reasons the same way.
+        assert!(state.try_begin_evicting(1).is_some());
+        for _ in 0..5 {
+            source.request(1, shared_buffer(STRIPE_SIZE)).unwrap();
+            assert_eq!(source.poll(), vec![(1, false)]);
+        }
+        assert_eq!(counters.degraded_reasons.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.clean_unrecoverable.load(Ordering::Relaxed), 3);
+    }
+
+    /// The clean-only arm counts its invariant violation once as well.
+    #[test]
+    fn a_repeated_no_store_refusal_is_counted_once() {
+        let state = state_with(&[(1, SPILLED)]);
+        let base = Arc::new(Mutex::new(RecordingBase::default()));
+        let mut source =
+            SpillingStripeSource::new(Box::new(SharedBase(base.clone())), None, state.clone());
+
+        for _ in 0..5 {
+            source.request(1, shared_buffer(STRIPE_SIZE)).unwrap();
+            assert_eq!(source.poll(), vec![(1, false)]);
+        }
+        assert_eq!(state.spill().degraded_reasons.load(Ordering::Relaxed), 1);
+        assert!(base.lock().unwrap().requests.is_empty());
     }
 
     #[test]
