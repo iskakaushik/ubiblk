@@ -66,6 +66,7 @@ impl StatusReport {
         }
     }
 
+    /// The spill counters, present only when `[spill]` is configured.
     pub fn spill(&self) -> Option<&SpillRecord> {
         self.spill.as_ref()
     }

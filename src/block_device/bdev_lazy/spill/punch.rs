@@ -19,6 +19,7 @@ pub trait HolePuncher: Send {
     fn free_bytes(&mut self) -> Result<u64>;
 }
 
+/// The real thing: punches holes in and reports free space for data_path.
 #[derive(Debug)]
 pub struct FilePuncher {
     file: File,

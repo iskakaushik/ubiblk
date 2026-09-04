@@ -393,12 +393,17 @@ impl UbiMetadata {
         })
     }
 
-    /// Stripe ids whose header has EVICTED set (the startup punch pass).
+    /// Stripe ids the startup punch pass may punch: EVICTED set and FETCHED
+    /// clear. A header with both bits is treated as resident (FETCHED wins,
+    /// see `SharedMetadataState::new`), so punching it would drop data the
+    /// state says is local.
     pub fn evicted_stripe_ids(&self) -> Vec<usize> {
         self.stripe_headers
             .iter()
             .enumerate()
-            .filter(|(_, header)| *header & metadata_flags::EVICTED != 0)
+            .filter(|(_, header)| {
+                *header & metadata_flags::EVICTED != 0 && *header & metadata_flags::FETCHED == 0
+            })
             .map(|(stripe_id, _)| stripe_id)
             .collect()
     }
@@ -628,6 +633,24 @@ mod tests {
             &[0, 0, 0, 0],
             "CRC32 should be non-zero for non-zero data"
         );
+    }
+
+    #[test]
+    fn evicted_stripe_ids_excludes_fetched_and_evicted() {
+        let mut metadata = UbiMetadata::new(9, 6, 4);
+        metadata.set_stripe_header(1, metadata_flags::EVICTED | metadata_flags::HAS_SOURCE);
+        metadata.set_stripe_header(
+            2,
+            metadata_flags::EVICTED | metadata_flags::FETCHED | metadata_flags::HAS_SOURCE,
+        );
+        metadata.set_stripe_header(3, metadata_flags::FETCHED | metadata_flags::HAS_SOURCE);
+        metadata.set_stripe_header(
+            5,
+            metadata_flags::EVICTED | metadata_flags::IN_S3 | metadata_flags::WRITTEN,
+        );
+
+        // Stripe 2 is resident by the FETCHED-wins rule and must not be punched.
+        assert_eq!(metadata.evicted_stripe_ids(), vec![1, 5]);
     }
 
     #[test]

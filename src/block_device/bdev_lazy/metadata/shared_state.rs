@@ -20,10 +20,21 @@ pub const NotWritten: u8 = 0;
 pub const Written: u8 = 1;
 
 /// Per-stripe side bits. Bits 2, 4, 5 mirror the header byte exactly so a
-/// persisted header can be OR-ed in. Bits 6 and 7 live only in memory.
+/// persisted header can be OR-ed in. Bits 3, 6 and 7 live only in memory.
 pub mod stripe_flags {
+    /// Mirrors the header's HAS_SOURCE: the snapshot holds this stripe.
     pub const HAS_SOURCE: u8 = 1 << 2;
+    /// The header still says EVICTED although the state is Failed: a fetch of
+    /// an evicted stripe failed for good. Set by `set_stripe_failed`, cleared
+    /// by `mark_stripe_resident`. While it is set, `mark_stripe_fetched`
+    /// refuses the stripe: the disk would punch it after a crash, so it may
+    /// become resident only once the header clearing EVICTED is durable (I4).
+    pub const WAS_EVICTED: u8 = 1 << 3;
+    /// Mirrors the header's IN_S3: the spill store holds an object for this
+    /// stripe. Authoritative only while the stripe is Evicted.
     pub const IN_S3: u8 = 1 << 4;
+    /// Mirrors the header's PUSHED: a snapshot push for this stripe arrived,
+    /// so the live replica will not serve it again.
     pub const PUSHED: u8 = 1 << 5;
     /// CLOCK reference bit: set by every request that passes to base on a
     /// resident stripe, cleared by the evictor's hand.
@@ -34,6 +45,7 @@ pub mod stripe_flags {
     /// bit was lost to a crash, and a stripe fetched before the subscription
     /// came up may have been copied out in the gap.
     pub const FETCHED_LIVE: u8 = 1 << 7;
+    /// The side bits a flusher completion may OR in from a header byte.
     pub const PERSISTED_MASK: u8 = HAS_SOURCE | IN_S3 | PUSHED;
 }
 
@@ -45,29 +57,48 @@ pub const GATE_HOLD: u8 = 1;
 /// on a non-resident stripe.
 pub const GATE_FAIL: u8 = 2;
 
+/// Spill activity since the process started, shared by the evictor, the spill
+/// stripe sources and the status report. Monotonic except `degraded` and
+/// `free_bytes`, which describe the present.
 #[derive(Debug, Default)]
 pub struct SpillCounters {
+    /// Evictions that dropped a stripe the live snapshot can serve again.
     pub evicted_clean: AtomicU64,
+    /// Evictions that uploaded the stripe first.
     pub evicted_dirty: AtomicU64,
+    /// Evictions abandoned before the header op because the guest touched
+    /// the stripe or a step failed.
     pub evictions_aborted: AtomicU64,
+    /// PUTs started.
     pub puts: AtomicU64,
+    /// PUTs that failed.
     pub put_failures: AtomicU64,
+    /// GETs started.
     pub gets: AtomicU64,
+    /// GETs that failed or decoded to garbage.
     pub get_failures: AtomicU64,
+    /// Object bytes uploaded.
     pub put_bytes: AtomicU64,
+    /// Object bytes downloaded.
     pub get_bytes: AtomicU64,
+    /// Successful hole punches after an eviction.
     pub punches: AtomicU64,
+    /// Failed hole punches, at eviction or at startup.
     pub punch_failures: AtomicU64,
+    /// Runs of EVICTED stripes punched by the startup pass.
     pub startup_punches: AtomicU64,
     /// Gate transitions open -> hold or open -> fail.
     pub stalls: AtomicU64,
+    /// Set while the store is refusing PUTs; dirty evictions pause.
     pub degraded: AtomicBool,
     /// Anomalies logged: FETCHED|EVICTED on disk, unknown fetch state, lost
     /// completion on drain, Uncertain header outcome, ...
     pub degraded_reasons: AtomicU64,
     /// Evicted clean stripes whose re-pull was refused (snapshot ended or PUSHED).
     pub clean_unrecoverable: AtomicU64,
+    /// Time spent compressing and encrypting objects.
     pub encode_ns: AtomicU64,
+    /// Time spent decrypting and decompressing objects.
     pub decode_ns: AtomicU64,
     /// Last statfs of the filesystem holding data_path (bytes available).
     pub free_bytes: AtomicU64,
@@ -213,30 +244,37 @@ impl SharedMetadataState {
 
     // ---- side bits
 
+    /// All `stripe_flags` bits of a stripe (Acquire).
     pub fn stripe_flags(&self, stripe_id: usize) -> u8 {
         self.stripe_flags[stripe_id].load(Ordering::Acquire)
     }
 
+    /// OR `bits` into the stripe's side bits (fetch_or AcqRel).
     pub fn set_stripe_flags(&self, stripe_id: usize, bits: u8) {
         self.stripe_flags[stripe_id].fetch_or(bits, Ordering::AcqRel);
     }
 
+    /// Clear `bits` from the stripe's side bits (fetch_and AcqRel).
     pub fn clear_stripe_flags(&self, stripe_id: usize, bits: u8) {
         self.stripe_flags[stripe_id].fetch_and(!bits, Ordering::AcqRel);
     }
 
+    /// HAS_SOURCE: the snapshot holds this stripe.
     pub fn stripe_has_source(&self, stripe_id: usize) -> bool {
         self.stripe_flags(stripe_id) & stripe_flags::HAS_SOURCE != 0
     }
 
+    /// IN_S3: the spill store holds an object for this stripe.
     pub fn stripe_in_s3(&self, stripe_id: usize) -> bool {
         self.stripe_flags(stripe_id) & stripe_flags::IN_S3 != 0
     }
 
+    /// PUSHED: a snapshot push for this stripe was received.
     pub fn stripe_pushed(&self, stripe_id: usize) -> bool {
         self.stripe_flags(stripe_id) & stripe_flags::PUSHED != 0
     }
 
+    /// FETCHED_LIVE: the stripe became resident while `source_live` was true.
     pub fn stripe_fetched_live(&self, stripe_id: usize) -> bool {
         self.stripe_flags(stripe_id) & stripe_flags::FETCHED_LIVE != 0
     }
@@ -269,6 +307,9 @@ impl SharedMetadataState {
     // ---- in-flight (channel side; SeqCst so the evictor's one look at the
     // counter after its CAS is enough)
 
+    /// Count a request that is about to pass to base on every stripe in
+    /// `first..=last`. Call before the state check, so an evictor that sees
+    /// the counter at zero after its CAS knows nothing can still land.
     pub fn pin_inflight(&self, first: usize, last: usize) {
         for stripe_id in first..=last {
             let prev = self.stripe_inflight[stripe_id].fetch_add(1, Ordering::SeqCst);
@@ -279,6 +320,7 @@ impl SharedMetadataState {
         }
     }
 
+    /// Undo `pin_inflight` once the request completed or was turned away.
     pub fn unpin_inflight(&self, first: usize, last: usize) {
         for stripe_id in first..=last {
             let prev = self.stripe_inflight[stripe_id].fetch_sub(1, Ordering::SeqCst);
@@ -286,6 +328,7 @@ impl SharedMetadataState {
         }
     }
 
+    /// Requests pinned on the stripe right now (SeqCst).
     pub fn stripe_inflight(&self, stripe_id: usize) -> u16 {
         self.stripe_inflight[stripe_id].load(Ordering::SeqCst)
     }
@@ -322,7 +365,20 @@ impl SharedMetadataState {
     /// NotFetched | Failed -> Fetched (HAS_SOURCE) or NoSource (!HAS_SOURCE).
     /// Never overwrites Evicting or Evicted: a late SetFetched completion for
     /// a stripe the evictor has since claimed must not release guest I/O.
+    ///
+    /// A Failed stripe carrying WAS_EVICTED is refused too, with an error and
+    /// a degraded reason: its header still says EVICTED, so the coordinator
+    /// has to land it the way it lands an Evicted stripe, through the header
+    /// op clearing EVICTED and `mark_stripe_resident`.
     pub fn mark_stripe_fetched(&self, stripe_id: usize) {
+        if self.stripe_flags(stripe_id) & stripe_flags::WAS_EVICTED != 0 {
+            error!(
+                "Stripe {stripe_id} marked fetched while its header still says EVICTED; \
+                 it must be re-materialised through mark_stripe_resident"
+            );
+            self.spill.degraded_reasons.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let target = self.landed_state(stripe_id);
         let mut current = self.stripe_fetch_state(stripe_id);
         loop {
@@ -351,22 +407,32 @@ impl SharedMetadataState {
     /// startup pass punches every stripe whose header says EVICTED, so the
     /// guest may not see the stripe as resident until the disk no longer says
     /// so. The IN_S3 flag is left set as a purge hint.
+    ///
+    /// Also Failed -> resident for a stripe carrying WAS_EVICTED (an evicted
+    /// stripe whose fetch failed once and then landed). `set_stripe_failed`
+    /// already took it out of the evicted counts, so only the bit is cleared.
     pub fn mark_stripe_resident(&self, stripe_id: usize) {
         let target = self.landed_state(stripe_id);
+        let was_evicted = self.stripe_flags(stripe_id) & stripe_flags::WAS_EVICTED != 0;
+        let from = if was_evicted { Failed } else { Evicted };
         if let Err(actual) = self.stripe_fetch_states[stripe_id].compare_exchange(
-            Evicted,
+            from,
             target,
             Ordering::SeqCst,
             Ordering::SeqCst,
         ) {
-            error!("Stripe {stripe_id} re-materialised while in state {actual}, not Evicted");
+            error!("Stripe {stripe_id} re-materialised while in state {actual}, not {from}");
             self.spill.degraded_reasons.fetch_add(1, Ordering::Relaxed);
             return;
         }
         self.record_landed_live(stripe_id);
-        self.evicted_stripes_count.fetch_sub(1, Ordering::AcqRel);
-        if self.stripe_in_s3(stripe_id) {
-            self.in_s3_stripes_count.fetch_sub(1, Ordering::AcqRel);
+        if was_evicted {
+            self.clear_stripe_flags(stripe_id, stripe_flags::WAS_EVICTED);
+        } else {
+            self.evicted_stripes_count.fetch_sub(1, Ordering::AcqRel);
+            if self.stripe_in_s3(stripe_id) {
+                self.in_s3_stripes_count.fetch_sub(1, Ordering::AcqRel);
+            }
         }
         if target == Fetched {
             self.fetched_stripes_count.fetch_add(1, Ordering::AcqRel);
@@ -382,9 +448,16 @@ impl SharedMetadataState {
     ///
     /// A first write into a NoSource stripe allocates its local blocks, so it
     /// becomes resident here.
+    ///
+    /// The fetch state is read before the write state is swapped. The evictor
+    /// may only claim a NoSource stripe once it is Written, so a read taken
+    /// before the swap cannot see Evicting; a read taken after it could, and
+    /// the stripe would then be evicted (resident -= 1) without ever having
+    /// been counted.
     pub fn mark_stripe_written(&self, stripe_id: usize) {
+        let was_nosource = self.stripe_fetch_state(stripe_id) == NoSource;
         let previous = self.stripe_write_states[stripe_id].swap(Written, Ordering::AcqRel);
-        if previous == NotWritten && self.stripe_fetch_state(stripe_id) == NoSource {
+        if previous == NotWritten && was_nosource {
             self.resident_stripes_count.fetch_add(1, Ordering::AcqRel);
         }
     }
@@ -405,8 +478,20 @@ impl SharedMetadataState {
         }
     }
 
+    /// A fetch failed for good: the stripe becomes Failed and guest I/O to it
+    /// gets an error until it lands. From Evicted the stripe leaves the
+    /// evicted (and in_s3) counts and keeps WAS_EVICTED, because its header
+    /// still says EVICTED and a restart would punch it: it may become resident
+    /// again only through `mark_stripe_resident` (I4).
     pub fn set_stripe_failed(&self, stripe_id: usize) {
-        self.stripe_fetch_states[stripe_id].store(Failed, Ordering::Release)
+        let previous = self.stripe_fetch_states[stripe_id].swap(Failed, Ordering::SeqCst);
+        if previous == Evicted {
+            self.set_stripe_flags(stripe_id, stripe_flags::WAS_EVICTED);
+            self.evicted_stripes_count.fetch_sub(1, Ordering::AcqRel);
+            if self.stripe_in_s3(stripe_id) {
+                self.in_s3_stripes_count.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
     }
 
     #[cfg(test)]
@@ -490,26 +575,34 @@ impl SharedMetadataState {
         self.source_stripes_count.load(Ordering::Acquire)
     }
 
+    /// Stripes occupying local blocks: Fetched, or NoSource and Written.
     pub fn resident_stripes(&self) -> u64 {
         self.resident_stripes_count.load(Ordering::Acquire)
     }
 
+    /// Stripes in state Evicted.
     pub fn evicted_stripes(&self) -> u64 {
         self.evicted_stripes_count.load(Ordering::Acquire)
     }
 
+    /// Evicted stripes whose data is in the spill store.
     pub fn in_s3_stripes(&self) -> u64 {
         self.in_s3_stripes_count.load(Ordering::Acquire)
     }
 
+    /// Whether the snapshot subscription is up, so a clean stripe could be
+    /// pulled again after being dropped.
     pub fn source_live(&self) -> bool {
         self.source_live.load(Ordering::Acquire)
     }
 
+    /// Set by the snapshot subscriber: true once subscribed, false for good
+    /// when the subscription ends.
     pub fn set_source_live(&self, live: bool) {
         self.source_live.store(live, Ordering::Release)
     }
 
+    /// GATE_OPEN, GATE_HOLD or GATE_FAIL: what a guest write meets right now.
     pub fn write_gate(&self) -> u8 {
         self.write_gate.load(Ordering::Acquire)
     }
@@ -522,6 +615,7 @@ impl SharedMetadataState {
         }
     }
 
+    /// The spill counters.
     pub fn spill(&self) -> &SpillCounters {
         &self.spill
     }
@@ -801,6 +895,111 @@ mod tests {
         assert_eq!(state.fetched_stripes(), 3);
         assert_eq!(state.resident_stripes(), 4);
         assert_eq!(state.spill().degraded_reasons.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn set_stripe_failed_from_evicted_leaves_the_evicted_counts() {
+        let state = SharedMetadataState::new(&evicted_metadata());
+        assert_eq!(state.evicted_stripes(), 3);
+        assert_eq!(state.in_s3_stripes(), 2);
+
+        // Clean-evicted: only the evicted count moves.
+        state.set_stripe_failed(0);
+        assert_eq!(state.stripe_fetch_state(0), Failed);
+        assert!(state.stripe_flags(0) & stripe_flags::WAS_EVICTED != 0);
+        assert_eq!(state.evicted_stripes(), 2);
+        assert_eq!(state.in_s3_stripes(), 2);
+
+        // Spilled: both move, and IN_S3 stays for the re-fetch to route by.
+        state.set_stripe_failed(1);
+        assert_eq!(state.evicted_stripes(), 1);
+        assert_eq!(state.in_s3_stripes(), 1);
+        assert!(state.stripe_in_s3(1));
+
+        // NotFetched -> Failed carries no bit and moves nothing.
+        state.set_stripe_fetch_state_for_test(4, NotFetched);
+        state.set_stripe_failed(4);
+        assert_eq!(state.stripe_fetch_state(4), Failed);
+        assert_eq!(state.stripe_flags(4) & stripe_flags::WAS_EVICTED, 0);
+        assert_eq!(state.evicted_stripes(), 1);
+        assert_eq!(state.resident_stripes(), 1);
+    }
+
+    #[test]
+    fn formerly_evicted_stripe_lands_only_through_mark_stripe_resident() {
+        let state = SharedMetadataState::new(&evicted_metadata());
+        state.set_stripe_failed(1);
+        assert_eq!(state.evicted_stripes(), 2);
+        assert_eq!(state.in_s3_stripes(), 1);
+
+        // The header still says EVICTED, so the plain landing is refused.
+        state.mark_stripe_fetched(1);
+        assert_eq!(state.stripe_fetch_state(1), Failed);
+        assert_eq!(state.fetched_stripes(), 1);
+        assert_eq!(state.resident_stripes(), 1);
+        assert_eq!(state.spill().degraded_reasons.load(Ordering::Relaxed), 1);
+
+        // Once the header clearing EVICTED is durable it lands as a Fetched
+        // stripe; the evicted counts were adjusted when it failed.
+        state.set_source_live(true);
+        state.mark_stripe_resident(1);
+        assert_eq!(state.stripe_fetch_state(1), Fetched);
+        assert_eq!(state.stripe_flags(1) & stripe_flags::WAS_EVICTED, 0);
+        assert!(state.stripe_fetched_live(1));
+        assert!(state.stripe_in_s3(1), "IN_S3 stays as a purge hint");
+        assert_eq!(state.evicted_stripes(), 2);
+        assert_eq!(state.in_s3_stripes(), 1);
+        assert_eq!(state.fetched_stripes(), 2);
+        assert_eq!(state.resident_stripes(), 2);
+        assert_eq!(state.spill().degraded_reasons.load(Ordering::Relaxed), 1);
+
+        // With the bit gone, a later failure and landing take the plain path.
+        state.set_stripe_fetch_state_for_test(1, Failed);
+        state.mark_stripe_fetched(1);
+        assert_eq!(state.stripe_fetch_state(1), Fetched);
+
+        // A plain Failed stripe (no bit) is not Evicted material for
+        // mark_stripe_resident.
+        state.set_stripe_failed(4);
+        state.mark_stripe_resident(4);
+        assert_eq!(state.stripe_fetch_state(4), Failed);
+        assert_eq!(state.spill().degraded_reasons.load(Ordering::Relaxed), 2);
+    }
+
+    /// A channel writes a NoSource stripe while the evictor is hunting for a
+    /// Written NoSource stripe to claim. Whatever the interleaving, the
+    /// stripe is counted resident exactly once before it is evicted, so the
+    /// eviction's decrement never underflows.
+    #[test]
+    fn mark_stripe_written_counts_before_a_concurrent_eviction() {
+        for _ in 0..200 {
+            let metadata = UbiMetadata::new(0, 1, 0);
+            let state = SharedMetadataState::new(&metadata);
+            assert_eq!(state.stripe_fetch_state(0), NoSource);
+            assert_eq!(state.resident_stripes(), 0);
+
+            let channel = {
+                let state = state.clone();
+                std::thread::spawn(move || state.mark_stripe_written(0))
+            };
+            let evictor = {
+                let state = state.clone();
+                std::thread::spawn(move || loop {
+                    if let Some(previous) = state.try_begin_evicting(0) {
+                        return previous;
+                    }
+                    std::hint::spin_loop();
+                })
+            };
+            channel.join().unwrap();
+            let previous = evictor.join().unwrap();
+
+            assert_eq!(previous, NoSource);
+            assert_eq!(state.resident_stripes(), 1);
+            state.finish_evicting(0, previous, true);
+            assert_eq!(state.resident_stripes(), 0);
+            assert_eq!(state.evicted_stripes(), 1);
+        }
     }
 
     #[test]

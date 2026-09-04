@@ -54,20 +54,34 @@ pub enum PushDisposition {
     Deferred,
 }
 
+/// The evictor's limits, derived by the backend from `[spill]` and the device
+/// geometry. Byte fields are in bytes; see `SpillSection` for their meaning.
 #[derive(Debug, Clone)]
 pub struct EvictorConfig {
+    /// The file whose blocks are punched.
     pub data_path: PathBuf,
+    /// Sectors per stripe.
     pub stripe_sector_count: u64,
+    /// Sectors on the device, so the last stripe's punch can be shortened.
     pub target_sector_count: u64,
+    /// Ceiling on resident bytes.
     pub max_local_bytes: u64,
+    /// Evict down to `max_local_bytes - low_water_bytes` once over the ceiling.
     pub low_water_bytes: u64,
+    /// Gate guest writes above `max_local_bytes + hard_margin_bytes`.
     pub hard_margin_bytes: u64,
+    /// statfs watermark on the filesystem; writes are gated below half of it.
     pub min_free_bytes: u64,
+    /// Drop clean stripes the live snapshot can serve again instead of
+    /// uploading them.
     pub clean_eviction: bool,
+    /// What a guest write meets when space runs out.
     pub on_full: OnFull,
+    /// Evictions, and so PUTs, in flight at once.
     pub max_concurrent_evictions: usize,
     /// Stripes the CLOCK hand examines per update tick (default 4096).
     pub sweep_batch: usize,
+    /// Buffer alignment for the reads that feed an upload.
     pub alignment: usize,
 }
 
@@ -127,6 +141,8 @@ impl Evictor {
         let _ = (flusher, outcomes);
     }
 
+    /// A guest `Fetch { S }` reached the coordinator: abort or defer an
+    /// eviction of S, hold or refuse it under a closed gate, else forward.
     pub fn on_fetch_request(&mut self, stripe_id: usize) -> FetchDisposition {
         let _ = stripe_id;
         FetchDisposition::Forward

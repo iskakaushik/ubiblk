@@ -23,7 +23,9 @@ use super::*;
 /// the runtime the backend built from `[spill]`, and the state it routes by.
 #[derive(Clone)]
 pub struct SpillSourceParts {
+    /// Store factory, codec and device id, as built from `[spill]`.
     pub runtime: SpillRuntime,
+    /// The per-stripe state the composite source routes by.
     pub state: SharedMetadataState,
 }
 
@@ -618,6 +620,7 @@ mod tests {
                 Ok(Box::new(TestObjectStore::new()) as Box<dyn ArchiveStore>)
             })),
             codec: SpillCodec::new(ArchiveCompressionAlgorithm::None, None, 8),
+            puncher_factory: None,
         };
         let parts = SpillSourceParts {
             runtime,

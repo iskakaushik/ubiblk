@@ -29,6 +29,8 @@ pub enum OnFull {
     Fail,
 }
 
+/// The `[spill]` section: when the local device is treated as a cache with a
+/// ceiling, and where its overflow goes.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct SpillSection {
@@ -44,6 +46,8 @@ pub struct SpillSection {
     /// gated below half of it.
     #[serde(default = "default_min_free_bytes")]
     pub min_free_bytes: u64,
+    /// What a guest write meets once the disk is full and the evictor has
+    /// not caught up.
     #[serde(default)]
     pub on_full: OnFull,
     /// Drop clean stripes that the live snapshot can serve again instead of
@@ -54,6 +58,7 @@ pub struct SpillSection {
     /// Also bounds PUTs in flight.
     #[serde(default = "default_max_concurrent_evictions")]
     pub max_concurrent_evictions: usize,
+    /// Compression applied to spilled objects before encryption.
     #[serde(default = "default_spill_compression")]
     pub compression: ArchiveCompressionAlgorithm,
     /// 32-byte key-encryption key; enables AES-XTS on spilled objects.

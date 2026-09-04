@@ -14,15 +14,21 @@ use crate::{
     Result,
 };
 
+/// The first eight bytes of every spill object.
 pub const SPILL_MAGIC: &[u8; 8] = b"UBISPILL";
+/// The only object format version this codec reads or writes.
 pub const SPILL_OBJECT_VERSION: u16 = 1;
+/// Bytes of header before the payload.
 pub const SPILL_HEADER_LEN: usize = 36;
 
 /// Object header flags: how the payload was transformed, in the order
 /// compress then encrypt.
 pub mod spill_flags {
+    /// The payload is zstd-compressed.
     pub const ZSTD: u16 = 1 << 0;
+    /// The payload is AES-XTS encrypted with the device's spill key.
     pub const XTS: u16 = 1 << 1;
+    /// Every flag this version understands; others fail decoding.
     pub const KNOWN: u16 = ZSTD | XTS;
 }
 
@@ -54,6 +60,8 @@ fn archive_error(description: String) -> crate::UbiblkError {
 }
 
 impl SpillObjectHeader {
+    /// The header's wire form. Magic, version and reserved come from the
+    /// constants; the caller has already computed `crc32`.
     pub fn encode(&self) -> [u8; SPILL_HEADER_LEN] {
         let mut bytes = [0u8; SPILL_HEADER_LEN];
         bytes[0..8].copy_from_slice(SPILL_MAGIC);
@@ -116,10 +124,12 @@ fn object_crc32(header_bytes: &[u8], payload: &[u8]) -> u32 {
     hasher.finalize()
 }
 
+/// Object name of a stripe, before the store adds its prefix.
 pub fn spill_object_name(device_id: &str, stripe_index: usize) -> String {
     format!("{device_id}/{stripe_index}")
 }
 
+/// Object name of the device's wrapped spill key.
 pub fn spill_key_object_name(device_id: &str) -> String {
     format!("{device_id}/spill-key")
 }
@@ -140,6 +150,8 @@ pub struct SpillCodec {
 }
 
 impl SpillCodec {
+    /// `cipher` None means objects are stored in the clear;
+    /// `stripe_sector_count` fixes the XTS tweak of each stripe.
     pub fn new(
         compression: ArchiveCompressionAlgorithm,
         cipher: Option<XtsBlockCipher>,
@@ -341,6 +353,7 @@ pub fn wrap_spill_key(kek: &KeyEncryptionCipher, cipher: &XtsBlockCipher) -> Res
     cipher.encrypted_key(kek)
 }
 
+/// Inverse of `wrap_spill_key`: the cipher from the key object's bytes.
 pub fn unwrap_spill_key(kek: &KeyEncryptionCipher, wrapped: &[u8]) -> Result<XtsBlockCipher> {
     XtsBlockCipher::from_encrypted_key(wrapped.to_vec(), kek)
 }

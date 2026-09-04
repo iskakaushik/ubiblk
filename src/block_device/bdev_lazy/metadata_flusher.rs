@@ -45,6 +45,8 @@ struct HeaderUpdateStatus {
     sector: u64,
 }
 
+/// How far a tokened header update got. The distinction matters because a
+/// caller may only act on "the disk now says X" once it holds `Durable`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PersistResult {
     /// Sector write and fsync both completed. The byte is on disk.
@@ -59,10 +61,15 @@ pub enum PersistResult {
     Uncertain,
 }
 
+/// The completion of one tokened header update, handed back to whoever
+/// issued it (odd tokens: the evictor; even tokens: the coordinator).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PersistOutcome {
+    /// The stripe whose header was updated.
     pub stripe_id: usize,
+    /// The token the caller passed to `update_stripe_header`.
     pub token: u64,
+    /// What happened to the update.
     pub result: PersistResult,
 }
 

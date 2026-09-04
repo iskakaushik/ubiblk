@@ -35,6 +35,8 @@ pub struct SpillStripeSource {
 }
 
 impl SpillStripeSource {
+    /// `store` is this source's own GET store; `connections` bounds the GETs
+    /// it keeps in flight. Counters come from `state`.
     pub fn new(
         store: Box<dyn ArchiveStore>,
         codec: SpillCodec,
@@ -100,6 +102,8 @@ pub struct SpillingStripeSource {
 }
 
 impl SpillingStripeSource {
+    /// Wrap `base` (the snapshot or an empty source) with the spill store.
+    /// `spill` None is the clean-only configuration.
     pub fn new(
         base: Box<dyn StripeSource>,
         spill: Option<SpillStripeSource>,

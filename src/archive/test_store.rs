@@ -34,10 +34,12 @@ impl Default for TestObjectStore {
 }
 
 impl TestObjectStore {
+    /// A store with its own empty object map.
     pub fn new() -> Self {
         Self::shared(Arc::new(Mutex::new(HashMap::new())))
     }
 
+    /// A store over `objects`, so two stores in one test see the same data.
     pub fn shared(objects: Arc<Mutex<HashMap<String, Vec<u8>>>>) -> Self {
         TestObjectStore {
             objects,
