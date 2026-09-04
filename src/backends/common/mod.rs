@@ -540,7 +540,7 @@ impl BackendEnv {
 
         let metadata = UbiMetadata::load_from_bdev(metadata_dev)?;
         let punched = evictor.punch_all_evicted(&metadata)?;
-        info!("spill: startup punch pass covered {punched} run(s) of evicted stripes");
+        info!("spill: startup punch pass covered {punched} evicted stripe(s)");
         Ok(evictor)
     }
 
