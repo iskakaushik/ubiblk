@@ -1234,6 +1234,40 @@ fn fetch_for_stripe_in_pending_release_is_dropped() {
     assert_eq!(rig.source_reads(), 1);
 }
 
+/// The coordinator's side of the FAIL-gate rule: a Fetch refused under
+/// GATE_FAIL reaches the ingest once the gate opens, so a read the channel
+/// queued under the closed gate and polled after the reopen is still served.
+#[test]
+fn refused_fetch_is_routed_once_the_gate_reopens() {
+    let headers: Vec<(usize, u8)> = (0..STRIPES - 1).map(|s| (s, DIRTY)).collect();
+    let mut rig = CoordRig::build(&headers, |cfg| {
+        cfg.max_local_bytes = stripes_bytes(4);
+        cfg.hard_margin_bytes = STRIPE_BYTES;
+        cfg.on_full = OnFull::Fail;
+    });
+    rig.store.lock().unwrap().hold_puts = true;
+    let unfetched = STRIPES - 1;
+    rig.worker.update();
+    assert_eq!(rig.state.write_gate(), GATE_FAIL);
+
+    rig.fetch(unfetched);
+    rig.run_until(3, |_| false);
+    assert_eq!(
+        rig.source_reads(),
+        0,
+        "refused: nothing pulled while closed"
+    );
+
+    rig.store.lock().unwrap().hold_puts = false;
+    rig.store.lock().unwrap().release_puts();
+    assert!(rig.run_until(60, |r| r.state.write_gate() == GATE_OPEN));
+    assert!(rig.run_until(30, |r| r.source_reads() == 1), "replayed");
+    assert!(rig.run_until(30, |r| r.target_stripe(unfetched)
+        == vec![0x80 | pattern(unfetched); STRIPE_BYTES as usize]));
+    rig.run_until(5, |_| false);
+    assert_eq!(rig.source_reads(), 1, "pulled once");
+}
+
 #[test]
 fn in_s3_count_drops_when_a_spilled_stripe_is_rematerialised() {
     let spilled = metadata_flags::EVICTED | metadata_flags::IN_S3 | metadata_flags::HAS_SOURCE;
@@ -1594,8 +1628,13 @@ fn hard_pressure_closes_gate_and_reopens_releasing_held_fetches() {
     assert!(rig.run_until(40, |r| r.state.resident_stripes() == 3));
 }
 
+/// Under GATE_FAIL the channel fails the request itself, but only if it polls
+/// while the gate is still closed. Should the gate reopen first, the Pending
+/// front waits for a fetch the channel never re-sends (NotFetched stripes
+/// are not re-sent for), so the refused fetch is kept and replayed like a
+/// held one.
 #[test]
-fn fail_gate_refuses_fetches_for_non_resident_stripes() {
+fn fail_gate_refuses_the_fetch_and_replays_it_when_the_gate_reopens() {
     let headers: Vec<(usize, u8)> = (0..STRIPES - 1).map(|s| (s, DIRTY)).collect();
     let mut rig = Rig::build(&headers, true, |cfg| {
         cfg.max_local_bytes = stripes_bytes(4);
@@ -1603,12 +1642,36 @@ fn fail_gate_refuses_fetches_for_non_resident_stripes() {
         cfg.on_full = OnFull::Fail;
     });
     rig.store.lock().unwrap().hold_puts = true;
+    let unfetched = STRIPES - 1;
     rig.tick();
     assert_eq!(rig.state.write_gate(), GATE_FAIL);
     assert_eq!(
-        rig.evictor.on_fetch_request(STRIPES - 1),
+        rig.evictor.on_fetch_request(unfetched),
         FetchDisposition::Refused
     );
+    assert_eq!(
+        rig.evictor.on_fetch_request(unfetched),
+        FetchDisposition::Refused,
+        "the channel re-sends"
+    );
+    assert_eq!(rig.evictor.held_for_space_for_test(), &[unfetched]);
+    assert_eq!(
+        rig.evictor.on_fetch_request(6),
+        FetchDisposition::Forward,
+        "resident stripes pass"
+    );
+    rig.ticks(3);
+    assert!(
+        rig.evictor.take_released().0.is_empty(),
+        "nothing replayed while closed"
+    );
+
+    rig.store.lock().unwrap().hold_puts = false;
+    rig.store.lock().unwrap().release_puts();
+    assert!(rig.run_until(40, |r| r.state.write_gate() == GATE_OPEN));
+    let (fetches, pushes) = rig.evictor.take_released();
+    assert_eq!(fetches, vec![unfetched]);
+    assert!(pushes.is_empty());
     assert!(rig.evictor.held_for_space_for_test().is_empty());
 }
 
@@ -1838,6 +1901,73 @@ fn read_failure_aborts_the_eviction() {
     // The buffer came back: the retry after the skip reads and uploads.
     rig.evictor.advance_time_for_test(Duration::from_secs(2));
     assert!(rig.run_until(15, |r| r.fetch_state(0) == Evicted));
+}
+
+/// A read whose submit failed may still complete: io_uring keeps the SQE and
+/// enters it with the next submit. Returning the buffer and forgetting the
+/// record there would let the late completion be taken for a later eviction's
+/// read of the same stripe, and bytes read before the guest wrote again be
+/// uploaded as the fork's data. The record and its buffer wait for it, and
+/// the stripe is not claimed again until it has drained.
+#[test]
+fn failed_read_submit_keeps_the_record_until_the_completion_lands() {
+    let mut rig = Rig::dirty(1, 0);
+    rig.state.pin_inflight(0, 0);
+    assert!(rig.run_until(5, |r| r.stage(0) == Some(Stage::Draining)));
+    let degraded_before = rig.counter(|c| &c.degraded_reasons);
+    rig.target_dev
+        .keep_requests_on_failed_submit
+        .store(true, Ordering::SeqCst);
+    rig.target_dev.fail_submit.store(true, Ordering::SeqCst);
+    rig.target_dev
+        .hold_completions
+        .store(true, Ordering::SeqCst);
+    rig.state.unpin_inflight(0, 0);
+
+    rig.tick();
+    assert_eq!(rig.target_dev.metrics.read().unwrap().reads, 1);
+    assert_eq!(rig.stage(0), None, "aborted");
+    assert_eq!(rig.fetch_state(0), Fetched);
+    assert_eq!(
+        rig.evictor.records_for_test(),
+        1,
+        "the record waits for the read"
+    );
+    assert_eq!(rig.counter(|c| &c.evictions_aborted), 1);
+    assert_eq!(rig.counter(|c| &c.degraded_reasons), degraded_before + 1);
+    assert!(rig.put_order().is_empty());
+
+    // The guest writes, and the hand comes round again; the stripe is not
+    // re-claimed while its old read is owed.
+    let written = vec![0x5A; STRIPE_BYTES as usize];
+    rig.target_dev.write(0, &written, written.len());
+    rig.evictor.advance_time_for_test(Duration::from_secs(2));
+    rig.ticks(3);
+    assert_eq!(rig.evictor.records_for_test(), 1);
+    assert_eq!(rig.stage(0), None);
+    assert_eq!(rig.fetch_state(0), Fetched);
+    assert_eq!(
+        rig.target_dev.metrics.read().unwrap().reads,
+        1,
+        "no second read"
+    );
+    assert!(rig.put_order().is_empty());
+
+    // The late completion drains the record and uploads nothing; only then
+    // is the stripe claimed again, and read afresh.
+    rig.target_dev
+        .hold_completions
+        .store(false, Ordering::SeqCst);
+    rig.tick();
+    assert_eq!(rig.target_dev.metrics.read().unwrap().reads, 1);
+    assert!(rig.put_order().is_empty(), "the stale read is not uploaded");
+    assert!(rig.punches().is_empty());
+    assert_eq!(rig.stage(0), Some(Stage::Draining), "claimed afresh");
+
+    assert!(rig.run_until(15, |r| r.fetch_state(0) == Evicted));
+    assert_eq!(rig.target_dev.metrics.read().unwrap().reads, 2);
+    assert_eq!(rig.put_order(), vec![object_name(0)]);
+    assert_eq!(rig.decode_object(0), written);
 }
 
 #[test]

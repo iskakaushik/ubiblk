@@ -101,6 +101,13 @@ A crash before that fsync leaves a stripe that says `EVICTED` on disk with
 its data present; the startup pass punches it and the next access fetches
 it again, and no acknowledged write can have landed in the gap.
 
+With `[spill]` configured, a stripe fetched or pushed for the first time
+waits for its `FETCHED` header the same way. Without that, a guest write to a
+stripe that is resident in memory while its header is still queued would be
+acknowledged, and a crash before the header reached the disk would restart
+the stripe as missing and fetch the base image over the write. The cost is one
+header write and fsync per landed stripe before the guest sees it.
+
 ### Crash points
 
 | Crash between | On restart |

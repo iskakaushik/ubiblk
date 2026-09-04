@@ -1,6 +1,6 @@
 use super::{
     ingest_pool::{IngestPool, IngestPoolConfig, IngestRequest},
-    metadata::shared_state::{stripe_flags, Evicted, SharedMetadataState},
+    metadata::shared_state::{stripe_flags, Evicted, Evicting, SharedMetadataState},
     metadata_flusher::{MetadataFlusher, PersistOutcome, PersistResult},
     push_gate::PushPermit,
     spill::{Evictor, FetchDisposition, PushDisposition},
@@ -68,17 +68,18 @@ enum Ingest {
 }
 
 /// A stripe whose data has landed and whose header op is in the flusher: a
-/// re-materialised stripe's EVICTED-clearing header, or a written stripe's
-/// FETCHED header. The guest may not see either as resident before that header
-/// is durable: the startup pass punches every stripe whose header says
-/// EVICTED, and a stripe whose header does not say FETCHED is fetched from
-/// base again on restart, over the write the guest was told had landed.
+/// re-materialised stripe's EVICTED-clearing header, or, with spill, any
+/// landed stripe's FETCHED header. The guest may not see either as resident
+/// before that header is durable: the startup pass punches every stripe whose
+/// header says EVICTED, and a stripe whose header does not say FETCHED is
+/// fetched from base again on restart, over any write the guest was told had
+/// landed meanwhile.
 struct PendingRelease {
     stripe_id: usize,
     retries: u8,
     /// Evicted, or Failed with the header still saying EVICTED: lands through
-    /// `mark_stripe_resident`. Otherwise a written NotFetched stripe, which
-    /// the header completion itself lands.
+    /// `mark_stripe_resident`. Otherwise a NotFetched stripe landing under
+    /// spill, which the header completion itself lands.
     from_evicted: bool,
 }
 
@@ -217,6 +218,19 @@ impl BgWorker {
                         | FetchDisposition::HeldForSpace
                         | FetchDisposition::Refused => return,
                     }
+                    if self.metadata_state.stripe_fetched_if_needed(stripe_id) {
+                        // Resident already (the channel asked before this
+                        // thread landed it): the fetcher would find nothing
+                        // to do. Forwarding is not harmless with a pool. The
+                        // request sits on the worker's queue while this
+                        // thread may evict the stripe; the worker then reads
+                        // its Fetched entry under an Evicted stripe as stale
+                        // and pulls, a landing noted nowhere here, whose
+                        // write can follow the guest's once a real re-fetch
+                        // has released the stripe.
+                        debug!("Fetch for resident stripe {stripe_id} dropped");
+                        return;
+                    }
                 }
                 self.route_fetch(stripe_id);
             }
@@ -255,6 +269,17 @@ impl BgWorker {
                         _ => return,
                     },
                 };
+                if self.evictor.is_some() && self.metadata_state.stripe_fetched_if_needed(stripe_id)
+                {
+                    // The fetcher drops a push for a local stripe itself, so
+                    // this only matters with a pool: forwarded, the push sits
+                    // on the worker's queue while this thread may claim the
+                    // stripe, and the worker would write the pre-image under
+                    // the evictor's read, to be uploaded as the fork's data.
+                    // The permit goes with it.
+                    debug!("Push for resident stripe {stripe_id} dropped");
+                    return;
+                }
                 self.route_push(stripe_id, data, permit);
             }
             BgWorkerRequest::SetWritten { stripe_id } => {
@@ -328,34 +353,51 @@ impl BgWorker {
         }
     }
 
-    /// The ingest finished with a stripe. A stripe that was not evicted lands
-    /// at once; an evicted one (or a Failed one whose header still says
-    /// EVICTED) is released only when the header clearing EVICTED is durable,
-    /// because the startup pass punches every stripe whose header says so.
+    /// The ingest finished with a stripe. Without spill it lands at once and
+    /// the FETCHED header follows whenever the flusher gets to it: a header
+    /// that says a stripe is missing only costs fetching it again.
     ///
-    /// With spill, a never-evicted stripe with a guest write queued on it
-    /// (WRITTEN is set in memory at queue time under track_written) waits for
-    /// its FETCHED header too. Released at once, the write would pass to base
-    /// and be acknowledged while the header sits in the flusher's queue; a
-    /// crash before it reaches the disk restarts the stripe as NotFetched and
-    /// fetches the base image over the acknowledged write. A stripe with only
-    /// reads waiting loses nothing to that order, so it keeps landing at once.
-    ///
-    /// What this does not cover: a write that arrives after a read landed the
-    /// stripe and before that landing's fire-and-forget SetFetched is flushed
-    /// passes on the in-memory state and is acknowledged under a header that
-    /// may not be durable yet. Closing that window needs the channel to hold
-    /// writes on a per-stripe "FETCHED durable" bit the flusher clears.
+    /// With spill every landing waits for its header, through the tokened
+    /// release op. An evicted stripe (or a Failed one whose header still says
+    /// EVICTED) may not be seen as resident before the header clearing
+    /// EVICTED is on disk, because the startup pass punches every stripe
+    /// whose header says so (I4). A never-evicted stripe waits for FETCHED
+    /// because a header that says missing no longer only costs a re-fetch:
+    /// a guest write to a stripe that is resident in memory passes to base
+    /// and is acknowledged, and a crash before FETCHED reaches the disk
+    /// restarts the stripe NotFetched (WRITTEN alone does not make it
+    /// resident) and fetches the base image over the acknowledged write.
+    /// Holding only writes would need the channel to know whether the header
+    /// is durable yet; holding the landing costs each fetched stripe one
+    /// header write and fsync before the guest sees it, and covers a write
+    /// that arrives the moment after the landing as well as one queued
+    /// before it.
     fn stripe_landed(&mut self, stripe_id: usize, success: bool) {
         self.landing.remove(&stripe_id);
         if !success {
             error!("Stripe {stripe_id} fetch failed");
             return;
         }
+        if self.metadata_state.stripe_fetch_state(stripe_id) == Evicting {
+            // The evictor owns the stripe and its header until it finishes or
+            // aborts. A landing now is a pull or push that reached the ingest
+            // before this thread claimed the stripe (a request already on a
+            // pool worker's queue is past the coordinator's interception);
+            // its data is under the evictor's read, and a SetFetched queued
+            // here would serialise behind the EVICTED header op and write
+            // FETCHED over it: a disk saying local for punched blocks.
+            error!(
+                "Stripe {stripe_id} landed while being evicted; leaving its header to the evictor"
+            );
+            self.metadata_state
+                .spill()
+                .degraded_reasons
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
         let from_evicted = self.metadata_state.stripe_fetch_state(stripe_id) == Evicted
             || self.metadata_state.stripe_flags(stripe_id) & stripe_flags::WAS_EVICTED != 0;
-        let durable_first = from_evicted
-            || (self.evictor.is_some() && self.metadata_state.stripe_written(stripe_id));
+        let durable_first = from_evicted || self.evictor.is_some();
         if !durable_first {
             // Unblocks anything waiting on this stripe now, rather than once
             // the flusher has worked through the sweep's backlog.
@@ -447,12 +489,12 @@ impl BgWorker {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             result => {
-                // Left NotFetched, the write queued on it would wait for good:
+                // Left NotFetched, anything queued on it would wait for good:
                 // the channel re-sends a Fetch only for an Evicting or Evicted
-                // front. Release it as an unwritten stripe is released, and
-                // count the exposure to a restart re-fetching over the write.
+                // front. Release it the way a stripe lands without spill, and
+                // count the exposure to a restart re-fetching over a write.
                 error!(
-                    "FETCHED header for written stripe {stripe_id} ended {result:?} after \
+                    "FETCHED header for stripe {stripe_id} ended {result:?} after \
                      {MAX_RELEASE_RETRIES} retries; releasing it with the header not known durable"
                 );
                 self.metadata_state
@@ -709,6 +751,15 @@ mod tests {
 
     /// Inline ingest over a `TestBlockDevice` source.
     fn build_bg_worker_with_evictor(headers: &[(usize, u8)], max_local_bytes: u64) -> EvictorRig {
+        build_bg_worker_with_evictor_opts(headers, max_local_bytes, false)
+    }
+
+    /// As above, with the fetcher's sweep on or off.
+    fn build_bg_worker_with_evictor_opts(
+        headers: &[(usize, u8)],
+        max_local_bytes: u64,
+        autofetch: bool,
+    ) -> EvictorRig {
         let (target_dev, metadata_dev, state) = rig_devices(headers);
         let source_dev = TestBlockDevice::new(RIG_STRIPES as u64 * RIG_STRIPE_BYTES);
         let stripe_source = Box::new(
@@ -725,7 +776,7 @@ mod tests {
             &target_dev,
             &metadata_dev,
             4096,
-            false,
+            autofetch,
             false,
             state.clone(),
             receiver,
@@ -935,6 +986,129 @@ mod tests {
         rig.worker.run();
     }
 
+    /// A Fetch for a stripe that is resident by the time this thread sees it
+    /// (the channel asked before the landing) is dropped rather than
+    /// forwarded when spill is on. Forwarded to a pool worker it sits on that
+    /// worker's queue while this thread may evict the stripe; the worker then
+    /// finds a Fetched entry under an Evicted stripe, drops it as stale and
+    /// pulls, a landing noted nowhere here, whose write can follow the
+    /// guest's once a real re-fetch has released the stripe. Observed through
+    /// the readahead a forwarded Fetch queues on a sweeping fetcher: the sweep
+    /// is confined to stripes 4..8, so anything pulled below 4 came from the
+    /// Fetch.
+    #[test]
+    fn fetch_for_a_resident_stripe_is_dropped_at_the_coordinator() {
+        let resident = crate::block_device::metadata_flags::FETCHED
+            | crate::block_device::metadata_flags::HAS_SOURCE;
+        let mut rig = build_bg_worker_with_evictor_opts(&[(0, resident)], 1 << 30, true);
+        let Ingest::Inline(fetcher) = &mut rig.worker.ingest else {
+            panic!("inline ingest expected");
+        };
+        fetcher.restrict_autofetch_to(4, RIG_STRIPES);
+        rig.worker
+            .process_request(BgWorkerRequest::Fetch { stripe_id: 0 });
+        for _ in 0..40 {
+            rig.worker.update();
+        }
+        assert_eq!(
+            rig.source_dev.metrics.read().unwrap().reads,
+            RIG_STRIPES - 4,
+            "only the sweep's stripes were pulled"
+        );
+
+        // Without spill the Fetch is forwarded as before: the fetcher finds
+        // the stripe local and reads ahead of it.
+        let (target_dev, metadata_dev, state) = rig_devices(&[(0, resident)]);
+        let source_dev = TestBlockDevice::new(RIG_STRIPES as u64 * RIG_STRIPE_BYTES);
+        let stripe_source = Box::new(
+            stripe_source::BlockDeviceStripeSource::new(
+                BlockDevice::clone(&source_dev),
+                RIG_STRIPE_SECTORS,
+            )
+            .unwrap(),
+        );
+        let (_sender, receiver) = channel();
+        let mut plain = BgWorker::new(
+            stripe_source,
+            &target_dev,
+            &metadata_dev,
+            4096,
+            true,
+            false,
+            state,
+            receiver,
+            None,
+        )
+        .unwrap();
+        let Ingest::Inline(fetcher) = &mut plain.ingest else {
+            panic!("inline ingest expected");
+        };
+        fetcher.restrict_autofetch_to(4, RIG_STRIPES);
+        plain.process_request(BgWorkerRequest::Fetch { stripe_id: 0 });
+        for _ in 0..40 {
+            plain.update();
+        }
+        assert_eq!(
+            source_dev.metrics.read().unwrap().reads,
+            RIG_STRIPES - 1,
+            "the readahead pulled stripes 1..4 as well"
+        );
+    }
+
+    /// A landing reported for a stripe the evictor has claimed (a pull or
+    /// push that reached a pool worker before the claim) must not queue a
+    /// header op: a SetFetched behind the evictor's EVICTED op would leave the
+    /// disk saying local for blocks about to be punched, and the next start
+    /// would serve zeros for the stripe.
+    #[test]
+    fn landing_for_an_evicting_stripe_touches_no_header() {
+        use crate::block_device::metadata_flags;
+
+        let mut rig = build_bg_worker_with_evictor(&[(0, RIG_DIRTY)], 1 << 30);
+        let degraded_before = rig
+            .state
+            .spill()
+            .degraded_reasons
+            .load(std::sync::atomic::Ordering::Relaxed);
+        rig.state.set_stripe_fetch_state_for_test(0, Evicting);
+        // The evictor's committed header op: EVICTED in, FETCHED out.
+        rig.worker.metadata_flusher.update_stripe_header(
+            0,
+            metadata_flags::EVICTED,
+            metadata_flags::FETCHED,
+            1,
+        );
+
+        rig.worker.process_request(BgWorkerRequest::FetchCompleted {
+            stripe_id: 0,
+            success: true,
+        });
+        assert!(rig.worker.pending_release.is_empty());
+        assert_eq!(rig.state.stripe_fetch_state(0), Evicting);
+        assert_eq!(
+            rig.state
+                .spill()
+                .degraded_reasons
+                .load(std::sync::atomic::Ordering::Relaxed),
+            degraded_before + 1
+        );
+
+        for _ in 0..6 {
+            rig.worker.update();
+        }
+        assert!(!rig.worker.metadata_flusher.busy());
+        let header = UbiMetadata::load_from_bdev(&rig.metadata_dev)
+            .unwrap()
+            .stripe_header(0);
+        assert_ne!(header & metadata_flags::EVICTED, 0);
+        assert_eq!(
+            header & metadata_flags::FETCHED,
+            0,
+            "no SetFetched went out behind the evictor's op"
+        );
+        assert_eq!(rig.state.stripe_fetch_state(0), Evicting);
+    }
+
     #[test]
     fn pushed_stripe_records_pushed_before_disposition() {
         use crate::block_device::{metadata_flags, PushGate};
@@ -1018,15 +1192,26 @@ mod tests {
         assert_ne!(header & metadata_flags::FETCHED, 0);
         assert_eq!(header & metadata_flags::EVICTED, 0);
 
-        // A stripe that was never evicted lands at once, untokened.
+        // A stripe that was never evicted waits for its FETCHED header too,
+        // under the next even token; the header's completion lands it.
         rig.state.set_stripe_fetch_state_for_test(1, NotFetched);
         rig.worker.process_request(BgWorkerRequest::FetchCompleted {
             stripe_id: 1,
             success: true,
         });
+        assert_eq!(
+            rig.state.stripe_fetch_state(1),
+            NotFetched,
+            "not released yet"
+        );
+        assert_eq!(rig.worker.pending_release[&4].stripe_id, 1);
+        assert!(!rig.worker.pending_release[&4].from_evicted);
+        for _ in 0..4 {
+            rig.worker.update();
+        }
         assert_eq!(rig.state.stripe_fetch_state(1), Fetched);
         assert!(rig.worker.pending_release.is_empty());
-        assert_eq!(rig.worker.next_release_token, 4);
+        assert_eq!(rig.worker.next_release_token, 6);
     }
 
     #[test]
@@ -1247,12 +1432,13 @@ mod tests {
         assert!(fetcher.busy());
     }
 
-    /// A stripe with a guest write queued on it (WRITTEN set at queue time)
-    /// is released only once its FETCHED header is durable, so the write the
-    /// guest is then told has landed cannot be undone by a restart that finds
-    /// the stripe NotFetched and fetches the base image over it.
+    /// With spill a stripe is released only once its FETCHED header is
+    /// durable, so a write the guest is then told has landed, queued before
+    /// the landing or issued the moment after it, cannot be undone by a
+    /// restart that finds the stripe NotFetched and fetches the base image
+    /// over it.
     #[test]
-    fn written_stripe_lands_only_when_its_fetched_header_is_durable() {
+    fn stripe_lands_only_when_its_fetched_header_is_durable_with_spill() {
         use crate::block_device::metadata_flags;
 
         let unfetched = metadata_flags::HAS_SOURCE;
@@ -1315,13 +1501,27 @@ mod tests {
             "the header completion and the outcome land it once, quietly"
         );
 
-        // A stripe with only reads waiting still lands at once.
+        // A stripe nobody has written waits the same way: a write may arrive
+        // the moment it is resident in memory.
         rig.worker.process_request(BgWorkerRequest::FetchCompleted {
             stripe_id: 1,
             success: true,
         });
+        assert_eq!(
+            rig.state.stripe_fetch_state(1),
+            NotFetched,
+            "not released yet"
+        );
+        assert_eq!(rig.worker.pending_release.len(), 1);
+        for _ in 0..4 {
+            rig.worker.update();
+        }
         assert_eq!(rig.state.stripe_fetch_state(1), Fetched);
         assert!(rig.worker.pending_release.is_empty());
+        let header = UbiMetadata::load_from_bdev(&rig.metadata_dev)
+            .unwrap()
+            .stripe_header(1);
+        assert_ne!(header & metadata_flags::FETCHED, 0);
 
         // Without an evictor nothing changes: a written stripe lands at once.
         let (mut plain, _sender) = build_bg_worker();

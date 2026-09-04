@@ -385,6 +385,19 @@ impl StripeFetcher {
     }
 
     fn write_pushed_stripe(&mut self, stripe_id: usize, data: &[u8]) {
+        if self.shared_metadata_state.stripe_fetch_state(stripe_id) == Evicting {
+            // The coordinator vets every push, but on a pool worker a push
+            // forwarded for a stripe that was not local can sit on the queue
+            // while the stripe lands by another route and the evictor claims
+            // it. Written now, the pre-image would go under the evictor's
+            // read and be uploaded as the fork's data. Evicting is the
+            // coordinator's; the push is dropped with its slot, as for a
+            // resident stripe.
+            warn!("Stripe {stripe_id} is being evicted, dropping the pushed copy");
+            self.push_permits.remove(&stripe_id);
+            return;
+        }
+
         // A pull for this stripe may still be queued: it failed because prod had
         // already copied the stripe out, and this is that copy. Retrying it
         // would fail again, and its completion would land on top of this write
@@ -748,6 +761,7 @@ impl StripeFetcher {
 mod tests {
     use super::*;
     use crate::block_device::bdev_test::TestBlockDevice;
+    use crate::block_device::PushGate;
     use crate::stripe_source::BlockDeviceStripeSource;
 
     struct TestState {
@@ -1524,6 +1538,90 @@ mod tests {
             1,
             "the push is the copy; nothing is pulled"
         );
+    }
+
+    /// The coordinator vets pushes, but with a pool of workers a forwarded
+    /// push sits on the worker's queue while the coordinator moves on, and
+    /// the evictor may claim the stripe meanwhile (it landed by another
+    /// route). Written now, the pre-image would go under the evictor's read
+    /// and be uploaded as the fork's data. Evicting is the coordinator's:
+    /// the push is dropped with its slot, and nothing is reported.
+    #[test]
+    fn push_for_evicting_stripe_is_dropped_without_a_write() {
+        let mut state = prep(false);
+        state.fetcher.handle_fetch_request(0);
+        for _ in 0..10 {
+            state.fetcher.update();
+        }
+        assert_eq!(state.fetcher.take_finished_fetches(), vec![(0, true)]);
+        state
+            .fetcher
+            .shared_metadata_state
+            .set_stripe_fetch_state_for_test(0, Evicting);
+        let writes_before = state.target_dev.metrics.read().unwrap().writes;
+        let gate = PushGate::new(2);
+
+        state
+            .fetcher
+            .accept_pushed_stripe(0, &[0xEF; 512], gate.acquire());
+        for _ in 0..10 {
+            state.fetcher.update();
+        }
+
+        assert_eq!(
+            state.target_dev.metrics.read().unwrap().writes,
+            writes_before
+        );
+        assert!(
+            state.fetcher.take_finished_fetches().is_empty(),
+            "nothing to report"
+        );
+        assert_eq!(gate.queued(), 0, "the permit went with the push");
+        assert!(state.fetcher.pending_pushes.is_empty());
+        assert!(state.fetcher.push_permits.is_empty());
+    }
+
+    /// The same for a push parked behind a pull: by the time the pull is
+    /// refused the stripe may be the evictor's.
+    #[test]
+    fn parked_push_is_dropped_when_the_stripe_is_evicting_by_the_time_it_applies() {
+        let mut state = prep(false);
+        state.fetcher.set_expects_pushes(true);
+        let pushed = vec![0xAB; (state.fetcher.stripe_sector_count as usize) * SECTOR_SIZE];
+        state
+            .source_dev
+            .fail_next
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        state
+            .source_dev
+            .hold_completions
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        state.fetcher.handle_fetch_request(0);
+        state.fetcher.update();
+        assert!(state.fetcher.fetch_in_flight(0));
+        let gate = PushGate::new(2);
+        state
+            .fetcher
+            .accept_pushed_stripe(0, &pushed, gate.acquire());
+        assert_eq!(state.fetcher.pending_pushes.len(), 1);
+
+        state
+            .fetcher
+            .shared_metadata_state
+            .set_stripe_fetch_state_for_test(0, Evicting);
+        state
+            .source_dev
+            .hold_completions
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        for _ in 0..10 {
+            state.fetcher.update();
+        }
+
+        assert_eq!(state.target_dev.metrics.read().unwrap().writes, 0);
+        assert!(state.fetcher.pending_pushes.is_empty());
+        assert!(state.fetcher.push_permits.is_empty());
+        assert_eq!(gate.queued(), 0);
+        assert!(state.fetcher.take_finished_fetches().is_empty());
     }
 
     /// On a fork a failed pull waits PUSH_WAIT for a push before its bounded

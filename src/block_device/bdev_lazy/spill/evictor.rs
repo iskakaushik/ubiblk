@@ -69,7 +69,10 @@ pub enum FetchDisposition {
     /// Space is exhausted and on_full = stall; replayed when the gate opens.
     HeldForSpace,
     /// Space is exhausted and on_full = fail; the channel fails the request
-    /// itself under GATE_FAIL. Nothing to route.
+    /// itself under GATE_FAIL. Nothing to route now, but the fetch is kept
+    /// like a held one and replayed when the gate opens: the channel may
+    /// poll only after the reopen, find the gate open and the stripe still
+    /// missing, and it never asks again for a NotFetched front.
     Refused,
 }
 
@@ -169,6 +172,11 @@ struct Eviction {
     deferred_push: Option<(Vec<u8>, PushPermit)>,
     /// A read or PUT has been started and its completion not yet seen.
     io_outstanding: bool,
+    /// The read's submit failed. io_uring keeps the SQE and enters it on the
+    /// next submit, so the completion is still owed: the record and its
+    /// buffer wait for it, and the channel is asked to submit again each
+    /// tick until one succeeds.
+    resubmit_read: bool,
     /// The stripe is resident again but a completion is still owed; the
     /// record stays until it lands so the completion is recognised.
     aborted: bool,
@@ -412,6 +420,7 @@ impl Evictor {
         let now = Instant::now();
         self.refresh_free_bytes(now);
         self.apply_outcomes(outcomes, now);
+        self.resubmit_reads();
         self.poll_reads(now);
         self.poll_puts(flusher, now);
         self.advance_draining(flusher, now);
@@ -596,6 +605,23 @@ impl Evictor {
         }
         if let Some((data, permit)) = eviction.deferred_push {
             self.released_pushes.push((stripe_id, data, permit));
+        }
+    }
+
+    /// Enter the SQE of a read whose submit failed, so its completion can
+    /// drain the aborted record. A bare submit is enough: the ring still
+    /// holds the entry.
+    fn resubmit_reads(&mut self) {
+        if !self.in_progress.values().any(|e| e.resubmit_read) {
+            return;
+        }
+        match self.read_channel.submit() {
+            Ok(()) => {
+                for eviction in self.in_progress.values_mut() {
+                    eviction.resubmit_read = false;
+                }
+            }
+            Err(e) => debug!("Re-submitting the evictor's reads still fails: {e}"),
         }
     }
 
@@ -876,14 +902,22 @@ impl Evictor {
         self.read_channel
             .add_read(offset, count as u32, buf.clone(), stripe_id);
         if let Err(e) = self.read_channel.submit() {
-            // The read was never queued, so no completion will come: the
-            // record cannot wait for one.
+            // The SQE is in the ring and a later submit enters it, so base
+            // may still carry the read out. The record keeps its buffer and
+            // waits for the completion under `aborted`, as an aborted PUT
+            // does. Returning the buffer now would let the late read land in
+            // a buffer handed to another eviction, and dropping the record
+            // would let the completion (keyed by stripe id) be taken for a
+            // new read of this stripe, uploading bytes read before the
+            // guest's later writes.
             error!("Submitting the read of stripe {stripe_id} failed: {e}");
+            self.state
+                .spill()
+                .degraded_reasons
+                .fetch_add(1, Ordering::Relaxed);
             if let Some(eviction) = self.in_progress.get_mut(&stripe_id) {
-                eviction.buf = None;
-                eviction.io_outstanding = false;
+                eviction.resubmit_read = true;
             }
-            self.buffers.return_buffer(&buf);
             self.abort(stripe_id, now);
         }
     }
@@ -1030,6 +1064,7 @@ impl Evictor {
                 deferred_fetch: false,
                 deferred_push: None,
                 io_outstanding: false,
+                resubmit_read: false,
                 aborted: false,
             },
         );
@@ -1065,7 +1100,18 @@ impl Evictor {
                     }
                     return FetchDisposition::HeldForSpace;
                 }
-                GATE_FAIL => return FetchDisposition::Refused,
+                GATE_FAIL => {
+                    // Kept all the same. The channel fails the request only
+                    // if it polls while the gate is still closed; should the
+                    // gate reopen first, its Pending front waits for a fetch
+                    // nobody sends again (no re-send for a NotFetched
+                    // stripe). The replay costs at most one pull the fetcher
+                    // may find redundant.
+                    if !self.held_for_space.contains(&stripe_id) {
+                        self.held_for_space.push(stripe_id);
+                    }
+                    return FetchDisposition::Refused;
+                }
                 _ => {}
             }
         }
