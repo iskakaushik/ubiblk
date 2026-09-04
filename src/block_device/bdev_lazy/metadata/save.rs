@@ -3,7 +3,10 @@ use ubiblk_macros::error_context;
 
 use crate::{
     backends::SECTOR_SIZE,
-    block_device::{shared_buffer, wait_for_completion, BlockDevice, UbiMetadata},
+    block_device::{
+        bdev_lazy::metadata::types::{METADATA_VERSION_MAJOR, METADATA_VERSION_MINOR},
+        shared_buffer, wait_for_completion, BlockDevice, UbiMetadata,
+    },
     Result,
 };
 
@@ -60,6 +63,47 @@ impl UbiMetadata {
         info!("Metadata device initialized successfully");
 
         Ok(())
+    }
+
+    /// Rewrite sector 0 with the current version constants if the loaded file
+    /// is older. Header sectors are untouched. Called once at spill startup
+    /// (before any eviction) so a pre-spill binary refuses a file whose header
+    /// bytes may carry EVICTED rather than reading a hole as FETCHED data.
+    /// Same write-then-flush pattern as `save_to_bdev`. Returns `Ok(true)` if
+    /// the sector was rewritten.
+    #[error_context("Failed to upgrade metadata version sector")]
+    pub fn upgrade_version_sector(bdev: &dyn BlockDevice) -> Result<bool> {
+        let mut metadata = UbiMetadata::load_from_bdev(bdev)?;
+        if metadata.version_major_u16() == METADATA_VERSION_MAJOR
+            && metadata.version_minor_u16() == METADATA_VERSION_MINOR
+        {
+            return Ok(false);
+        }
+
+        info!(
+            "Upgrading metadata version {}.{} to {}.{}",
+            metadata.version_major_u16(),
+            metadata.version_minor_u16(),
+            METADATA_VERSION_MAJOR,
+            METADATA_VERSION_MINOR
+        );
+        metadata.version_major = METADATA_VERSION_MAJOR.to_le_bytes();
+        metadata.version_minor = METADATA_VERSION_MINOR.to_le_bytes();
+
+        let buf = shared_buffer(SECTOR_SIZE);
+        metadata.write_header_sector(buf.borrow_mut().as_mut_slice())?;
+
+        let timeout = std::time::Duration::from_secs(30);
+        let mut ch = bdev.create_channel()?;
+        ch.add_write(0, 1, buf.clone(), METADATA_WRITE_ID);
+        ch.submit()?;
+        wait_for_completion(ch.as_mut(), METADATA_WRITE_ID, timeout)?;
+
+        ch.add_flush(METADATA_FLUSH_ID);
+        ch.submit()?;
+        wait_for_completion(ch.as_mut(), METADATA_FLUSH_ID, timeout)?;
+
+        Ok(true)
     }
 }
 

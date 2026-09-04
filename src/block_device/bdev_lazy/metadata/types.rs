@@ -5,7 +5,11 @@ use crate::{backends::SECTOR_SIZE, stripe_source::StripeSource, Result};
 pub const UBI_MAGIC_SIZE: usize = 9;
 pub const UBI_MAGIC: &[u8] = b"BDEV_UBI\0"; // 9 bytes
 pub const METADATA_VERSION_MAJOR: u16 = 2;
-pub const METADATA_VERSION_MINOR: u16 = 0;
+/// Bumped from 0. Minor versions only add header bits in reserved space.
+pub const METADATA_VERSION_MINOR: u16 = 1;
+/// Oldest minor this binary reads. A 2.0 file has bits 3..7 clear, which reads
+/// as "nothing evicted, nothing spilled, nothing pushed".
+pub const METADATA_VERSION_MINOR_MIN: u16 = 0;
 
 pub const CRC32_SIZE: usize = 4;
 pub const STRIPE_HEADERS_PER_SECTOR: usize = SECTOR_SIZE - CRC32_SIZE; // 508
@@ -22,6 +26,21 @@ pub mod metadata_flags {
     /// Stripe exists in the base source. Such a stripe might have been fetched
     /// already, or not yet.
     pub const HAS_SOURCE: u8 = 1 << 2;
+    /// The stripe's data is not on the local device although it once was.
+    /// Consult IN_S3, then HAS_SOURCE, to find it. Never set together with
+    /// FETCHED by any writer; if both are read, FETCHED wins and the anomaly
+    /// is logged (see `SharedMetadataState::new`).
+    pub const EVICTED: u8 = 1 << 3;
+    /// The spill store holds an object for this stripe. Authoritative only
+    /// while EVICTED is set; on a resident stripe it is a purge hint.
+    pub const IN_S3: u8 = 1 << 4;
+    /// A snapshot push for this stripe was received, so the live replica will
+    /// not serve it again. Counts as dirty for eviction.
+    pub const PUSHED: u8 = 1 << 5;
+    /// Bits 6 and 7 must be zero on disk.
+    pub const RESERVED_MASK: u8 = 0b1100_0000;
+    /// Bits a masked flusher update may touch.
+    pub const SPILL_MASK: u8 = EVICTED | IN_S3 | PUSHED;
 }
 
 #[repr(C)]
@@ -38,7 +57,10 @@ pub struct UbiMetadata {
     // bit 0: fetched or not
     // bit 1: written or not
     // bit 2: exists in source
-    // bits 3-7: reserved
+    // bit 3: evicted from the local device
+    // bit 4: an object for it is in the spill store
+    // bit 5: a snapshot push for it was received
+    // bits 6-7: reserved
     pub stripe_headers: Vec<u8>,
 }
 
@@ -226,16 +248,19 @@ impl UbiMetadata {
 
         let mut version_minor = [0u8; 2];
         version_minor.copy_from_slice(&buf[UBI_MAGIC_SIZE + 2..UBI_MAGIC_SIZE + 4]);
+        let minor = u16::from_le_bytes(version_minor);
         if version_major != METADATA_VERSION_MAJOR.to_le_bytes()
-            || version_minor != METADATA_VERSION_MINOR.to_le_bytes()
+            || !(METADATA_VERSION_MINOR_MIN..=METADATA_VERSION_MINOR).contains(&minor)
         {
             return Err(crate::ubiblk_error!(MetadataError {
                 description: format!(
-                    "Metadata version mismatch! Expected: {}.{}, Found: {}.{}",
+                    "Metadata version mismatch! Expected: {}.{}..={}.{}, Found: {}.{}",
+                    METADATA_VERSION_MAJOR,
+                    METADATA_VERSION_MINOR_MIN,
                     METADATA_VERSION_MAJOR,
                     METADATA_VERSION_MINOR,
                     u16::from_le_bytes(version_major),
-                    u16::from_le_bytes(version_minor)
+                    minor
                 ),
             }));
         }
@@ -290,6 +315,20 @@ impl UbiMetadata {
         assert!(all_headers.len() >= stripe_count);
         all_headers.truncate(stripe_count);
 
+        // A bit this binary does not know is a bit a newer binary wrote, and
+        // guessing what it means is how a hole gets read as data.
+        if let Some(stripe_id) = all_headers
+            .iter()
+            .position(|header| header & metadata_flags::RESERVED_MASK != 0)
+        {
+            return Err(crate::ubiblk_error!(MetadataError {
+                description: format!(
+                    "Metadata stripe header {stripe_id} has reserved bits set: {:#010b}",
+                    all_headers[stripe_id]
+                ),
+            }));
+        }
+
         Ok(Box::new(UbiMetadata {
             magic,
             version_major,
@@ -309,7 +348,25 @@ impl UbiMetadata {
             }));
         }
 
-        // Write header sector (sector 0)
+        self.write_header_sector(&mut buf[..SECTOR_SIZE])?;
+
+        // Write stripe header sectors with CRC32
+        let num_sectors = self.stripe_header_sector_count();
+        for group in 0..num_sectors {
+            let start = group * STRIPE_HEADERS_PER_SECTOR;
+            let end = (start + STRIPE_HEADERS_PER_SECTOR).min(self.stripe_headers.len());
+            let headers = &self.stripe_headers[start..end];
+
+            let sector_start = SECTOR_SIZE + group * SECTOR_SIZE;
+            assert!(sector_start + SECTOR_SIZE <= buf.len());
+            write_sector_with_crc32(&mut buf[sector_start..sector_start + SECTOR_SIZE], headers);
+        }
+        Ok(())
+    }
+
+    /// Serialize sector 0 (magic, version, stripe geometry) into `buf`, which
+    /// must be exactly one sector.
+    pub(crate) fn write_header_sector(&self, buf: &mut [u8]) -> Result<()> {
         let mut header = [0u8; Self::HEADER_SIZE];
         header[..UBI_MAGIC_SIZE].copy_from_slice(&self.magic);
         header[UBI_MAGIC_SIZE..UBI_MAGIC_SIZE + 2].copy_from_slice(&self.version_major);
@@ -326,19 +383,7 @@ impl UbiMetadata {
             .to_le_bytes();
         header[STRIPE_COUNT_OFFSET..STRIPE_COUNT_OFFSET + 4].copy_from_slice(&stripe_count_bytes);
 
-        write_sector_with_crc32(&mut buf[..SECTOR_SIZE], &header);
-
-        // Write stripe header sectors with CRC32
-        let num_sectors = self.stripe_header_sector_count();
-        for group in 0..num_sectors {
-            let start = group * STRIPE_HEADERS_PER_SECTOR;
-            let end = (start + STRIPE_HEADERS_PER_SECTOR).min(self.stripe_headers.len());
-            let headers = &self.stripe_headers[start..end];
-
-            let sector_start = SECTOR_SIZE + group * SECTOR_SIZE;
-            assert!(sector_start + SECTOR_SIZE <= buf.len());
-            write_sector_with_crc32(&mut buf[sector_start..sector_start + SECTOR_SIZE], headers);
-        }
+        write_sector_with_crc32(buf, &header);
         Ok(())
     }
 
@@ -346,6 +391,16 @@ impl UbiMetadata {
         self.stripe_headers.iter().all(|&header| {
             (header & metadata_flags::HAS_SOURCE) == 0 || (header & metadata_flags::FETCHED) != 0
         })
+    }
+
+    /// Stripe ids whose header has EVICTED set (the startup punch pass).
+    pub fn evicted_stripe_ids(&self) -> Vec<usize> {
+        self.stripe_headers
+            .iter()
+            .enumerate()
+            .filter(|(_, header)| *header & metadata_flags::EVICTED != 0)
+            .map(|(stripe_id, _)| stripe_id)
+            .collect()
     }
 }
 

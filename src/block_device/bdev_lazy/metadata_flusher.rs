@@ -12,16 +12,18 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 const MAX_CONCURRENT_CHANGES: usize = 16;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MetadataFlusherRequestKind {
-    SetFetched,
-    SetWritten,
-}
+/// Header bits a request may set or clear. The rest of the byte is reserved.
+const UPDATABLE_MASK: u8 = metadata_flags::FETCHED | metadata_flags::WRITTEN | metadata_flags::SPILL_MASK;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MetadataFlusherRequest {
     stripe_id: usize,
-    kind: MetadataFlusherRequestKind,
+    set: u8,
+    clear: u8,
+    /// 0: fire-and-forget (SetFetched, SetWritten), deduplicated when the byte
+    /// already has the requested value. Non-zero: always written and flushed,
+    /// outcome reported under this token via `take_persist_outcomes`.
+    token: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,9 +37,32 @@ struct HeaderUpdateStatus {
     stage: RequestStage,
     stripe_id: usize,
     header: u8,
-    /// The specific flag bit(s) added by this request, used to revert on failure.
-    requested_bitmask: u8,
+    /// The byte before this update. Restored on a write-stage failure. A bit
+    /// mask of what was added could not undo a clear.
+    previous: u8,
+    token: u64,
     sector: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersistResult {
+    /// Sector write and fsync both completed. The byte is on disk.
+    Durable,
+    /// The write (or its submit) failed. The disk still holds `previous`; the
+    /// in-memory byte was restored to `previous`.
+    NotWritten,
+    /// The write completed but the fsync failed (or its submit failed). The
+    /// disk may hold either byte. The in-memory byte is left at the new value
+    /// so a retry rewrites it. Callers must not act as if the old byte is on
+    /// disk.
+    Uncertain,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PersistOutcome {
+    pub stripe_id: usize,
+    pub token: u64,
+    pub result: PersistResult,
 }
 
 pub struct MetadataFlusher {
@@ -48,6 +73,8 @@ pub struct MetadataFlusher {
     header_updates: HashMap<usize, HeaderUpdateStatus>,
     queued_requests: VecDeque<MetadataFlusherRequest>,
     buffer_pool: AlignedBufferPool,
+    /// Outcomes of tokened requests, in completion order, until taken.
+    persist_outcomes: Vec<PersistOutcome>,
 }
 
 impl MetadataFlusher {
@@ -79,6 +106,7 @@ impl MetadataFlusher {
             queued_requests: VecDeque::new(),
             buffer_pool: AlignedBufferPool::new(4096, MAX_CONCURRENT_CHANGES, SECTOR_SIZE),
             header_updates: HashMap::new(),
+            persist_outcomes: Vec::new(),
         })
     }
 
@@ -86,18 +114,62 @@ impl MetadataFlusher {
         !self.sectors_being_updated.is_empty() || !self.queued_requests.is_empty()
     }
 
+    /// Update{set: FETCHED, clear: EVICTED}, token 0. Clearing EVICTED here is
+    /// belt and braces: FETCHED|EVICTED must never reach disk.
     pub fn set_stripe_fetched(&mut self, stripe_id: usize) {
         self.queued_requests.push_back(MetadataFlusherRequest {
             stripe_id,
-            kind: MetadataFlusherRequestKind::SetFetched,
+            set: metadata_flags::FETCHED,
+            clear: metadata_flags::EVICTED,
+            token: 0,
         });
     }
 
+    /// Update{set: WRITTEN, clear: 0}, token 0.
     pub fn set_stripe_written(&mut self, stripe_id: usize) {
         self.queued_requests.push_back(MetadataFlusherRequest {
             stripe_id,
-            kind: MetadataFlusherRequestKind::SetWritten,
+            set: metadata_flags::WRITTEN,
+            clear: 0,
+            token: 0,
         });
+    }
+
+    /// Masked update. `set` and `clear` may only touch FETCHED | WRITTEN |
+    /// SPILL_MASK (debug_assert). With a non-zero `token` the update is always
+    /// written and flushed, and its outcome reported under that token by
+    /// `take_persist_outcomes`. Token 0 is fire-and-forget like the setters
+    /// above: skipped when the byte already reads as requested, no outcome.
+    pub fn update_stripe_header(&mut self, stripe_id: usize, set: u8, clear: u8, token: u64) {
+        debug_assert!(
+            (set | clear) & !UPDATABLE_MASK == 0,
+            "header update touches reserved bits: set {set:#010b} clear {clear:#010b}"
+        );
+        self.queued_requests.push_back(MetadataFlusherRequest {
+            stripe_id,
+            set,
+            clear,
+            token,
+        });
+    }
+
+    /// Outcomes completed since the last call, in completion order.
+    pub fn take_persist_outcomes(&mut self) -> Vec<PersistOutcome> {
+        std::mem::take(&mut self.persist_outcomes)
+    }
+
+    /// The flusher's current in-memory byte (what the next write starts from).
+    pub fn header(&self, stripe_id: usize) -> u8 {
+        self.metadata
+            .stripe_headers
+            .get(stripe_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// The metadata as loaded at construction plus every update applied since.
+    pub fn metadata(&self) -> &UbiMetadata {
+        &self.metadata
     }
 
     pub fn update(&mut self) {
@@ -105,10 +177,42 @@ impl MetadataFlusher {
         self.poll_channel();
     }
 
+    /// The disk provably still holds the old byte: put memory back to match and
+    /// tell a tokened caller so.
+    fn fail_not_written(&mut self, status: &HeaderUpdateStatus) {
+        self.metadata.stripe_headers[status.stripe_id] = status.previous;
+        if status.token != 0 {
+            self.persist_outcomes.push(PersistOutcome {
+                stripe_id: status.stripe_id,
+                token: status.token,
+                result: PersistResult::NotWritten,
+            });
+        }
+    }
+
+    /// The sector was written but never made durable, so the disk may hold
+    /// either byte. A tokened caller keeps the new byte in memory so its retry
+    /// rewrites it; a fire-and-forget request reverts as it always has, since
+    /// an unflushed SetFetched only costs a re-fetch.
+    fn fail_uncertain(&mut self, status: &HeaderUpdateStatus) {
+        if status.token != 0 {
+            self.persist_outcomes.push(PersistOutcome {
+                stripe_id: status.stripe_id,
+                token: status.token,
+                result: PersistResult::Uncertain,
+            });
+        } else {
+            self.metadata.stripe_headers[status.stripe_id] = status.previous;
+        }
+    }
+
     fn cleanup_failed_submission(&mut self, stripe_ids: &[usize], return_buffer: bool) {
         for stripe_id in stripe_ids {
             if let Some(status) = self.header_updates.remove(stripe_id) {
-                self.metadata.stripe_headers[status.stripe_id] &= !status.requested_bitmask;
+                match status.stage {
+                    RequestStage::Writing => self.fail_not_written(&status),
+                    RequestStage::Flushing => self.fail_uncertain(&status),
+                }
                 if return_buffer {
                     self.buffer_pool.return_buffer(&status.buffer);
                 }
@@ -127,21 +231,22 @@ impl MetadataFlusher {
                 (None, _) => {
                     error!("Received unexpected response for stripe {stripe_id}");
                 }
-                (Some(status), false) => {
+                (Some(_), false) => {
                     error!("Failed to write metadata for stripe {stripe_id}");
-                    // Revert only the specific flag bit we added, so a future
-                    // retry for the same operation won't be skipped by the
-                    // dedup check in start_writes.
-                    self.metadata.stripe_headers[status.stripe_id] &= !status.requested_bitmask;
-                    // Only return the buffer if it hasn't already been returned.
-                    // On write success the buffer is returned before transitioning
-                    // to Flushing, so a subsequent flush failure must not return
-                    // it a second time.
-                    if status.stage == RequestStage::Writing {
-                        self.buffer_pool.return_buffer(&status.buffer);
+                    let Some(status) = self.header_updates.remove(&stripe_id) else {
+                        continue;
+                    };
+                    match status.stage {
+                        RequestStage::Writing => {
+                            self.fail_not_written(&status);
+                            // On write success the buffer is returned before
+                            // transitioning to Flushing, so only a write
+                            // failure still holds it.
+                            self.buffer_pool.return_buffer(&status.buffer);
+                        }
+                        RequestStage::Flushing => self.fail_uncertain(&status),
                     }
                     self.sectors_being_updated.remove(&status.sector);
-                    self.header_updates.remove(&stripe_id);
                 }
                 (Some(status), true) => match status.stage {
                     RequestStage::Writing => {
@@ -152,16 +257,23 @@ impl MetadataFlusher {
                     }
                     RequestStage::Flushing => {
                         self.sectors_being_updated.remove(&(status.sector));
-                        finished_stripes.push((status.stripe_id, status.header));
+                        finished_stripes.push((status.stripe_id, status.header, status.token));
                     }
                 },
             }
         }
 
-        for (stripe, header) in finished_stripes {
+        for (stripe, header, token) in finished_stripes {
             debug!("Stripe {stripe} metadata updated with header {header}");
             self.header_updates.remove(&stripe);
             self.shared_state.set_stripe_header(stripe, header);
+            if token != 0 {
+                self.persist_outcomes.push(PersistOutcome {
+                    stripe_id: stripe,
+                    token,
+                    result: PersistResult::Durable,
+                });
+            }
         }
 
         if newly_flushing.is_empty() {
@@ -191,18 +303,17 @@ impl MetadataFlusher {
             }
             self.queued_requests.pop_front();
 
-            let requested_bitmask = match req.kind {
-                MetadataFlusherRequestKind::SetFetched => metadata_flags::FETCHED,
-                MetadataFlusherRequestKind::SetWritten => metadata_flags::WRITTEN,
-            };
-
-            if self.metadata.stripe_headers[req.stripe_id] & requested_bitmask != 0 {
-                // Already set, skip
+            let previous = self.metadata.stripe_headers[req.stripe_id];
+            let next = (previous | req.set) & !req.clear;
+            if req.token == 0 && next == previous {
+                // Already as requested, skip. A tokened update is written
+                // regardless: its caller wants the byte on disk, not merely
+                // in memory.
                 continue;
             }
 
             let buf = self.buffer_pool.get_buffer().unwrap();
-            self.metadata.stripe_headers[req.stripe_id] |= requested_bitmask;
+            self.metadata.stripe_headers[req.stripe_id] = next;
 
             let headers_start = group * STRIPE_HEADERS_PER_SECTOR;
             let headers_end =
@@ -219,8 +330,9 @@ impl MetadataFlusher {
                     buffer: buf,
                     stage: RequestStage::Writing,
                     stripe_id: req.stripe_id,
-                    header: self.metadata.stripe_headers[req.stripe_id],
-                    requested_bitmask,
+                    header: next,
+                    previous,
+                    token: req.token,
                     sector,
                 },
             );
@@ -576,5 +688,228 @@ mod tests {
 
         // Now it should succeed
         assert!(shared_state.stripe_fetched(5));
+    }
+
+    fn init_flusher() -> (TestBlockDevice, SharedMetadataState, MetadataFlusher) {
+        let metadata_dev = init_metadata_device();
+        let shared_state = {
+            let metadata = UbiMetadata::load_from_bdev(&metadata_dev).expect("load metadata");
+            SharedMetadataState::new(&metadata)
+        };
+        let flusher = MetadataFlusher::new(&metadata_dev, 8 * 1024, shared_state.clone()).unwrap();
+        (metadata_dev, shared_state, flusher)
+    }
+
+    fn on_disk_header(metadata_dev: &TestBlockDevice, stripe_id: usize) -> u8 {
+        UbiMetadata::load_from_bdev(metadata_dev)
+            .expect("load metadata")
+            .stripe_header(stripe_id)
+    }
+
+    fn io_counts(metadata_dev: &TestBlockDevice) -> (usize, usize) {
+        let metrics = metadata_dev.metrics.read().unwrap();
+        (metrics.writes, metrics.flushes)
+    }
+
+    #[test]
+    fn masked_update_clears_fetched_and_sets_evicted_in_one_write() {
+        let (metadata_dev, shared_state, mut flusher) = init_flusher();
+        flusher.set_stripe_fetched(5);
+        wait_for_completion(&mut flusher);
+        let old = flusher.header(5);
+        assert_eq!(old, metadata_flags::FETCHED | metadata_flags::HAS_SOURCE);
+        let (writes, flushes) = io_counts(&metadata_dev);
+
+        flusher.update_stripe_header(
+            5,
+            metadata_flags::EVICTED | metadata_flags::IN_S3,
+            metadata_flags::FETCHED,
+            7,
+        );
+        wait_for_completion(&mut flusher);
+
+        let expected = (old | metadata_flags::EVICTED | metadata_flags::IN_S3) & !metadata_flags::FETCHED;
+        assert_eq!(io_counts(&metadata_dev), (writes + 1, flushes + 1));
+        assert_eq!(on_disk_header(&metadata_dev, 5), expected);
+        assert_eq!(flusher.header(5), expected);
+        assert_eq!(
+            flusher.take_persist_outcomes(),
+            vec![PersistOutcome {
+                stripe_id: 5,
+                token: 7,
+                result: PersistResult::Durable,
+            }]
+        );
+        assert!(flusher.take_persist_outcomes().is_empty());
+        // The in-memory state is the evictor's to move; the completion only
+        // carries the side bit.
+        assert!(shared_state.stripe_fetched(5));
+        assert!(shared_state.stripe_in_s3(5));
+    }
+
+    #[test]
+    fn masked_update_outcome_is_durable_only_after_flush() {
+        let (_metadata_dev, _shared_state, mut flusher) = init_flusher();
+
+        flusher.update_stripe_header(5, metadata_flags::EVICTED, metadata_flags::FETCHED, 1);
+        flusher.start_writes();
+        assert!(flusher.take_persist_outcomes().is_empty());
+
+        // Write completion: the flush is issued, nothing is durable yet.
+        flusher.poll_channel();
+        assert!(flusher.take_persist_outcomes().is_empty());
+        assert!(flusher.busy());
+
+        // Flush completion.
+        flusher.poll_channel();
+        let outcomes = flusher.take_persist_outcomes();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].result, PersistResult::Durable);
+        assert!(!flusher.busy());
+    }
+
+    #[test]
+    fn masked_update_write_failure_reports_not_written_and_restores_previous_byte() {
+        let (metadata_dev, _shared_state, mut flusher) = init_flusher();
+        flusher.set_stripe_fetched(5);
+        flusher.set_stripe_written(5);
+        wait_for_completion(&mut flusher);
+        let original = metadata_flags::FETCHED | metadata_flags::WRITTEN | metadata_flags::HAS_SOURCE;
+        assert_eq!(flusher.header(5), original);
+
+        metadata_dev
+            .fail_next
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        flusher.update_stripe_header(5, metadata_flags::EVICTED, metadata_flags::FETCHED, 3);
+        flusher.update();
+
+        assert_eq!(
+            flusher.take_persist_outcomes(),
+            vec![PersistOutcome {
+                stripe_id: 5,
+                token: 3,
+                result: PersistResult::NotWritten,
+            }]
+        );
+        // The whole byte comes back, FETCHED included; `& !mask` could not
+        // have restored a cleared bit.
+        assert_eq!(flusher.header(5), original);
+        assert_eq!(on_disk_header(&metadata_dev, 5), original);
+        assert!(!flusher.busy());
+    }
+
+    #[test]
+    fn masked_update_flush_failure_reports_uncertain_and_keeps_new_byte() {
+        let (metadata_dev, _shared_state, mut flusher) = init_flusher();
+        flusher.set_stripe_fetched(5);
+        wait_for_completion(&mut flusher);
+        let old = flusher.header(5);
+
+        flusher.update_stripe_header(5, metadata_flags::EVICTED, metadata_flags::FETCHED, 3);
+        flusher.start_writes();
+        // The write has completed; arm the failure for the flush it triggers.
+        metadata_dev
+            .fail_next
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        flusher.poll_channel();
+        flusher.poll_channel();
+
+        assert_eq!(
+            flusher.take_persist_outcomes(),
+            vec![PersistOutcome {
+                stripe_id: 5,
+                token: 3,
+                result: PersistResult::Uncertain,
+            }]
+        );
+        let new = (old | metadata_flags::EVICTED) & !metadata_flags::FETCHED;
+        assert_eq!(flusher.header(5), new, "memory keeps the new byte for the retry");
+        assert_eq!(on_disk_header(&metadata_dev, 5), new, "the sector write did land");
+        assert!(!flusher.busy());
+
+        // The retry rewrites the same byte and is durable.
+        flusher.update_stripe_header(5, metadata_flags::EVICTED, metadata_flags::FETCHED, 5);
+        wait_for_completion(&mut flusher);
+        assert_eq!(flusher.take_persist_outcomes()[0].result, PersistResult::Durable);
+    }
+
+    #[test]
+    fn masked_update_is_never_deduplicated() {
+        let (metadata_dev, _shared_state, mut flusher) = init_flusher();
+        flusher.set_stripe_fetched(5);
+        wait_for_completion(&mut flusher);
+        let (writes, flushes) = io_counts(&metadata_dev);
+
+        // Fire-and-forget: already set, nothing written.
+        flusher.set_stripe_fetched(5);
+        wait_for_completion(&mut flusher);
+        assert_eq!(io_counts(&metadata_dev), (writes, flushes));
+
+        // Tokened: the same no-op change is written and flushed anyway.
+        flusher.update_stripe_header(5, metadata_flags::FETCHED, 0, 9);
+        wait_for_completion(&mut flusher);
+        assert_eq!(io_counts(&metadata_dev), (writes + 1, flushes + 1));
+        assert_eq!(flusher.take_persist_outcomes()[0].result, PersistResult::Durable);
+    }
+
+    #[test]
+    fn set_fetched_clears_evicted() {
+        let (metadata_dev, shared_state, mut flusher) = init_flusher();
+        flusher.update_stripe_header(5, metadata_flags::EVICTED, metadata_flags::FETCHED, 1);
+        wait_for_completion(&mut flusher);
+        assert_ne!(flusher.header(5) & metadata_flags::EVICTED, 0);
+
+        flusher.set_stripe_fetched(5);
+        wait_for_completion(&mut flusher);
+
+        let header = flusher.header(5);
+        assert_eq!(header & metadata_flags::EVICTED, 0);
+        assert_ne!(header & metadata_flags::FETCHED, 0);
+        assert_eq!(on_disk_header(&metadata_dev, 5), header);
+        assert!(shared_state.stripe_fetched(5));
+    }
+
+    #[test]
+    fn masked_update_serialises_behind_set_written_in_same_sector() {
+        let (metadata_dev, _shared_state, mut flusher) = init_flusher();
+        let (writes, flushes) = io_counts(&metadata_dev);
+
+        // Stripes 5 and 6 share sector 1.
+        flusher.set_stripe_written(5);
+        flusher.update_stripe_header(6, metadata_flags::EVICTED, metadata_flags::FETCHED, 1);
+        flusher.start_writes();
+        assert_eq!(io_counts(&metadata_dev), (writes + 1, flushes), "one write at a time per sector");
+        assert!(flusher.take_persist_outcomes().is_empty());
+
+        wait_for_completion(&mut flusher);
+        assert_eq!(io_counts(&metadata_dev), (writes + 2, flushes + 2));
+        assert_eq!(flusher.take_persist_outcomes()[0].result, PersistResult::Durable);
+        // The second write started from the sector image the first produced,
+        // so neither update lost the other.
+        assert_ne!(on_disk_header(&metadata_dev, 5) & metadata_flags::WRITTEN, 0);
+        assert_ne!(on_disk_header(&metadata_dev, 6) & metadata_flags::EVICTED, 0);
+    }
+
+    #[test]
+    fn metadata_accessor_reflects_applied_updates() {
+        let (_metadata_dev, _shared_state, mut flusher) = init_flusher();
+        assert_eq!(flusher.metadata().stripe_header(5) & metadata_flags::FETCHED, 0);
+
+        flusher.set_stripe_fetched(5);
+        assert_eq!(
+            flusher.metadata().stripe_header(5) & metadata_flags::FETCHED,
+            0,
+            "queued is not applied"
+        );
+
+        flusher.start_writes();
+        assert_ne!(flusher.metadata().stripe_header(5) & metadata_flags::FETCHED, 0);
+        assert_eq!(flusher.metadata().stripe_header(5), flusher.header(5));
+        assert_eq!(flusher.metadata().evicted_stripe_ids(), Vec::<usize>::new());
+        wait_for_completion(&mut flusher);
+
+        flusher.update_stripe_header(6, metadata_flags::EVICTED, metadata_flags::FETCHED, 1);
+        wait_for_completion(&mut flusher);
+        assert_eq!(flusher.metadata().evicted_stripe_ids(), vec![6]);
     }
 }

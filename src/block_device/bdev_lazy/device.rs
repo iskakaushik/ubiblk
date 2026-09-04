@@ -5,12 +5,12 @@ use crate::{
 
 use super::{
     bgworker::BgWorkerRequest,
-    metadata::{Failed, Fetched, NoSource, NotFetched},
+    metadata::{Evicted, Evicting, Failed, Fetched, NoSource, NotFetched},
 };
 
 use std::{
     collections::{HashSet, VecDeque},
-    sync::mpsc::Sender,
+    sync::{atomic::Ordering, mpsc::Sender},
 };
 
 use log::{debug, error};
@@ -78,13 +78,22 @@ impl LazyIoChannel {
                 Fetched | NoSource => {
                     continue;
                 }
-                NotFetched => {
+                NotFetched | Evicting | Evicted => {
                     return StripesFetchStatus::Pending;
                 }
                 Failed => {
                     return StripesFetchStatus::Failed { stripe_id };
                 }
-                _ => {}
+                other => {
+                    // Neither a hole (Complete) nor a hang (Pending): a state
+                    // this code does not know is an I/O error.
+                    error!("Stripe {stripe_id} has unknown fetch state {other}");
+                    self.metadata_state
+                        .spill()
+                        .degraded_reasons
+                        .fetch_add(1, Ordering::Relaxed);
+                    return StripesFetchStatus::Failed { stripe_id };
+                }
             }
         }
         StripesFetchStatus::Complete

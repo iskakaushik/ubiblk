@@ -477,4 +477,31 @@ mod tests {
         assert_eq!(results, vec![(1, false)]);
         assert_eq!(target_metrics.read().unwrap().writes, 0);
     }
+
+    #[test]
+    fn unknown_fetch_state_fails_the_request() {
+        let TestEnv {
+            lazy,
+            metadata_state,
+            target_metrics,
+            ..
+        } = setup_env(false, false, b"");
+        metadata_state.set_stripe_fetch_state_for_test(0, 9);
+        let mut chan = lazy.create_channel().unwrap();
+
+        let buf: SharedBuffer = shared_buffer(SECTOR_SIZE);
+        chan.add_read(0, 1, buf, 1);
+        chan.submit().unwrap();
+        let results = chan.poll();
+
+        assert_eq!(results, vec![(1, false)]);
+        assert_eq!(target_metrics.read().unwrap().reads, 0);
+        assert_eq!(
+            metadata_state
+                .spill()
+                .degraded_reasons
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
 }
