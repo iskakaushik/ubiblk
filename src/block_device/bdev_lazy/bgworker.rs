@@ -1,18 +1,21 @@
 use super::{
     ingest_pool::{IngestPool, IngestPoolConfig, IngestRequest},
-    metadata::shared_state::SharedMetadataState,
-    metadata_flusher::MetadataFlusher,
+    metadata::shared_state::{stripe_flags, Evicted, SharedMetadataState},
+    metadata_flusher::{MetadataFlusher, PersistOutcome, PersistResult},
     push_gate::PushPermit,
-    spill::Evictor,
+    spill::{Evictor, FetchDisposition, PushDisposition},
     stripe_fetcher::StripeFetcher,
 };
 
+#[cfg(feature = "fault-injection")]
+use super::spill::evictor::CrashPoint;
+
 use crate::{
-    block_device::BlockDevice,
+    block_device::{metadata_flags, BlockDevice},
     stripe_source::{StripeSource, StripeSourceBuilder},
     Result,
 };
-use log::{error, info};
+use log::{debug, error, info, warn};
 use std::{
     collections::HashMap,
     sync::{
@@ -26,6 +29,10 @@ use std::{
 /// nothing is busy. The evictor has deadlines of its own (statfs refresh,
 /// upload backoff), so the loop must come round without a request.
 const EVICTOR_IDLE_WAIT: Duration = Duration::from_millis(250);
+
+/// Re-issues of a re-materialised stripe's EVICTED-clearing header before the
+/// coordinator gives up and leaves the stripe Evicted for the next fetch.
+const MAX_RELEASE_RETRIES: u8 = 3;
 
 pub enum BgWorkerRequest {
     Fetch {
@@ -63,7 +70,6 @@ enum Ingest {
 /// A re-materialised stripe whose EVICTED-clearing header is in the flusher.
 /// The guest may not see it as resident before that header is durable: the
 /// startup pass punches every stripe whose header says EVICTED.
-#[allow(dead_code)]
 struct PendingRelease {
     stripe_id: usize,
     retries: u8,
@@ -76,13 +82,10 @@ pub struct BgWorker {
     metadata_state: SharedMetadataState,
     /// Present when `[spill]` is configured.
     evictor: Option<Evictor>,
-    // Driven by the coordinator logic that lands with the evictor body.
     /// Evicted stripes whose data has landed and whose EVICTED-clearing header
     /// is in the flusher, keyed by even token.
-    #[allow(dead_code)]
     pending_release: HashMap<u64, PendingRelease>,
     /// Even tokens are the coordinator's; odd ones the evictor's.
-    #[allow(dead_code)]
     next_release_token: u64,
     done: bool,
 }
@@ -183,39 +186,164 @@ impl BgWorker {
 
     pub fn process_request(&mut self, req: BgWorkerRequest) {
         match req {
-            BgWorkerRequest::Fetch { stripe_id } => match &mut self.ingest {
-                Ingest::Inline(fetcher) => fetcher.handle_fetch_request(stripe_id),
-                Ingest::Pool(pool) => pool.send(stripe_id, IngestRequest::Fetch { stripe_id }),
-            },
+            BgWorkerRequest::Fetch { stripe_id } => {
+                if self
+                    .pending_release
+                    .values()
+                    .any(|pending| pending.stripe_id == stripe_id)
+                {
+                    // The data is local and the header clearing EVICTED is in
+                    // flight; the channel's re-send finds the stripe resident
+                    // once that header is durable.
+                    debug!("Fetch for stripe {stripe_id} dropped: its release is pending");
+                    return;
+                }
+                if let Some(evictor) = &mut self.evictor {
+                    match evictor.on_fetch_request(stripe_id) {
+                        FetchDisposition::Forward => {}
+                        FetchDisposition::Aborted
+                        | FetchDisposition::Deferred
+                        | FetchDisposition::HeldForSpace
+                        | FetchDisposition::Refused => return,
+                    }
+                }
+                self.route_fetch(stripe_id);
+            }
             BgWorkerRequest::PushedStripe {
                 stripe_id,
                 data,
                 permit,
-            } => match &mut self.ingest {
-                Ingest::Inline(fetcher) => fetcher.accept_pushed_stripe(stripe_id, &data, permit),
-                Ingest::Pool(pool) => pool.send(
-                    stripe_id,
-                    IngestRequest::Pushed {
-                        stripe_id,
-                        data,
-                        permit,
+            } => {
+                if self.evictor.is_some() {
+                    // Recorded for every push, whatever becomes of it: the
+                    // server refuses a re-pull after copy-out regardless of
+                    // who holds the stripe, so it is dirty from now on.
+                    self.metadata_state
+                        .set_stripe_flags(stripe_id, stripe_flags::PUSHED);
+                    self.metadata_flusher
+                        .update_stripe_header(stripe_id, metadata_flags::PUSHED, 0, 0);
+                }
+                let permit = match &mut self.evictor {
+                    None => permit,
+                    Some(evictor) => match evictor.on_pushed_stripe(stripe_id, &data, permit) {
+                        (PushDisposition::Forward, Some(permit)) => permit,
+                        _ => return,
                     },
-                ),
-            },
+                };
+                self.route_push(stripe_id, data, permit);
+            }
             BgWorkerRequest::SetWritten { stripe_id } => {
                 self.metadata_flusher.set_stripe_written(stripe_id)
             }
             BgWorkerRequest::FetchCompleted { stripe_id, success } => {
-                if success {
-                    self.metadata_state.mark_stripe_fetched(stripe_id);
-                    self.metadata_flusher.set_stripe_fetched(stripe_id);
-                } else {
-                    error!("Stripe {stripe_id} fetch failed");
-                }
+                self.stripe_landed(stripe_id, success)
             }
             BgWorkerRequest::Shutdown => {
                 info!("Received shutdown request, stopping worker");
                 self.done = true;
+            }
+        }
+    }
+
+    fn route_fetch(&mut self, stripe_id: usize) {
+        match &mut self.ingest {
+            Ingest::Inline(fetcher) => fetcher.handle_fetch_request(stripe_id),
+            Ingest::Pool(pool) => pool.send(stripe_id, IngestRequest::Fetch { stripe_id }),
+        }
+    }
+
+    fn route_push(&mut self, stripe_id: usize, data: Vec<u8>, permit: PushPermit) {
+        match &mut self.ingest {
+            Ingest::Inline(fetcher) => fetcher.accept_pushed_stripe(stripe_id, &data, permit),
+            Ingest::Pool(pool) => pool.send(
+                stripe_id,
+                IngestRequest::Pushed {
+                    stripe_id,
+                    data,
+                    permit,
+                },
+            ),
+        }
+    }
+
+    /// The ingest finished with a stripe. A stripe that was not evicted lands
+    /// at once; an evicted one (or a Failed one whose header still says
+    /// EVICTED) is released only when the header clearing EVICTED is durable,
+    /// because the startup pass punches every stripe whose header says so.
+    fn stripe_landed(&mut self, stripe_id: usize, success: bool) {
+        if !success {
+            error!("Stripe {stripe_id} fetch failed");
+            return;
+        }
+        let state = self.metadata_state.stripe_fetch_state(stripe_id);
+        if state == Evicted
+            || self.metadata_state.stripe_flags(stripe_id) & stripe_flags::WAS_EVICTED != 0
+        {
+            let token = self.next_release_token;
+            self.next_release_token += 2;
+            self.pending_release
+                .insert(token, PendingRelease { stripe_id, retries: 0 });
+            self.metadata_flusher.update_stripe_header(
+                stripe_id,
+                metadata_flags::FETCHED,
+                metadata_flags::EVICTED,
+                token,
+            );
+            #[cfg(feature = "fault-injection")]
+            if let Some(evictor) = &self.evictor {
+                evictor.crash_if_at(CrashPoint::DuringRefetch);
+            }
+        } else {
+            // Unblocks anything waiting on this stripe now, rather than once
+            // the flusher has worked through the sweep's backlog.
+            self.metadata_state.mark_stripe_fetched(stripe_id);
+            self.metadata_flusher.set_stripe_fetched(stripe_id);
+        }
+    }
+
+    /// The flusher finished a release op. Durable lands the stripe; anything
+    /// else is retried a few times with a fresh token and then given up on,
+    /// leaving the stripe Evicted for the guest's next fetch to re-write.
+    fn apply_release_outcome(&mut self, outcome: &PersistOutcome) {
+        let Some(pending) = self.pending_release.remove(&outcome.token) else {
+            error!(
+                "Release outcome for stripe {} with unknown token {}",
+                outcome.stripe_id, outcome.token
+            );
+            return;
+        };
+        let stripe_id = pending.stripe_id;
+        match outcome.result {
+            PersistResult::Durable => {
+                debug!("Stripe {stripe_id} re-materialised");
+                self.metadata_state.mark_stripe_resident(stripe_id);
+            }
+            result if pending.retries < MAX_RELEASE_RETRIES => {
+                warn!("Release header for stripe {stripe_id} ended {result:?}; retrying");
+                let token = self.next_release_token;
+                self.next_release_token += 2;
+                self.pending_release.insert(
+                    token,
+                    PendingRelease {
+                        stripe_id,
+                        retries: pending.retries + 1,
+                    },
+                );
+                self.metadata_flusher.update_stripe_header(
+                    stripe_id,
+                    metadata_flags::FETCHED,
+                    metadata_flags::EVICTED,
+                    token,
+                );
+            }
+            result => {
+                error!(
+                    "Release header for stripe {stripe_id} ended {result:?} after                      {MAX_RELEASE_RETRIES} retries; leaving it evicted"
+                );
+                self.metadata_state
+                    .spill()
+                    .degraded_reasons
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }
@@ -275,20 +403,36 @@ impl BgWorker {
     }
 
     pub fn update(&mut self) {
-        if let Ingest::Inline(fetcher) = &mut self.ingest {
-            fetcher.update();
-            for (stripe_id, success) in fetcher.take_finished_fetches() {
-                if success {
-                    // Unblocks anything waiting on this stripe now, rather than
-                    // once the flusher has worked through the sweep's backlog.
-                    self.metadata_state.mark_stripe_fetched(stripe_id);
-                    self.metadata_flusher.set_stripe_fetched(stripe_id);
-                } else {
-                    error!("Stripe {stripe_id} fetch failed");
-                }
+        let finished = match &mut self.ingest {
+            Ingest::Inline(fetcher) => {
+                fetcher.update();
+                fetcher.take_finished_fetches()
             }
+            Ingest::Pool(_) => Vec::new(),
+        };
+        for (stripe_id, success) in finished {
+            self.stripe_landed(stripe_id, success);
         }
         self.metadata_flusher.update();
+        let outcomes = self.metadata_flusher.take_persist_outcomes();
+        for outcome in outcomes
+            .iter()
+            .filter(|outcome| !Evictor::owns_token(outcome.token))
+        {
+            self.apply_release_outcome(outcome);
+        }
+        let released = self.evictor.as_mut().map(|evictor| {
+            evictor.update(&mut self.metadata_flusher, &outcomes);
+            evictor.take_released()
+        });
+        if let Some((fetches, pushes)) = released {
+            for stripe_id in fetches {
+                self.route_fetch(stripe_id);
+            }
+            for (stripe_id, data, permit) in pushes {
+                self.route_push(stripe_id, data, permit);
+            }
+        }
         if let Ingest::Inline(fetcher) = &mut self.ingest {
             fetcher.disconnect_from_source_if_all_fetched();
         }

@@ -104,8 +104,12 @@ impl HolePuncher for FilePuncher {
 pub struct RecordingPuncher {
     pub punches: std::sync::Arc<std::sync::Mutex<Vec<(u64, u64)>>>,
     pub free: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    /// The next punch fails with EIO and clears this.
+    /// The next punch fails and clears this.
     pub fail_next: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The errno a failed punch reports, as a raw value; 0 means EIO. The
+    /// evictor treats EOPNOTSUPP differently from every other failure, so a
+    /// test has to be able to choose.
+    pub fail_errno: std::sync::Arc<std::sync::atomic::AtomicI32>,
 }
 
 #[cfg(test)]
@@ -115,7 +119,12 @@ impl HolePuncher for RecordingPuncher {
             .fail_next
             .swap(false, std::sync::atomic::Ordering::SeqCst)
         {
-            return Err(Errno::EIO);
+            let raw = self.fail_errno.load(std::sync::atomic::Ordering::SeqCst);
+            return Err(if raw == 0 {
+                Errno::EIO
+            } else {
+                Errno::from_raw(raw)
+            });
         }
         self.punches.lock().unwrap().push((offset, len));
         Ok(())
@@ -145,6 +154,15 @@ mod tests {
             *puncher.punches.lock().unwrap(),
             vec![(0, 512), (1024, 512)]
         );
+
+        // The errno is a choice, so the unsupported case can be exercised.
+        puncher
+            .fail_errno
+            .store(Errno::EOPNOTSUPP as i32, Ordering::SeqCst);
+        puncher.fail_next.store(true, Ordering::SeqCst);
+        assert_eq!(puncher.punch(1536, 512), Err(Errno::EOPNOTSUPP));
+        puncher.punch(2048, 512).unwrap();
+        assert_eq!(puncher.punches.lock().unwrap().len(), 3);
     }
 
     #[test]
