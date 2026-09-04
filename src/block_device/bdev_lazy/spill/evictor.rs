@@ -773,14 +773,22 @@ impl Evictor {
     // ---- draining
 
     /// A stripe is clean when the live snapshot can serve it again: nothing
-    /// written or pushed, the source holds it, and it became resident while the
-    /// subscription was up. Only with clean eviction enabled.
+    /// written or pushed, the source holds it, it became resident while the
+    /// subscription was up, and it never went through the store. Only with
+    /// clean eviction enabled.
+    ///
+    /// IN_S3 on a resident stripe means it came back from the store, and a
+    /// stripe was uploaded because its content could not be trusted to match
+    /// the snapshot (its WRITTEN bit may have been lost to a crash). The round
+    /// trip sets FETCHED_LIVE again, so without this term such a stripe would
+    /// be dropped next time and the snapshot's pre-image served in its place.
     fn clean_predicate(&self, stripe_id: usize) -> bool {
         let flags = self.state.stripe_flags(stripe_id);
         self.cfg.clean_eviction
             && self.state.source_live()
             && !self.state.stripe_written(stripe_id)
             && flags & stripe_flags::PUSHED == 0
+            && flags & stripe_flags::IN_S3 == 0
             && flags & stripe_flags::HAS_SOURCE != 0
             && flags & stripe_flags::FETCHED_LIVE != 0
     }
@@ -1094,9 +1102,15 @@ impl Evictor {
         let flags = self.state.stripe_flags(stripe_id);
         let gone = self.state.stripe_fetch_state(stripe_id) == Evicted
             || flags & stripe_flags::WAS_EVICTED != 0;
-        if gone && (self.state.stripe_written(stripe_id) || flags & stripe_flags::IN_S3 != 0) {
-            // The fork's data is in the store or was written before the
-            // eviction; a pre-image landing now would replace it.
+        if gone && flags & stripe_flags::IN_S3 != 0 {
+            // The fork's data is in the store; a pre-image landing now would
+            // replace it. IN_S3 alone decides: a dirty eviction always PUTs,
+            // so a stripe evicted without it held the snapshot's content, and
+            // WRITTEN on such a stripe is a write still queued behind the
+            // eviction (set at queue time), whose pull the replica refuses
+            // once it has pushed. The push is then the only copy the fork can
+            // get; the fetcher parks it behind that pull and writes it when
+            // the pull is refused.
             return (PushDisposition::Ignore, None);
         }
         (PushDisposition::Forward, Some(permit))

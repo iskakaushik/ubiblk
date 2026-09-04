@@ -187,8 +187,10 @@ spill: ceiling 12884901888, low water 536870912, hard margin 268435456, min free
 
 Watch `status.spill` over RPC. Healthy steady state: `gate == "open"`,
 `degraded == false`, `degraded_reasons == 0`, `puts` growing with
-`evicted_dirty`, `punches == puts` at quiescence (every uploaded stripe was
-punched), `resident_bytes` hovering between `max_local_bytes -
+`evicted_dirty`, `punches == evicted_dirty + evicted_clean` at quiescence
+(every completed eviction was punched; `puts` may run a little ahead of
+`evicted_dirty`, by at most `evictions_aborted`, for uploads whose eviction a
+guest read then aborted), `resident_bytes` hovering between `max_local_bytes -
 low_water_bytes` and `max_local_bytes`.
 
 Things worth an alert:
@@ -217,8 +219,11 @@ it never touches `data_path`.
 
 A `[spill]` section can be added to an existing device: the next start
 rewrites the metadata version to 2.1 and eviction begins once the limits are
-exceeded. Removing the section from a device that has evicted stripes is not
-supported: the evicted stripes' data would be unreachable.
+exceeded. Removing the section from a device that has evicted stripes is
+refused at startup (`metadata has N evicted stripe(s) but the config has no
+[spill] section`): without it the base image would be fetched over the
+punched holes in place of the evicted stripes' data. Restore the section, or
+read every evicted stripe back first.
 
 ## Metrics reference
 

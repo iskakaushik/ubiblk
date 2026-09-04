@@ -460,10 +460,13 @@ fn dirty_eviction_puts_then_flushes_header_then_punches() {
     assert!(!rig.evictor.busy());
 }
 
+/// A stripe carrying the store's IN_S3 hint is never clean (see
+/// `in_s3_hint_makes_a_resident_stripe_dirty`), so a clean eviction starts
+/// from a stripe without it; the header op still clears the bit, belt and
+/// braces against a hint that would read as authoritative under EVICTED.
 #[test]
 fn clean_eviction_writes_header_then_punches_without_put() {
-    // The stale IN_S3 hint from an earlier dirty eviction must go with it.
-    let mut rig = Rig::build(&[(0, CLEAN | metadata_flags::IN_S3)], true, |cfg| {
+    let mut rig = Rig::build(&[(0, CLEAN)], true, |cfg| {
         cfg.clean_eviction = true;
         cfg.max_local_bytes = 0;
     });
@@ -937,8 +940,12 @@ fn push_for_committed_clean_eviction_is_deferred_then_applied() {
     assert_eq!(gate.queued(), 0);
 }
 
+/// WRITTEN on an evicted stripe is a write queued behind the eviction (the
+/// channel sets it at queue time), not data on disk: a stripe evicted without
+/// IN_S3 held the snapshot's content. The replica refuses the pull once it has
+/// pushed, so the push is the only copy the fork can get and must go through.
 #[test]
-fn push_for_evicted_written_stripe_is_ignored() {
+fn push_for_evicted_written_stripe_is_forwarded() {
     let mut rig = Rig::build(
         &[(
             0,
@@ -948,13 +955,24 @@ fn push_for_evicted_written_stripe_is_ignored() {
         |_| {},
     );
     assert_eq!(rig.fetch_state(0), Evicted);
+    assert!(rig.state.stripe_written(0));
     let gate = PushGate::new(4);
     let (disposition, permit) = rig
         .evictor
         .on_pushed_stripe(0, &[0u8; 512], permit_from(&gate));
-    assert_eq!(disposition, PushDisposition::Ignore);
-    assert!(permit.is_none());
-    assert_eq!(gate.queued(), 0);
+    assert_eq!(disposition, PushDisposition::Forward);
+    assert!(permit.is_some(), "the ingest needs the permit");
+    assert_eq!(gate.queued(), 1);
+    drop(permit);
+
+    // Failed with WAS_EVICTED and WRITTEN, still without IN_S3: the same.
+    rig.state.set_stripe_failed(0);
+    assert_eq!(rig.fetch_state(0), Failed);
+    let (disposition, permit) = rig
+        .evictor
+        .on_pushed_stripe(0, &[0u8; 512], permit_from(&gate));
+    assert_eq!(disposition, PushDisposition::Forward);
+    assert!(permit.is_some());
 }
 
 #[test]
@@ -1239,6 +1257,46 @@ fn in_s3_count_drops_when_a_spilled_stripe_is_rematerialised() {
     );
 }
 
+/// A stripe that came back from the store carries IN_S3 as a purge hint, and
+/// the release sets FETCHED_LIVE because the subscription is up. It was
+/// uploaded because its content could not be trusted to match the snapshot,
+/// so it must never be dropped as clean afterwards: the next eviction PUTs
+/// again rather than clearing IN_S3 and routing the re-fetch to base.
+#[test]
+fn rematerialised_from_store_is_never_clean() {
+    let spilled = metadata_flags::EVICTED | metadata_flags::IN_S3 | metadata_flags::HAS_SOURCE;
+    let mut rig = CoordRig::build(&[(0, spilled)], |cfg| {
+        cfg.clean_eviction = true;
+        cfg.max_local_bytes = 0;
+    });
+    rig.state.set_source_live(true);
+    assert_eq!(rig.state.stripe_fetch_state(0), Evicted);
+    // Nothing is resident, so nothing is under pressure yet.
+    rig.run_until(3, |_| false);
+    assert!(rig.punches.lock().unwrap().is_empty());
+
+    // Re-materialised through the pending release, with the store's hint and
+    // the live bit both set: exactly the shape that read as clean before.
+    // The tick that releases it also finds the device over its ceiling and
+    // claims it again, so "left Evicted" is what can be observed.
+    rig.fetch(0);
+    assert!(rig.run_until(30, |r| r.state.stripe_fetch_state(0) != Evicted));
+    assert!(rig.state.stripe_in_s3(0), "the purge hint stays");
+    assert!(rig.state.stripe_fetched_live(0));
+    assert!(!rig.state.stripe_written(0));
+    let content = rig.target_stripe(0);
+
+    // Over the ceiling: the stripe is evicted again, and dirty.
+    assert!(rig.run_until(40, |r| r.state.stripe_fetch_state(0) == Evicted));
+    assert_eq!(rig.state.spill().evicted_dirty.load(Ordering::Relaxed), 1);
+    assert_eq!(rig.state.spill().evicted_clean.load(Ordering::Relaxed), 0);
+    assert_eq!(rig.store.lock().unwrap().put_order, vec![object_name(0)]);
+    assert_eq!(rig.decode_object(0), content);
+    assert_eq!(rig.metadata_dev.header(0), spilled);
+    assert!(rig.state.stripe_in_s3(0));
+    assert_eq!(rig.punches.lock().unwrap().len(), 1);
+}
+
 // ---- selection
 
 #[test]
@@ -1364,6 +1422,21 @@ fn not_fetched_live_is_dirty() {
     assert_eq!(
         kind_under(&[(0, CLEAN)], true, true, stripe_flags::FETCHED_LIVE),
         Kind::Clean
+    );
+}
+
+/// The predicate alone: a resident stripe still carrying the store's hint is
+/// dirty whatever else says clean.
+#[test]
+fn in_s3_hint_makes_a_resident_stripe_dirty() {
+    assert_eq!(
+        kind_under(
+            &[(0, CLEAN | metadata_flags::IN_S3)],
+            true,
+            true,
+            stripe_flags::FETCHED_LIVE
+        ),
+        Kind::Dirty
     );
 }
 

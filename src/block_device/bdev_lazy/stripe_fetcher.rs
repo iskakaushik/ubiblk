@@ -679,8 +679,16 @@ impl StripeFetcher {
         debug!("Fetch completed for stripe {stripe_id}, success={success}");
         self.demand_stripes.remove(&stripe_id);
 
-        // Whatever the outcome, this stripe is no longer waiting on a push.
-        if !self.pending_pushes.contains_key(&stripe_id) {
+        if success {
+            // A pull that succeeded returned the snapshot content the parked
+            // push carries. Writing the push as well would be a second write
+            // of the stripe after the coordinator has released it to the
+            // guest, on top of whatever the guest wrote meanwhile; only a
+            // refused pull needs the parked copy.
+            self.pending_pushes.remove(&stripe_id);
+            self.push_permits.remove(&stripe_id);
+        } else if !self.pending_pushes.contains_key(&stripe_id) {
+            // Failed without a parked push: nothing is waiting on this stripe.
             self.push_permits.remove(&stripe_id);
         }
 
@@ -816,16 +824,23 @@ mod tests {
     #[test]
     fn pushed_stripe_is_applied_after_the_racing_fetch_fails() {
         let mut state = prep(false);
+        state.fetcher.set_expects_pushes(true);
         let pushed = vec![0xAB; (state.fetcher.stripe_sector_count as usize) * SECTOR_SIZE];
 
         // Start a pull and make it fail, the way a pull for a stripe prod has
-        // already copied out fails.
+        // already copied out fails; hold its completion so the push finds it
+        // outstanding.
         state
             .source_dev
             .fail_next
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        state
+            .source_dev
+            .hold_completions
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         state.fetcher.handle_fetch_request(0);
         state.fetcher.update();
+        assert!(state.fetcher.fetch_in_flight(0));
 
         // The push arrives while that pull is still outstanding.
         state
@@ -837,6 +852,10 @@ mod tests {
             "the push waits for the pull rather than racing it to the disk"
         );
 
+        state
+            .source_dev
+            .hold_completions
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         for _ in 0..10 {
             state.fetcher.update();
         }
@@ -923,6 +942,49 @@ mod tests {
             0,
             "and released once the stripe is on the fork's disk"
         );
+    }
+
+    /// A push parked behind a pull that then succeeds is dropped with its slot:
+    /// the pull brought the same snapshot content, and a second write of the
+    /// stripe would land after the coordinator has released it to the guest.
+    #[test]
+    fn a_parked_push_is_dropped_when_the_pull_succeeds() {
+        let mut state = prep(false);
+        let stripe_bytes = (state.fetcher.stripe_sector_count as usize) * SECTOR_SIZE;
+        state
+            .source_dev
+            .write(0, &vec![0x11; stripe_bytes], stripe_bytes);
+        let pushed = vec![0x22; stripe_bytes];
+        let gate = super::super::push_gate::PushGate::new(4);
+
+        // One update puts the pull in flight (its write is waiting on a flush).
+        state.fetcher.handle_fetch_request(0);
+        state.fetcher.update();
+        assert!(state.fetcher.fetch_in_flight(0));
+        state
+            .fetcher
+            .accept_pushed_stripe(0, &pushed, gate.acquire());
+        assert_eq!(gate.queued(), 1, "parked behind the pull");
+
+        for _ in 0..10 {
+            state.fetcher.update();
+        }
+
+        assert_eq!(state.fetcher.take_finished_fetches(), vec![(0, true)]);
+        assert_eq!(
+            state.target_dev.metrics.read().unwrap().writes,
+            1,
+            "the pull's write is the only write of the stripe"
+        );
+        let mut written = vec![0u8; stripe_bytes];
+        state.target_dev.read(0, &mut written, stripe_bytes);
+        assert_eq!(
+            written,
+            vec![0x11; stripe_bytes],
+            "the pulled content stands"
+        );
+        assert!(state.fetcher.pending_pushes.is_empty());
+        assert_eq!(gate.queued(), 0, "the slot went with the dropped push");
     }
 
     /// With no pull in flight the push is written straight away.

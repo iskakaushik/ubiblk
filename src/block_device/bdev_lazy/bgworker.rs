@@ -67,12 +67,19 @@ enum Ingest {
     Pool(IngestPool),
 }
 
-/// A re-materialised stripe whose EVICTED-clearing header is in the flusher.
-/// The guest may not see it as resident before that header is durable: the
-/// startup pass punches every stripe whose header says EVICTED.
+/// A stripe whose data has landed and whose header op is in the flusher: a
+/// re-materialised stripe's EVICTED-clearing header, or a written stripe's
+/// FETCHED header. The guest may not see either as resident before that header
+/// is durable: the startup pass punches every stripe whose header says
+/// EVICTED, and a stripe whose header does not say FETCHED is fetched from
+/// base again on restart, over the write the guest was told had landed.
 struct PendingRelease {
     stripe_id: usize,
     retries: u8,
+    /// Evicted, or Failed with the header still saying EVICTED: lands through
+    /// `mark_stripe_resident`. Otherwise a written NotFetched stripe, which
+    /// the header completion itself lands.
+    from_evicted: bool,
 }
 
 pub struct BgWorker {
@@ -199,21 +206,7 @@ impl BgWorker {
     pub fn process_request(&mut self, req: BgWorkerRequest) {
         match req {
             BgWorkerRequest::Fetch { stripe_id } => {
-                if self
-                    .pending_release
-                    .values()
-                    .any(|pending| pending.stripe_id == stripe_id)
-                {
-                    // The data is local and the header clearing EVICTED is in
-                    // flight; the channel's re-send finds the stripe resident
-                    // once that header is durable.
-                    debug!("Fetch for stripe {stripe_id} dropped: its release is pending");
-                    return;
-                }
-                if self.landing.contains(&stripe_id) {
-                    // Its re-fetch, or a push, is with the ingest already; a
-                    // second pull would land after the release.
-                    debug!("Fetch for stripe {stripe_id} dropped: it is being taken in");
+                if self.stripe_local_or_landing(stripe_id) {
                     return;
                 }
                 if let Some(evictor) = &mut self.evictor {
@@ -245,6 +238,16 @@ impl BgWorker {
                         0,
                     );
                 }
+                if self.release_pending(stripe_id) {
+                    // The stripe's content is local already, a pull of the
+                    // same snapshot stripe or this push's twin, and its
+                    // header is in flight. Forwarding would put the stripe
+                    // back in `landing` with an ingest that finds it resident
+                    // and reports nothing, leaving every later Fetch for it
+                    // dropped. The permit goes with the push.
+                    debug!("Push for stripe {stripe_id} dropped: its release is pending");
+                    return;
+                }
                 let permit = match &mut self.evictor {
                     None => permit,
                     Some(evictor) => match evictor.on_pushed_stripe(stripe_id, &data, permit) {
@@ -265,6 +268,31 @@ impl BgWorker {
                 self.done = true;
             }
         }
+    }
+
+    fn release_pending(&self, stripe_id: usize) -> bool {
+        self.pending_release
+            .values()
+            .any(|pending| pending.stripe_id == stripe_id)
+    }
+
+    /// Whether a `Fetch { S }` has nothing to do: S's data is local with its
+    /// header in flight, or a pull or push for it is with the ingest already.
+    /// Forwarding either would start a second pull whose write lands after the
+    /// guest has the stripe back. Every route a fetch takes to the ingest,
+    /// the guest's request and the evictor's released ones alike, asks here.
+    fn stripe_local_or_landing(&self, stripe_id: usize) -> bool {
+        if self.release_pending(stripe_id) {
+            // The channel's re-send finds the stripe resident once the header
+            // is durable.
+            debug!("Fetch for stripe {stripe_id} dropped: its release is pending");
+            return true;
+        }
+        if self.landing.contains(&stripe_id) {
+            debug!("Fetch for stripe {stripe_id} dropped: it is being taken in");
+            return true;
+        }
+        false
     }
 
     /// Remember a stripe that is not local when it goes to the ingest, so
@@ -304,56 +332,77 @@ impl BgWorker {
     /// at once; an evicted one (or a Failed one whose header still says
     /// EVICTED) is released only when the header clearing EVICTED is durable,
     /// because the startup pass punches every stripe whose header says so.
+    ///
+    /// With spill, a never-evicted stripe with a guest write queued on it
+    /// (WRITTEN is set in memory at queue time under track_written) waits for
+    /// its FETCHED header too. Released at once, the write would pass to base
+    /// and be acknowledged while the header sits in the flusher's queue; a
+    /// crash before it reaches the disk restarts the stripe as NotFetched and
+    /// fetches the base image over the acknowledged write. A stripe with only
+    /// reads waiting loses nothing to that order, so it keeps landing at once.
+    ///
+    /// What this does not cover: a write that arrives after a read landed the
+    /// stripe and before that landing's fire-and-forget SetFetched is flushed
+    /// passes on the in-memory state and is acknowledged under a header that
+    /// may not be durable yet. Closing that window needs the channel to hold
+    /// writes on a per-stripe "FETCHED durable" bit the flusher clears.
     fn stripe_landed(&mut self, stripe_id: usize, success: bool) {
         self.landing.remove(&stripe_id);
         if !success {
             error!("Stripe {stripe_id} fetch failed");
             return;
         }
-        let state = self.metadata_state.stripe_fetch_state(stripe_id);
-        if state == Evicted
-            || self.metadata_state.stripe_flags(stripe_id) & stripe_flags::WAS_EVICTED != 0
-        {
-            if self
-                .pending_release
-                .values()
-                .any(|pending| pending.stripe_id == stripe_id)
-            {
-                // Landed twice (a released push written behind the re-fetch,
-                // with the same content): the op in flight releases it once.
-                debug!("Stripe {stripe_id} landed again while its release is pending");
-                return;
-            }
-            let token = self.next_release_token;
-            self.next_release_token += 2;
-            self.pending_release.insert(
-                token,
-                PendingRelease {
-                    stripe_id,
-                    retries: 0,
-                },
-            );
-            self.metadata_flusher.update_stripe_header(
-                stripe_id,
-                metadata_flags::FETCHED,
-                metadata_flags::EVICTED,
-                token,
-            );
-            #[cfg(feature = "fault-injection")]
-            if let Some(evictor) = &self.evictor {
-                evictor.crash_if_at(CrashPoint::DuringRefetch);
-            }
-        } else {
+        let from_evicted = self.metadata_state.stripe_fetch_state(stripe_id) == Evicted
+            || self.metadata_state.stripe_flags(stripe_id) & stripe_flags::WAS_EVICTED != 0;
+        let durable_first = from_evicted
+            || (self.evictor.is_some() && self.metadata_state.stripe_written(stripe_id));
+        if !durable_first {
             // Unblocks anything waiting on this stripe now, rather than once
             // the flusher has worked through the sweep's backlog.
             self.metadata_state.mark_stripe_fetched(stripe_id);
             self.metadata_flusher.set_stripe_fetched(stripe_id);
+            return;
+        }
+        if self.release_pending(stripe_id) {
+            // Landed twice (a released push written behind the re-fetch,
+            // with the same content): the op in flight releases it once.
+            debug!("Stripe {stripe_id} landed again while its release is pending");
+            return;
+        }
+        self.issue_release(stripe_id, 0, from_evicted);
+        #[cfg(feature = "fault-injection")]
+        if from_evicted {
+            if let Some(evictor) = &self.evictor {
+                evictor.crash_if_at(CrashPoint::DuringRefetch);
+            }
         }
     }
 
+    /// Hand the flusher the tokened {set FETCHED, clear EVICTED} op that lands
+    /// `stripe_id` once durable, and remember it under the token.
+    fn issue_release(&mut self, stripe_id: usize, retries: u8, from_evicted: bool) {
+        let token = self.next_release_token;
+        self.next_release_token += 2;
+        self.pending_release.insert(
+            token,
+            PendingRelease {
+                stripe_id,
+                retries,
+                from_evicted,
+            },
+        );
+        self.metadata_flusher.update_stripe_header(
+            stripe_id,
+            metadata_flags::FETCHED,
+            metadata_flags::EVICTED,
+            token,
+        );
+    }
+
     /// The flusher finished a release op. Durable lands the stripe; anything
-    /// else is retried a few times with a fresh token and then given up on,
-    /// leaving the stripe Evicted for the guest's next fetch to re-write.
+    /// else is retried a few times with a fresh token and then given up on:
+    /// an evicted stripe is left Evicted for the guest's next fetch to
+    /// re-write, a written one is released the way an unwritten one lands.
     fn apply_release_outcome(&mut self, outcome: &PersistOutcome) {
         let Some(pending) = self.pending_release.remove(&outcome.token) else {
             error!(
@@ -363,37 +412,55 @@ impl BgWorker {
             return;
         };
         let stripe_id = pending.stripe_id;
+        if outcome.result != PersistResult::Durable && pending.retries < MAX_RELEASE_RETRIES {
+            warn!(
+                "Release header for stripe {stripe_id} ended {:?}; retrying",
+                outcome.result
+            );
+            self.issue_release(stripe_id, pending.retries + 1, pending.from_evicted);
+            return;
+        }
+        // The release is over either way. A push forwarded for the stripe
+        // while its pull was landing may have put it back in `landing` with
+        // an ingest that found it resident and reported nothing; an entry
+        // left here would drop every later Fetch for the stripe.
+        self.landing.remove(&stripe_id);
         match outcome.result {
-            PersistResult::Durable => {
+            PersistResult::Durable if pending.from_evicted => {
                 debug!("Stripe {stripe_id} re-materialised");
                 self.metadata_state.mark_stripe_resident(stripe_id);
             }
-            result if pending.retries < MAX_RELEASE_RETRIES => {
-                warn!("Release header for stripe {stripe_id} ended {result:?}; retrying");
-                let token = self.next_release_token;
-                self.next_release_token += 2;
-                self.pending_release.insert(
-                    token,
-                    PendingRelease {
-                        stripe_id,
-                        retries: pending.retries + 1,
-                    },
-                );
-                self.metadata_flusher.update_stripe_header(
-                    stripe_id,
-                    metadata_flags::FETCHED,
-                    metadata_flags::EVICTED,
-                    token,
-                );
+            PersistResult::Durable => {
+                // The flusher's completion landed it already (its header
+                // carries FETCHED); this is the landing if it somehow did not.
+                debug!("Stripe {stripe_id} landed with its FETCHED header durable");
+                self.metadata_state.mark_stripe_fetched(stripe_id);
             }
-            result => {
+            result if pending.from_evicted => {
                 error!(
-                    "Release header for stripe {stripe_id} ended {result:?} after                      {MAX_RELEASE_RETRIES} retries; leaving it evicted"
+                    "Release header for stripe {stripe_id} ended {result:?} after \
+                     {MAX_RELEASE_RETRIES} retries; leaving it evicted"
                 );
                 self.metadata_state
                     .spill()
                     .degraded_reasons
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            result => {
+                // Left NotFetched, the write queued on it would wait for good:
+                // the channel re-sends a Fetch only for an Evicting or Evicted
+                // front. Release it as an unwritten stripe is released, and
+                // count the exposure to a restart re-fetching over the write.
+                error!(
+                    "FETCHED header for written stripe {stripe_id} ended {result:?} after \
+                     {MAX_RELEASE_RETRIES} retries; releasing it with the header not known durable"
+                );
+                self.metadata_state
+                    .spill()
+                    .degraded_reasons
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.metadata_state.mark_stripe_fetched(stripe_id);
+                self.metadata_flusher.set_stripe_fetched(stripe_id);
             }
         }
     }
@@ -477,6 +544,11 @@ impl BgWorker {
         });
         if let Some((fetches, pushes)) = released {
             for stripe_id in fetches {
+                // A fetch held for space may have been overtaken by a push
+                // (pushes are not gated) that has since landed.
+                if self.stripe_local_or_landing(stripe_id) {
+                    continue;
+                }
                 self.route_fetch(stripe_id);
             }
             for (stripe_id, data, permit) in pushes {
@@ -655,6 +727,48 @@ mod tests {
             4096,
             false,
             false,
+            state.clone(),
+            receiver,
+            Some(evictor),
+        )
+        .unwrap();
+        EvictorRig {
+            worker,
+            sender,
+            state,
+            source_dev,
+            target_dev,
+            metadata_dev,
+        }
+    }
+
+    /// Inline ingest over the composite source a fork runs with, expecting
+    /// pushes: a pull of an evicted stripe is refused by metadata once the
+    /// stripe was pushed, and the fetcher then applies the parked push.
+    fn build_bg_worker_with_spilling_source(headers: &[(usize, u8)]) -> EvictorRig {
+        let (target_dev, metadata_dev, state) = rig_devices(headers);
+        let source_dev = TestBlockDevice::new(RIG_STRIPES as u64 * RIG_STRIPE_BYTES);
+        let base = Box::new(
+            stripe_source::BlockDeviceStripeSource::new(
+                BlockDevice::clone(&source_dev),
+                RIG_STRIPE_SECTORS,
+            )
+            .unwrap(),
+        );
+        let stripe_source = Box::new(stripe_source::SpillingStripeSource::new(
+            base,
+            None,
+            state.clone(),
+        ));
+        let evictor = rig_evictor(&target_dev, &state, 1 << 30, 1 << 40);
+        let (sender, receiver) = channel();
+        let worker = BgWorker::new(
+            stripe_source,
+            &target_dev,
+            &metadata_dev,
+            4096,
+            false,
+            true,
             state.clone(),
             receiver,
             Some(evictor),
@@ -1131,6 +1245,352 @@ mod tests {
             panic!("inline ingest expected");
         };
         assert!(fetcher.busy());
+    }
+
+    /// A stripe with a guest write queued on it (WRITTEN set at queue time)
+    /// is released only once its FETCHED header is durable, so the write the
+    /// guest is then told has landed cannot be undone by a restart that finds
+    /// the stripe NotFetched and fetches the base image over it.
+    #[test]
+    fn written_stripe_lands_only_when_its_fetched_header_is_durable() {
+        use crate::block_device::metadata_flags;
+
+        let unfetched = metadata_flags::HAS_SOURCE;
+        let mut rig = build_bg_worker_with_evictor(&[(0, unfetched), (1, unfetched)], 1 << 30);
+        assert_eq!(rig.state.stripe_fetch_state(0), NotFetched);
+        let (fetched, resident) = (rig.state.fetched_stripes(), rig.state.resident_stripes());
+        let degraded_before = rig
+            .state
+            .spill()
+            .degraded_reasons
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        // The channel queued a write: WRITTEN in memory, before any data.
+        rig.state.mark_stripe_written(0);
+        rig.worker.process_request(BgWorkerRequest::FetchCompleted {
+            stripe_id: 0,
+            success: true,
+        });
+        assert_eq!(
+            rig.state.stripe_fetch_state(0),
+            NotFetched,
+            "not released yet"
+        );
+        assert_eq!(rig.state.fetched_stripes(), fetched);
+        assert_eq!(rig.state.resident_stripes(), resident);
+        assert_eq!(rig.worker.pending_release.len(), 1);
+        assert_eq!(rig.worker.pending_release[&2].stripe_id, 0);
+        assert!(!rig.worker.pending_release[&2].from_evicted);
+
+        // A fetch for it meanwhile is dropped, as for a re-materialisation.
+        rig.worker
+            .process_request(BgWorkerRequest::Fetch { stripe_id: 0 });
+        let Ingest::Inline(fetcher) = &rig.worker.ingest else {
+            panic!("inline ingest expected");
+        };
+        assert!(!fetcher.busy());
+
+        for _ in 0..4 {
+            rig.worker.update();
+        }
+        assert_eq!(rig.state.stripe_fetch_state(0), Fetched);
+        assert!(rig.state.stripe_written(0));
+        assert_eq!(rig.state.fetched_stripes(), fetched + 1);
+        assert_eq!(rig.state.resident_stripes(), resident + 1);
+        assert!(rig.worker.pending_release.is_empty());
+        let header = UbiMetadata::load_from_bdev(&rig.metadata_dev)
+            .unwrap()
+            .stripe_header(0);
+        assert_ne!(
+            header & metadata_flags::FETCHED,
+            0,
+            "durable before release"
+        );
+        assert_eq!(
+            rig.state
+                .spill()
+                .degraded_reasons
+                .load(std::sync::atomic::Ordering::Relaxed),
+            degraded_before,
+            "the header completion and the outcome land it once, quietly"
+        );
+
+        // A stripe with only reads waiting still lands at once.
+        rig.worker.process_request(BgWorkerRequest::FetchCompleted {
+            stripe_id: 1,
+            success: true,
+        });
+        assert_eq!(rig.state.stripe_fetch_state(1), Fetched);
+        assert!(rig.worker.pending_release.is_empty());
+
+        // Without an evictor nothing changes: a written stripe lands at once.
+        let (mut plain, _sender) = build_bg_worker();
+        plain.shared_state().mark_stripe_written(0);
+        plain.process_request(BgWorkerRequest::FetchCompleted {
+            stripe_id: 0,
+            success: true,
+        });
+        assert_eq!(plain.shared_state().stripe_fetch_state(0), Fetched);
+        assert!(plain.pending_release.is_empty());
+    }
+
+    /// When the FETCHED header cannot be made durable the written stripe is
+    /// still released, the way every stripe was released before, rather than
+    /// holding the guest's write for good; the exposure is counted.
+    #[test]
+    fn written_stripe_landing_falls_back_after_failed_retries() {
+        use crate::block_device::metadata_flags;
+
+        let mut rig = build_bg_worker_with_evictor(&[(0, metadata_flags::HAS_SOURCE)], 1 << 30);
+        let degraded_before = rig
+            .state
+            .spill()
+            .degraded_reasons
+            .load(std::sync::atomic::Ordering::Relaxed);
+        rig.state.mark_stripe_written(0);
+        rig.worker.process_request(BgWorkerRequest::FetchCompleted {
+            stripe_id: 0,
+            success: true,
+        });
+
+        for attempt in 0..4u64 {
+            assert_eq!(rig.worker.pending_release.len(), 1);
+            assert_eq!(
+                rig.worker.pending_release[&(2 + 2 * attempt)].retries,
+                attempt as u8
+            );
+            assert_eq!(rig.state.stripe_fetch_state(0), NotFetched);
+            rig.metadata_dev
+                .fail_next
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            rig.worker.update();
+        }
+        assert!(rig.worker.pending_release.is_empty(), "given up");
+        assert_eq!(rig.state.stripe_fetch_state(0), Fetched, "released anyway");
+        assert_eq!(
+            rig.state
+                .spill()
+                .degraded_reasons
+                .load(std::sync::atomic::Ordering::Relaxed),
+            degraded_before + 1
+        );
+        // The fire-and-forget SetFetched goes out behind it.
+        for _ in 0..4 {
+            rig.worker.update();
+        }
+        let header = UbiMetadata::load_from_bdev(&rig.metadata_dev)
+            .unwrap()
+            .stripe_header(0);
+        assert_ne!(header & metadata_flags::FETCHED, 0);
+    }
+
+    /// A push for a stripe whose pull has landed and whose release is pending
+    /// carries the same content and is dropped with its permit. Forwarded, a
+    /// pool worker could take it in after the release, find the stripe local
+    /// and report nothing, and the stripe would sit in `landing` for good,
+    /// every later Fetch for it dropped and the guest hung.
+    #[test]
+    fn push_during_pending_release_is_dropped_and_the_stripe_can_be_fetched_again() {
+        use crate::block_device::{metadata_flags, PushGate};
+
+        let evicted = metadata_flags::EVICTED | metadata_flags::HAS_SOURCE;
+        let mut rig = build_bg_worker_with_pool_and_evictor(&[(0, evicted)], 1 << 30);
+        let gate = PushGate::new(2);
+
+        // The worker reported the pull; the release header is in flight.
+        rig.worker.process_request(BgWorkerRequest::FetchCompleted {
+            stripe_id: 0,
+            success: true,
+        });
+        assert_eq!(rig.worker.pending_release.len(), 1);
+        rig.worker.process_request(BgWorkerRequest::PushedStripe {
+            stripe_id: 0,
+            data: vec![0xEE; RIG_STRIPE_BYTES as usize],
+            permit: gate.acquire(),
+        });
+        assert!(rig.state.stripe_pushed(0), "recorded all the same");
+        assert_eq!(gate.queued(), 0, "dropped with its permit");
+        assert!(!rig.worker.landing.contains(&0));
+        // Nothing reached the worker: a forwarded push would be written and
+        // reported back.
+        assert!(matches!(
+            rig.worker
+                .req_receiver
+                .recv_timeout(Duration::from_millis(300)),
+            Err(RecvTimeoutError::Timeout)
+        ));
+        assert_eq!(rig.target_dev.metrics.read().unwrap().writes, 0);
+
+        for _ in 0..4 {
+            rig.worker.update();
+        }
+        assert_eq!(rig.state.stripe_fetch_state(0), Fetched);
+        assert!(!rig.worker.landing.contains(&0));
+
+        // Evicted again later, a Fetch for it reaches the worker.
+        rig.state.set_stripe_fetch_state_for_test(0, Evicted);
+        rig.worker
+            .process_request(BgWorkerRequest::Fetch { stripe_id: 0 });
+        match rig.worker.req_receiver.recv_timeout(Duration::from_secs(5)) {
+            Ok(BgWorkerRequest::FetchCompleted { stripe_id, .. }) => assert_eq!(stripe_id, 0),
+            _ => panic!("the pool worker should have been given stripe 0"),
+        }
+        rig.worker.process_request(BgWorkerRequest::Shutdown);
+        rig.worker.run();
+    }
+
+    /// Backstop for the same hang: whatever put a stripe back in `landing`
+    /// while its release was pending, the release ending takes it out.
+    #[test]
+    fn landing_is_cleared_when_the_release_ends() {
+        use crate::block_device::metadata_flags;
+
+        let evicted = metadata_flags::EVICTED | metadata_flags::HAS_SOURCE;
+        let mut rig = build_bg_worker_with_evictor(&[(0, evicted)], 1 << 30);
+        rig.worker.process_request(BgWorkerRequest::FetchCompleted {
+            stripe_id: 0,
+            success: true,
+        });
+        rig.worker.landing.insert(0);
+        for _ in 0..4 {
+            rig.worker.update();
+        }
+        assert_eq!(rig.state.stripe_fetch_state(0), Fetched);
+        assert!(!rig.worker.landing.contains(&0), "cleared on Durable");
+
+        // And when the release is given up on.
+        let mut rig = build_bg_worker_with_evictor(&[(0, evicted)], 1 << 30);
+        rig.worker.process_request(BgWorkerRequest::FetchCompleted {
+            stripe_id: 0,
+            success: true,
+        });
+        rig.worker.landing.insert(0);
+        for _ in 0..4 {
+            rig.metadata_dev
+                .fail_next
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            rig.worker.update();
+        }
+        assert!(rig.worker.pending_release.is_empty());
+        assert_eq!(rig.state.stripe_fetch_state(0), Evicted);
+        assert!(!rig.worker.landing.contains(&0), "cleared on giving up");
+        rig.worker
+            .process_request(BgWorkerRequest::Fetch { stripe_id: 0 });
+        let Ingest::Inline(fetcher) = &rig.worker.ingest else {
+            panic!("inline ingest expected");
+        };
+        assert!(fetcher.busy(), "the next fetch is forwarded");
+    }
+
+    /// A fetch held under GATE_HOLD can be overtaken by a push (pushes are not
+    /// gated) that lands and sits in pending release. Released when the gate
+    /// reopens, it must meet the same guards as a fresh Fetch: forwarded, the
+    /// fetcher would see a Fetched entry under a still-Evicted stripe and
+    /// pull again, over the pushed copy and after the guest has it back.
+    #[test]
+    fn released_fetch_is_dropped_while_the_stripe_is_in_pending_release() {
+        use crate::block_device::{metadata_flags, PushGate, GATE_HOLD, GATE_OPEN};
+
+        let evicted = metadata_flags::EVICTED | metadata_flags::HAS_SOURCE;
+        let mut rig = build_bg_worker_with_evictor(&[(0, evicted)], 1 << 30);
+        let pushed = vec![0xEE; RIG_STRIPE_BYTES as usize];
+        let gate = PushGate::new(2);
+
+        rig.state.set_write_gate(GATE_HOLD);
+        rig.worker
+            .process_request(BgWorkerRequest::Fetch { stripe_id: 0 });
+        let Ingest::Inline(fetcher) = &rig.worker.ingest else {
+            panic!("inline ingest expected");
+        };
+        assert!(!fetcher.busy(), "held for space");
+        assert!(!rig.worker.landing.contains(&0));
+
+        rig.worker.process_request(BgWorkerRequest::PushedStripe {
+            stripe_id: 0,
+            data: pushed.clone(),
+            permit: gate.acquire(),
+        });
+        assert!(rig.worker.landing.contains(&0), "forwarded");
+        // The push lands in the fetcher before the coordinator ticks, the way
+        // a pool worker runs ahead of this thread.
+        let Ingest::Inline(fetcher) = &mut rig.worker.ingest else {
+            panic!("inline ingest expected");
+        };
+        for _ in 0..10 {
+            fetcher.update();
+        }
+        assert_eq!(rig.state.stripe_fetch_state(0), Evicted);
+
+        // One tick takes the landing into pending release and, with nothing
+        // under pressure, reopens the gate and releases the held fetch.
+        rig.worker.update();
+        assert_eq!(rig.state.write_gate(), GATE_OPEN);
+        assert_eq!(rig.worker.pending_release.len(), 1);
+        for _ in 0..4 {
+            rig.worker.update();
+        }
+        assert_eq!(rig.state.stripe_fetch_state(0), Fetched);
+        assert_eq!(
+            rig.source_dev.metrics.read().unwrap().reads,
+            0,
+            "the released fetch must not pull over the pushed copy"
+        );
+        assert_eq!(rig.target_dev.metrics.read().unwrap().writes, 1);
+        let mut written = vec![0u8; pushed.len()];
+        rig.target_dev.read(0, &mut written, pushed.len());
+        assert_eq!(written, pushed);
+        assert!(!rig.worker.landing.contains(&0));
+    }
+
+    /// An evicted clean stripe with a guest write queued on it carries WRITTEN
+    /// (set at queue time) but holds none of the fork's data: the write waits
+    /// for the stripe to come back. The pull goes out, the replica copies the
+    /// stripe out, pushes it and refuses the pull. The push is the only copy
+    /// the fork can get, so it must land; ignored, the guest gets EIO for good.
+    #[test]
+    fn push_lands_an_evicted_stripe_whose_queued_write_set_written() {
+        use crate::block_device::{metadata_flags, PushGate};
+
+        let evicted = metadata_flags::EVICTED | metadata_flags::HAS_SOURCE;
+        let mut rig = build_bg_worker_with_spilling_source(&[(0, evicted)]);
+        rig.state.set_source_live(true);
+        let pushed = vec![0xEE; RIG_STRIPE_BYTES as usize];
+        let gate = PushGate::new(2);
+
+        // The guest's write queues: WRITTEN in memory, a Fetch to us.
+        rig.state.mark_stripe_written(0);
+        rig.worker
+            .process_request(BgWorkerRequest::Fetch { stripe_id: 0 });
+        assert!(
+            rig.worker.landing.contains(&0),
+            "the pull is with the ingest"
+        );
+
+        // The replica pushes before the pull is served.
+        rig.worker.process_request(BgWorkerRequest::PushedStripe {
+            stripe_id: 0,
+            data: pushed.clone(),
+            permit: gate.acquire(),
+        });
+        assert!(rig.state.stripe_pushed(0));
+        assert_eq!(gate.queued(), 1, "forwarded: the ingest holds the slot");
+
+        for _ in 0..12 {
+            rig.worker.update();
+        }
+        assert_eq!(rig.state.stripe_fetch_state(0), Fetched);
+        assert!(rig.state.stripe_written(0));
+        assert_eq!(
+            rig.source_dev.metrics.read().unwrap().reads,
+            0,
+            "the pull was refused by metadata, never served by base"
+        );
+        let mut written = vec![0u8; pushed.len()];
+        rig.target_dev.read(0, &mut written, pushed.len());
+        assert_eq!(written, pushed, "the push is the stripe's content");
+        assert_eq!(gate.queued(), 0);
+        assert!(!rig.worker.landing.contains(&0));
+        assert!(rig.worker.pending_release.is_empty());
     }
 
     #[test]

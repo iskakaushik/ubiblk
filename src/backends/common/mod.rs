@@ -269,7 +269,24 @@ impl BackendEnv {
         // Everything spill needs that may block (the key GET) or fail loudly
         // happens here on the main thread, before any device is offered.
         let spill_runtime = match &config.spill {
-            None => None,
+            None => {
+                // An evicted stripe's only copy is in the store (or, evicted
+                // clean, behind a re-pull the composite source routes). Without
+                // the section the plain source would fetch the base image over
+                // the punched hole and the release would clear EVICTED: the
+                // fork's data replaced with the snapshot's, silently.
+                let evicted = metadata.evicted_stripe_ids().len();
+                if evicted > 0 {
+                    return Err(crate::ubiblk_error!(InvalidParameter {
+                        description: format!(
+                            "metadata has {evicted} evicted stripe(s) but the config has no \
+                             [spill] section; restore the section this device was evicting \
+                             under before starting it"
+                        ),
+                    }));
+                }
+                None
+            }
             Some(section) => {
                 spill_setup::check_spill_preconditions(config)?;
                 let runtime = spill_setup::build_spill_runtime(
@@ -1499,6 +1516,46 @@ mod tests {
         config.device.data_path = PathBuf::from("/dev/null");
         let err = BackendEnv::build(&config).err().unwrap().to_string();
         assert!(err.contains("regular file"), "{err}");
+    }
+
+    /// A 2.1 metadata file with EVICTED stripes started without `[spill]`
+    /// would have the plain source pull the base image over the punched
+    /// holes, replacing the fork's spilled data; the build refuses instead.
+    #[test]
+    fn build_backend_env_refuses_evicted_stripes_without_spill() {
+        use crate::block_device::metadata_flags;
+
+        let metadata_file = tempfile::NamedTempFile::new().unwrap();
+        metadata_file.as_file().set_len(1024 * 1024).unwrap();
+        let disk_file = tempfile::NamedTempFile::new().unwrap();
+        disk_file.as_file().set_len(4 * 1024 * 1024).unwrap();
+
+        let mut config = test_config(disk_file.path(), Some(metadata_file.path()), None);
+        config.device.device_id = "fork-1".to_string();
+        config.device.track_written = true;
+        config.spill = Some(test_spill_section(None));
+        init_metadata(&config, 11).unwrap();
+
+        // What a run under [spill] leaves behind: two evicted stripes, one
+        // of them in the store.
+        let metadata_dev = build_block_device(metadata_file.path(), &config, false).unwrap();
+        let mut metadata = UbiMetadata::load_from_bdev(&*metadata_dev).unwrap();
+        metadata.set_stripe_header(1, metadata_flags::EVICTED | metadata_flags::HAS_SOURCE);
+        metadata.set_stripe_header(
+            2,
+            metadata_flags::EVICTED | metadata_flags::IN_S3 | metadata_flags::HAS_SOURCE,
+        );
+        metadata.save_to_bdev(&*metadata_dev).unwrap();
+        drop(metadata_dev);
+
+        config.spill = None;
+        let err = BackendEnv::build(&config).err().unwrap().to_string();
+        assert!(err.contains("2 evicted stripe(s)"), "{err}");
+        assert!(err.contains("[spill]"), "{err}");
+
+        // With the section back the same file starts.
+        config.spill = Some(test_spill_section(None));
+        BackendEnv::build(&config).expect("starts under [spill]");
     }
 
     #[test]

@@ -176,11 +176,6 @@ class Model:
     def acknowledged_stripes(self):
         return {b // BLOCKS_PER_STRIPE for b in self.gen}
 
-    def forget_stripe(self, stripe):
-        """Expect the base image again for a stripe the device lost."""
-        for b in range(stripe * BLOCKS_PER_STRIPE, (stripe + 1) * BLOCKS_PER_STRIPE):
-            self.gen.pop(b, None)
-
     def describe(self, block, data):
         """Say what a mismatching block looks like, for the failure message."""
         tag, blk, gen, _ = struct.unpack("<IIII", data[:16])
@@ -679,17 +674,30 @@ class Cases(Suite):
             return set()
         return {int(n) for n in os.listdir(d) if n.isdigit()}
 
+    @staticmethod
+    def evictions_completed(sp):
+        return sp["evicted_dirty"] + sp["evicted_clean"]
+
     def wait_quiescent(self, timeout=120.0):
         """Wait until the evictor has nothing in flight: the counters stop
-        moving, the gate is open and every successful PUT has its punch."""
+        moving, the gate is open and every completed eviction has its punch.
+        ``punches == puts`` is not the invariant: an eviction aborted by a
+        guest Fetch while its PUT was in flight counts the PUT and never
+        punches (the stale completion is discarded)."""
         deadline = time.monotonic() + timeout
         last, since = None, time.monotonic()
         while True:
             sp = self.backend.spill()
-            key = (sp["puts"], sp["punches"], sp["evicted"], sp["resident"], sp["gate"])
+            key = (
+                sp["puts"], sp["punches"], sp["punch_failures"], sp["evicted_dirty"], sp["evicted_clean"],
+                sp["evicted"], sp["resident"], sp["gate"],
+            )
             if key != last:
                 last, since = key, time.monotonic()
-            settled = sp["gate"] == "open" and sp["puts"] - sp["put_failures"] == sp["punches"]
+            settled = (
+                sp["gate"] == "open"
+                and self.evictions_completed(sp) == sp["punches"] + sp["punch_failures"]
+            )
             if settled and time.monotonic() - since >= 2.0:
                 return sp
             if time.monotonic() > deadline:
@@ -777,6 +785,30 @@ class Cases(Suite):
 
     # --- shared assertions ---------------------------------------------------
 
+    def check_eviction_accounting(self, problems, sp):
+        """The counters' real invariants at quiescence. Every completed
+        eviction punches exactly once; every dirty one had a successful PUT;
+        a successful PUT without a completed eviction is an eviction a guest
+        Fetch aborted during its PUT, so those are bounded by the aborts."""
+        completed = self.evictions_completed(sp)
+        good_puts = sp["puts"] - sp["put_failures"]
+        self.check(
+            problems,
+            completed == sp["punches"] + sp["punch_failures"],
+            f"evicted_dirty + evicted_clean {completed} != punches {sp['punches']} + punch_failures {sp['punch_failures']}",
+        )
+        self.check(
+            problems,
+            good_puts >= sp["evicted_dirty"],
+            f"successful puts {good_puts} < evicted_dirty {sp['evicted_dirty']}",
+        )
+        self.check(
+            problems,
+            good_puts - sp["evicted_dirty"] <= sp["evictions_aborted"],
+            f"{good_puts - sp['evicted_dirty']} PUTs without a completed eviction, "
+            f"more than the {sp['evictions_aborted']} aborted evictions",
+        )
+
     def check_counters(self, problems, sp, expect_stalls=None):
         self.check(problems, sp["evicted_dirty"] > 0, f"evicted_dirty is {sp['evicted_dirty']}")
         self.check(problems, sp["puts"] >= sp["in_s3"], f"puts {sp['puts']} < in_s3 {sp['in_s3']}")
@@ -785,11 +817,7 @@ class Cases(Suite):
         self.check(problems, sp["degraded_reasons"] == 0, f"degraded_reasons {sp['degraded_reasons']}")
         self.check(problems, not sp["degraded"], "store is degraded")
         self.check(problems, sp["gate"] == "open", f"gate is {sp['gate']}")
-        self.check(
-            problems,
-            sp["punches"] == sp["puts"] - sp["put_failures"],
-            f"punches {sp['punches']} != successful puts {sp['puts'] - sp['put_failures']}",
-        )
+        self.check_eviction_accounting(problems, sp)
         if expect_stalls == 0:
             self.check(problems, sp["stalls"] == 0, f"stalls {sp['stalls']} in steady state")
         elif expect_stalls == "some":
@@ -1051,19 +1079,18 @@ class Cases(Suite):
                 f"crashed after {len(acked)} acknowledged stripes; {len(evicted)} EVICTED on disk, "
                 f"{len(allocated_before)} of them with allocated blocks before restart"
             )
-            # A stripe the guest wrote whose header says neither FETCHED nor
-            # EVICTED had its SetFetched still queued in the flusher when the
-            # process died; on restart it is NotFetched and is fetched from the
-            # base image again, so the acknowledged writes are gone. That is
-            # bdev_lazy's pre-existing in-memory-first landing (spill/base
-            # bgworker.rs: mark_stripe_fetched before set_stripe_fetched), not
-            # the spill path; expect the base image for those and report them.
+            # An acknowledged write sits under a durable header: FETCHED (the
+            # coordinator lands a written stripe only once its FETCHED header
+            # is durable) or EVICTED with the data in the store. A stripe the
+            # guest wrote whose header says neither would restart as
+            # NotFetched and have the base image fetched over the write, so
+            # it is a failure here, not something to expect the base image
+            # for.
             lost = sorted(acked - md["fetched"] - evicted)
-            for stripe in lost:
-                self.model.forget_stripe(stripe)
-            notes.append(
-                f"{len(lost)} acknowledged stripes had no durable FETCHED header at the crash "
-                f"(pre-existing bdev_lazy gap; re-fetched from the base image on restart): {lost[:8]}"
+            self.check(
+                problems, not lost,
+                f"{len(lost)} acknowledged stripes have no durable FETCHED or EVICTED header "
+                f"(their writes would be lost to the restart): {lost[:8]}",
             )
             if point in ("after_header_flush", "during_refetch"):
                 self.check(
@@ -1232,7 +1259,7 @@ class Cases(Suite):
             sp = self.wait_quiescent()
             self.check(problems, sp["stalls"] >= 1, "no stall counted")
             self.check(problems, sp["put_failures"] >= 1, "no PUT failure counted")
-            self.check(problems, sp["punches"] == sp["puts"] - sp["put_failures"], f"punches {sp['punches']} != successful puts")
+            self.check_eviction_accounting(problems, sp)
             self.check(problems, not sp["degraded"], "still degraded after restore")
             self.check(problems, sp["degraded_reasons"] == 0, f"degraded_reasons {sp['degraded_reasons']}")
             notes.append(f"final: puts {sp['puts']}, put_failures {sp['put_failures']}, punches {sp['punches']}, stalls {sp['stalls']}")
@@ -1295,7 +1322,7 @@ class Cases(Suite):
             sp = self.wait_quiescent()
             self.check(problems, sp["stalls"] >= 1, "no gate transition counted")
             self.check(problems, sp["put_failures"] >= 1, "no PUT failure counted")
-            self.check(problems, sp["punches"] == sp["puts"] - sp["put_failures"], f"punches {sp['punches']} != successful puts")
+            self.check_eviction_accounting(problems, sp)
             self.check(problems, sp["degraded_reasons"] == 0, f"degraded_reasons {sp['degraded_reasons']}")
             notes.append(f"final: puts {sp['puts']}, put_failures {sp['put_failures']}, punches {sp['punches']}, stalls {sp['stalls']}")
             self.stop_backend()
