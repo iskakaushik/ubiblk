@@ -435,10 +435,7 @@ impl Evictor {
         match self.puncher.free_bytes() {
             Ok(free) => {
                 self.free_bytes = Some(free);
-                self.state
-                    .spill()
-                    .free_bytes
-                    .store(free, Ordering::Relaxed);
+                self.state.spill().free_bytes.store(free, Ordering::Relaxed);
             }
             Err(e) => warn!("statfs of {} failed: {e}", self.cfg.data_path.display()),
         }
@@ -632,9 +629,7 @@ impl Evictor {
             let object = {
                 let data = buf.borrow();
                 match data.as_slice().get(..len as usize) {
-                    Some(data) => self
-                        .codec
-                        .encode(stripe_id, data, Some(self.state.spill())),
+                    Some(data) => self.codec.encode(stripe_id, data, Some(self.state.spill())),
                     None => Err(crate::ubiblk_error!(InvalidParameter {
                         description: format!(
                             "stripe {stripe_id} is {len} bytes but its buffer holds {}",
@@ -719,12 +714,7 @@ impl Evictor {
     }
 
     fn store_recovered(&mut self) {
-        if self
-            .state
-            .spill()
-            .degraded
-            .swap(false, Ordering::AcqRel)
-        {
+        if self.state.spill().degraded.swap(false, Ordering::AcqRel) {
             info!("Spill store recovered");
         }
         self.degraded_until = None;
@@ -988,8 +978,7 @@ impl Evictor {
                 Kind::Dirty => {
                     // Re-checked per claim: under half-open only one probe
                     // may be in flight, and the first claim is it.
-                    if self.dirty_allowed(now) && self.begin_eviction(stripe_id, Kind::Dirty, now)
-                    {
+                    if self.dirty_allowed(now) && self.begin_eviction(stripe_id, Kind::Dirty, now) {
                         claimed += 1;
                     }
                 }

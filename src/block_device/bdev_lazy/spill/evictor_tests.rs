@@ -370,7 +370,9 @@ impl Rig {
             .expect("object in store");
         let mut codec = SpillCodec::new(ArchiveCompressionAlgorithm::None, None, STRIPE_SECTORS);
         let mut dst = vec![0u8; STRIPE_BYTES as usize];
-        let len = codec.decode_into(stripe_id, &object, &mut dst, None).unwrap();
+        let len = codec
+            .decode_into(stripe_id, &object, &mut dst, None)
+            .unwrap();
         dst.truncate(len);
         dst
     }
@@ -404,7 +406,11 @@ fn dirty_eviction_puts_then_flushes_header_then_punches() {
     // Held upload: nothing may move.
     rig.ticks(5);
     assert_eq!(rig.stage(0), Some(Stage::Putting));
-    assert_eq!(rig.metadata_io(), (0, 0), "no header op before the PUT returns");
+    assert_eq!(
+        rig.metadata_io(),
+        (0, 0),
+        "no header op before the PUT returns"
+    );
     assert!(rig.punches().is_empty(), "no punch before the PUT returns");
     assert_eq!(rig.header(0), DIRTY);
     assert!(!rig.flusher.busy());
@@ -414,12 +420,18 @@ fn dirty_eviction_puts_then_flushes_header_then_punches() {
     rig.tick();
     assert!(matches!(rig.stage(0), Some(Stage::WritingHeader { .. })));
     assert!(rig.punches().is_empty());
-    assert_eq!(rig.counter(|c| &c.put_bytes) as usize, rig.store.lock().unwrap().objects.lock().unwrap()[&object_name(0)].len());
+    assert_eq!(
+        rig.counter(|c| &c.put_bytes) as usize,
+        rig.store.lock().unwrap().objects.lock().unwrap()[&object_name(0)].len()
+    );
 
     // Written and flushed before the punch.
     rig.tick();
     assert_eq!(rig.metadata_io(), (1, 1));
-    assert!(rig.punches().is_empty(), "the flush completion has not been seen yet");
+    assert!(
+        rig.punches().is_empty(),
+        "the flush completion has not been seen yet"
+    );
     assert_eq!(rig.fetch_state(0), Evicting);
 
     rig.tick();
@@ -436,7 +448,10 @@ fn dirty_eviction_puts_then_flushes_header_then_punches() {
     assert_eq!(rig.state.fetched_stripes(), 1);
     assert_eq!(rig.counter(|c| &c.evicted_dirty), 1);
     assert_eq!(rig.counter(|c| &c.punches), 1);
-    assert_eq!(rig.decode_object(0), vec![pattern(0); STRIPE_BYTES as usize]);
+    assert_eq!(
+        rig.decode_object(0),
+        vec![pattern(0); STRIPE_BYTES as usize]
+    );
     assert_eq!(rig.stage(0), None);
 
     // One stripe over the ceiling of one: done, and no longer busy.
@@ -455,7 +470,10 @@ fn clean_eviction_writes_header_then_punches_without_put() {
     rig.make_clean_evictable(&[0]);
 
     assert!(rig.run_until(10, |r| r.fetch_state(0) == Evicted));
-    assert!(rig.put_order().is_empty(), "a clean eviction uploads nothing");
+    assert!(
+        rig.put_order().is_empty(),
+        "a clean eviction uploads nothing"
+    );
     assert_eq!(rig.metadata_io(), (1, 1));
     assert_eq!(rig.punches(), vec![(0, STRIPE_BYTES)]);
     assert_eq!(
@@ -510,7 +528,10 @@ fn nothing_is_punched_when_header_write_fails() {
             matches!(r.stage(stripe_id), Some(Stage::WritingHeader { .. }))
         }));
         // The header op is queued; the write it becomes fails.
-        rig.metadata_dev.inner.fail_next.store(true, Ordering::SeqCst);
+        rig.metadata_dev
+            .inner
+            .fail_next
+            .store(true, Ordering::SeqCst);
         rig.tick();
         assert_eq!(rig.stage(stripe_id), None);
         assert_eq!(rig.fetch_state(stripe_id), previous);
@@ -555,8 +576,15 @@ fn uncertain_header_outcome_is_retried_not_aborted() {
     rig.evictor.advance_time_for_test(Duration::from_secs(2));
     assert!(rig.run_until(10, |r| r.fetch_state(0) == Evicted));
     assert_eq!(rig.metadata_io(), (2, 1), "written twice, flushed once");
-    assert_eq!(rig.punches(), vec![(0, STRIPE_BYTES)], "punched exactly once");
-    assert_eq!(rig.header(0) & metadata_flags::EVICTED, metadata_flags::EVICTED);
+    assert_eq!(
+        rig.punches(),
+        vec![(0, STRIPE_BYTES)],
+        "punched exactly once"
+    );
+    assert_eq!(
+        rig.header(0) & metadata_flags::EVICTED,
+        metadata_flags::EVICTED
+    );
     let (fetches, pushes) = rig.evictor.take_released();
     assert_eq!(fetches, vec![0], "the deferred fetch is replayed");
     assert!(pushes.is_empty());
@@ -573,10 +601,7 @@ fn punch_covers_only_the_short_last_stripe() {
 
     assert!(rig.run_until(10, |r| r.fetch_state(last) == Evicted));
     let short_len = short_sectors * SECTOR_SIZE as u64;
-    assert_eq!(
-        rig.punches(),
-        vec![(last as u64 * STRIPE_BYTES, short_len)]
-    );
+    assert_eq!(rig.punches(), vec![(last as u64 * STRIPE_BYTES, short_len)]);
     assert_eq!(
         rig.decode_object(last),
         vec![pattern(last); short_len as usize],
@@ -605,10 +630,7 @@ fn in_s3_is_set_only_after_the_put_succeeds() {
     assert!(rig.run_until(10, |r| r.fetch_state(0) == Evicted));
     assert!(rig.state.stripe_in_s3(0));
     assert_eq!(rig.state.in_s3_stripes(), 1);
-    assert_eq!(
-        rig.header(0) & metadata_flags::IN_S3,
-        metadata_flags::IN_S3
-    );
+    assert_eq!(rig.header(0) & metadata_flags::IN_S3, metadata_flags::IN_S3);
 }
 
 // ---- concurrency
@@ -669,7 +691,11 @@ fn fetch_during_draining_aborts_and_restores_previous_state() {
         );
         assert_eq!(rig.fetch_state(stripe_id), previous);
         assert_eq!(rig.stage(stripe_id), None);
-        assert_eq!(rig.evictor.records_for_test(), 0, "nothing outstanding to drain");
+        assert_eq!(
+            rig.evictor.records_for_test(),
+            0,
+            "nothing outstanding to drain"
+        );
         assert_eq!(rig.state.fetched_stripes(), fetched);
         assert_eq!(rig.state.resident_stripes(), resident);
         assert_ne!(
@@ -706,9 +732,16 @@ fn fetch_during_putting_aborts_and_stale_put_completion_is_ignored() {
     assert_eq!(rig.evictor.puts_in_flight_for_test(), 0);
     assert_eq!(rig.evictor.records_for_test(), 0);
     assert_eq!(rig.fetch_state(0), Fetched);
-    assert_eq!(rig.metadata_io(), (0, 0), "the stale PUT issues no header op");
+    assert_eq!(
+        rig.metadata_io(),
+        (0, 0),
+        "the stale PUT issues no header op"
+    );
     assert!(rig.punches().is_empty());
-    assert!(!rig.state.stripe_in_s3(0), "the orphan object is not claimed");
+    assert!(
+        !rig.state.stripe_in_s3(0),
+        "the orphan object is not claimed"
+    );
 }
 
 #[test]
@@ -749,8 +782,16 @@ fn stale_set_fetched_completion_does_not_release_an_evicting_stripe() {
 
     rig.tick();
     rig.tick();
-    assert_ne!(rig.header(0) & metadata_flags::FETCHED, 0, "the stale write landed");
-    assert_eq!(rig.fetch_state(0), Evicting, "but did not release the stripe");
+    assert_ne!(
+        rig.header(0) & metadata_flags::FETCHED,
+        0,
+        "the stale write landed"
+    );
+    assert_eq!(
+        rig.fetch_state(0),
+        Evicting,
+        "but did not release the stripe"
+    );
     assert_eq!(rig.state.fetched_stripes(), fetched);
 
     assert!(rig.run_until(15, |r| r.fetch_state(0) == Evicted));
@@ -810,9 +851,16 @@ fn push_for_dirty_evicting_stripe_is_ignored_and_pushed_recorded() {
         .unwrap();
     rig.worker.receive_requests(false);
 
-    assert!(rig.state.stripe_pushed(0), "PUSHED recorded before disposition");
+    assert!(
+        rig.state.stripe_pushed(0),
+        "PUSHED recorded before disposition"
+    );
     assert_eq!(gate.queued(), 0, "the permit was dropped with the push");
-    assert_eq!(rig.state.stripe_fetch_state(0), Evicting, "eviction continues");
+    assert_eq!(
+        rig.state.stripe_fetch_state(0),
+        Evicting,
+        "eviction continues"
+    );
     rig.worker.update();
     rig.worker.update();
     assert_ne!(
@@ -828,7 +876,10 @@ fn push_for_dirty_evicting_stripe_is_ignored_and_pushed_recorded() {
 
     rig.store.lock().unwrap().release_puts();
     assert!(rig.run_until(15, |r| r.state.stripe_fetch_state(0) == Evicted));
-    assert_eq!(rig.decode_object(0), vec![pattern(0); STRIPE_BYTES as usize]);
+    assert_eq!(
+        rig.decode_object(0),
+        vec![pattern(0); STRIPE_BYTES as usize]
+    );
 }
 
 #[test]
@@ -843,9 +894,9 @@ fn push_for_clean_evicting_stripe_aborts_eviction() {
     assert_eq!(rig.kind(0), Some(Kind::Clean));
 
     let gate = PushGate::new(4);
-    let (disposition, permit) =
-        rig.evictor
-            .on_pushed_stripe(0, &[0u8; 512], permit_from(&gate));
+    let (disposition, permit) = rig
+        .evictor
+        .on_pushed_stripe(0, &[0u8; 512], permit_from(&gate));
     assert_eq!(disposition, PushDisposition::AbortedEviction);
     assert!(permit.is_none());
     assert_eq!(gate.queued(), 0, "the duplicate's permit is released");
@@ -868,9 +919,7 @@ fn push_for_committed_clean_eviction_is_deferred_then_applied() {
 
     let gate = PushGate::new(4);
     let data = vec![0xABu8; STRIPE_BYTES as usize];
-    let (disposition, permit) = rig
-        .evictor
-        .on_pushed_stripe(0, &data, permit_from(&gate));
+    let (disposition, permit) = rig.evictor.on_pushed_stripe(0, &data, permit_from(&gate));
     assert_eq!(disposition, PushDisposition::Deferred);
     assert!(permit.is_none());
     assert_eq!(gate.queued(), 1, "the permit is held with the bytes");
@@ -891,15 +940,18 @@ fn push_for_committed_clean_eviction_is_deferred_then_applied() {
 #[test]
 fn push_for_evicted_written_stripe_is_ignored() {
     let mut rig = Rig::build(
-        &[(0, metadata_flags::EVICTED | metadata_flags::WRITTEN | metadata_flags::HAS_SOURCE)],
+        &[(
+            0,
+            metadata_flags::EVICTED | metadata_flags::WRITTEN | metadata_flags::HAS_SOURCE,
+        )],
         true,
         |_| {},
     );
     assert_eq!(rig.fetch_state(0), Evicted);
     let gate = PushGate::new(4);
-    let (disposition, permit) =
-        rig.evictor
-            .on_pushed_stripe(0, &[0u8; 512], permit_from(&gate));
+    let (disposition, permit) = rig
+        .evictor
+        .on_pushed_stripe(0, &[0u8; 512], permit_from(&gate));
     assert_eq!(disposition, PushDisposition::Ignore);
     assert!(permit.is_none());
     assert_eq!(gate.queued(), 0);
@@ -908,7 +960,10 @@ fn push_for_evicted_written_stripe_is_ignored() {
 #[test]
 fn push_for_evicted_in_s3_stripe_is_ignored() {
     let mut rig = Rig::build(
-        &[(0, metadata_flags::EVICTED | metadata_flags::IN_S3 | metadata_flags::HAS_SOURCE)],
+        &[(
+            0,
+            metadata_flags::EVICTED | metadata_flags::IN_S3 | metadata_flags::HAS_SOURCE,
+        )],
         true,
         |_| {},
     );
@@ -922,9 +977,9 @@ fn push_for_evicted_in_s3_stripe_is_ignored() {
     // and IN_S3 still set: the same hazard, the same answer.
     rig.state.set_stripe_failed(0);
     assert_eq!(rig.fetch_state(0), Failed);
-    let (disposition, permit) =
-        rig.evictor
-            .on_pushed_stripe(0, &[0u8; 512], permit_from(&gate));
+    let (disposition, permit) = rig
+        .evictor
+        .on_pushed_stripe(0, &[0u8; 512], permit_from(&gate));
     assert_eq!(disposition, PushDisposition::Ignore);
     assert!(permit.is_none());
     assert_eq!(gate.queued(), 0);
@@ -938,9 +993,9 @@ fn push_for_evicted_clean_stripe_is_forwarded() {
         |_| {},
     );
     let gate = PushGate::new(4);
-    let (disposition, permit) =
-        rig.evictor
-            .on_pushed_stripe(0, &[0u8; 512], permit_from(&gate));
+    let (disposition, permit) = rig
+        .evictor
+        .on_pushed_stripe(0, &[0u8; 512], permit_from(&gate));
     assert_eq!(disposition, PushDisposition::Forward);
     assert!(permit.is_some(), "the ingest needs the permit");
     assert_eq!(gate.queued(), 1);
@@ -949,16 +1004,16 @@ fn push_for_evicted_clean_stripe_is_forwarded() {
     // Failed with WAS_EVICTED and neither WRITTEN nor IN_S3: the push is the
     // only copy the fork can get.
     rig.state.set_stripe_failed(0);
-    let (disposition, permit) =
-        rig.evictor
-            .on_pushed_stripe(0, &[0u8; 512], permit_from(&gate));
+    let (disposition, permit) = rig
+        .evictor
+        .on_pushed_stripe(0, &[0u8; 512], permit_from(&gate));
     assert_eq!(disposition, PushDisposition::Forward);
     assert!(permit.is_some());
 
     // And a plain resident or unfetched stripe is none of the evictor's business.
-    let (disposition, permit) =
-        rig.evictor
-            .on_pushed_stripe(3, &[0u8; 512], permit_from(&gate));
+    let (disposition, permit) = rig
+        .evictor
+        .on_pushed_stripe(3, &[0u8; 512], permit_from(&gate));
     assert_eq!(disposition, PushDisposition::Forward);
     assert!(permit.is_some());
 }
@@ -1084,7 +1139,9 @@ impl CoordRig {
             .expect("object in store");
         let mut codec = SpillCodec::new(ArchiveCompressionAlgorithm::None, None, STRIPE_SECTORS);
         let mut dst = vec![0u8; STRIPE_BYTES as usize];
-        let len = codec.decode_into(stripe_id, &object, &mut dst, None).unwrap();
+        let len = codec
+            .decode_into(stripe_id, &object, &mut dst, None)
+            .unwrap();
         dst.truncate(len);
         dst
     }
@@ -1109,9 +1166,16 @@ fn rematerialised_stripe_is_not_released_before_header_is_durable() {
     rig.fetch(0);
     // The data lands and the header write goes out, but its flush fails.
     assert!(rig.run_until(20, |r| r.metadata_io().0 >= 1));
-    assert_eq!(rig.target_stripe(0), vec![0x80 | pattern(0); STRIPE_BYTES as usize]);
+    assert_eq!(
+        rig.target_stripe(0),
+        vec![0x80 | pattern(0); STRIPE_BYTES as usize]
+    );
     assert!(rig.run_until(5, |r| r.metadata_io().0 >= 2), "retried");
-    assert_eq!(rig.state.stripe_fetch_state(0), Evicted, "guest I/O still waits");
+    assert_eq!(
+        rig.state.stripe_fetch_state(0),
+        Evicted,
+        "guest I/O still waits"
+    );
     assert_eq!(rig.state.resident_stripes(), resident);
 
     assert!(rig.run_until(10, |r| r.state.stripe_fetch_state(0) == Fetched));
@@ -1165,7 +1229,10 @@ fn in_s3_count_drops_when_a_spilled_stripe_is_rematerialised() {
     assert!(rig.run_until(30, |r| r.state.stripe_fetch_state(1) == Fetched));
     assert_eq!(rig.state.in_s3_stripes(), 1);
     assert_eq!(rig.state.evicted_stripes(), 1);
-    assert!(rig.state.stripe_in_s3(1), "the hint stays for the purge tool");
+    assert!(
+        rig.state.stripe_in_s3(1),
+        "the hint stays for the purge tool"
+    );
     assert_eq!(
         rig.metadata_dev.header(1),
         metadata_flags::FETCHED | metadata_flags::IN_S3 | metadata_flags::HAS_SOURCE
@@ -1184,7 +1251,11 @@ fn clean_before_dirty() {
     rig.make_clean_evictable(&[1]);
 
     rig.tick();
-    assert_eq!(rig.kind(1), Some(Kind::Clean), "the clean stripe goes first");
+    assert_eq!(
+        rig.kind(1),
+        Some(Kind::Clean),
+        "the clean stripe goes first"
+    );
     assert_eq!(rig.stage(0), None);
     assert_eq!(rig.fetch_state(0), Fetched);
     assert!(rig.run_until(10, |r| r.fetch_state(1) == Evicted));
@@ -1204,7 +1275,11 @@ fn referenced_stripes_skipped_once() {
     rig.state.touch(0, 0);
 
     rig.tick();
-    assert_eq!(rig.evictor.records_for_test(), 0, "stripe 0 had its bit set");
+    assert_eq!(
+        rig.evictor.records_for_test(),
+        0,
+        "stripe 0 had its bit set"
+    );
     assert_eq!(rig.state.stripe_flags(0) & stripe_flags::REFERENCED, 0);
     assert_eq!(rig.evictor.hand_for_test(), 1);
 
@@ -1320,7 +1395,10 @@ fn written_nosource_stripe_is_dirty_and_evictable() {
         rig.header(0),
         metadata_flags::EVICTED | metadata_flags::IN_S3 | metadata_flags::WRITTEN
     );
-    assert_eq!(rig.decode_object(0), vec![pattern(0); STRIPE_BYTES as usize]);
+    assert_eq!(
+        rig.decode_object(0),
+        vec![pattern(0); STRIPE_BYTES as usize]
+    );
 }
 
 #[test]
@@ -1379,11 +1457,19 @@ fn soft_pressure_evicts_to_low_water() {
     assert!(rig.evictor.busy());
     assert!(rig.run_until(40, |r| r.state.resident_stripes() == 4));
     rig.ticks(10);
-    assert_eq!(rig.state.resident_stripes(), 4, "stops at the low-water mark");
+    assert_eq!(
+        rig.state.resident_stripes(),
+        4,
+        "stops at the low-water mark"
+    );
     assert_eq!(rig.state.evicted_stripes(), 4);
     assert_eq!(rig.evictor.records_for_test(), 0);
     assert!(!rig.evictor.busy());
-    assert_eq!(rig.state.write_gate(), GATE_OPEN, "never under hard pressure");
+    assert_eq!(
+        rig.state.write_gate(),
+        GATE_OPEN,
+        "never under hard pressure"
+    );
     assert_eq!(rig.counter(|c| &c.stalls), 0);
 }
 
@@ -1462,10 +1548,18 @@ fn statfs_pressure_evicts_even_below_ceiling() {
     rig.free.store(STRIPE_BYTES, Ordering::SeqCst);
 
     rig.tick();
-    assert_eq!(rig.counter(|c| &c.free_bytes), STRIPE_BYTES, "statfs published");
+    assert_eq!(
+        rig.counter(|c| &c.free_bytes),
+        STRIPE_BYTES,
+        "statfs published"
+    );
     assert_eq!(rig.state.write_gate(), GATE_HOLD, "below half the minimum");
     assert!(rig.run_until(20, |r| r.state.evicted_stripes() == 2));
-    assert_eq!(rig.state.write_gate(), GATE_HOLD, "the filesystem is still full");
+    assert_eq!(
+        rig.state.write_gate(),
+        GATE_HOLD,
+        "the filesystem is still full"
+    );
 
     // Room comes back (something else was deleted): the gate opens on the
     // next statfs, which is rate limited, so the interval is skipped.
@@ -1504,7 +1598,10 @@ fn degraded_store_blocks_dirty_but_not_clean() {
     assert_eq!(rig.counter(|c| &c.evicted_dirty), 0);
     assert_eq!(rig.put_order().len(), 1);
     assert!(rig.degraded());
-    assert!(!rig.evictor.busy(), "nothing it can do until the backoff passes");
+    assert!(
+        !rig.evictor.busy(),
+        "nothing it can do until the backoff passes"
+    );
 }
 
 #[test]
@@ -1522,7 +1619,11 @@ fn half_open_after_backoff() {
     assert!(rig.run_until(10, |r| r.counter(|c| &c.put_failures) == 2));
     assert!(rig.degraded());
     rig.ticks(10);
-    assert_eq!(rig.evictor.records_for_test(), 0, "paused during the backoff");
+    assert_eq!(
+        rig.evictor.records_for_test(),
+        0,
+        "paused during the backoff"
+    );
     assert_eq!(rig.put_order().len(), 2);
 
     // The backoff passes: exactly one upload probes the store.
@@ -1567,7 +1668,11 @@ fn startup_pass_punches_every_evicted_stripe_and_coalesces_runs() {
         ]
     );
     assert_eq!(rig.counter(|c| &c.startup_punches), 3);
-    assert_eq!(rig.counter(|c| &c.punches), 0, "counted apart from evictions");
+    assert_eq!(
+        rig.counter(|c| &c.punches),
+        0,
+        "counted apart from evictions"
+    );
 
     // Idempotent: the same calls again.
     assert_eq!(rig.evictor.punch_all_evicted(&metadata).unwrap(), 5);
@@ -1579,10 +1684,16 @@ fn startup_pass_punches_every_evicted_stripe_and_coalesces_runs() {
     assert_eq!(rig.evictor.punch_all_evicted(&metadata).unwrap(), 2);
     assert_eq!(rig.counter(|c| &c.punch_failures), 1);
     assert_eq!(rig.punches().len(), 8);
-    assert!(rig.evictor.punch_supported_for_test(), "EIO is not EOPNOTSUPP");
+    assert!(
+        rig.evictor.punch_supported_for_test(),
+        "EIO is not EOPNOTSUPP"
+    );
 
     // Nothing evicted, nothing punched.
-    assert_eq!(rig.evictor.punch_all_evicted(&metadata_with(&[])).unwrap(), 0);
+    assert_eq!(
+        rig.evictor.punch_all_evicted(&metadata_with(&[])).unwrap(),
+        0
+    );
     assert_eq!(rig.punches().len(), 8);
 }
 
@@ -1590,7 +1701,10 @@ fn startup_pass_punches_every_evicted_stripe_and_coalesces_runs() {
 fn startup_pass_ignores_fetched_and_evicted_header() {
     let mut rig = Rig::build(&[], true, |_| {});
     let metadata = metadata_with(&[
-        (2, metadata_flags::FETCHED | metadata_flags::EVICTED | metadata_flags::HAS_SOURCE),
+        (
+            2,
+            metadata_flags::FETCHED | metadata_flags::EVICTED | metadata_flags::HAS_SOURCE,
+        ),
         (4, metadata_flags::EVICTED | metadata_flags::HAS_SOURCE),
     ]);
     assert_eq!(rig.evictor.punch_all_evicted(&metadata).unwrap(), 1);
