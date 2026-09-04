@@ -63,10 +63,14 @@ struct LazyIoChannel {
     /// CryptIoChannel::read_requests. This map, not the id, decides whether a
     /// completion unpins anything, so a stray completion for an id already
     /// released finds `None` and does nothing.
+    ///
+    /// A pin outlives a failed `submit`. io_uring keeps the SQEs a failed
+    /// enter did not consume and enters them on the next submit, so base may
+    /// still carry out an id whose submit reported an error; unpinning at the
+    /// failure would let the evictor take a stripe with I/O on the way. The
+    /// pin goes on the completion, or when the frontend reuses the id
+    /// (`try_pass_to_base`), which is its word that the old request is over.
     pinned_by_id: Vec<Option<(usize, usize)>>,
-    /// Ids handed to `base` since its last `submit`. If that submit fails,
-    /// base will never complete them, so their pins are released here.
-    unsubmitted: Vec<usize>,
 }
 
 impl LazyIoChannel {
@@ -87,7 +91,6 @@ impl LazyIoChannel {
             stripe_fetches_requested: HashSet::new(),
             track_written,
             pinned_by_id: Vec::new(),
-            unsubmitted: Vec::new(),
         }
     }
 }
@@ -173,10 +176,13 @@ impl LazyIoChannel {
             self.pinned_by_id.resize(request.id + 1, None);
         }
         if let Some(slot) = self.pinned_by_id.get_mut(request.id) {
-            debug_assert!(slot.is_none(), "request id {} reused in flight", request.id);
-            *slot = Some((first, last));
+            // A live slot is the pin of a request whose submit failed and
+            // that base never completed. The frontend handing out the id
+            // again says that request is over, so give its pin back first.
+            if let Some((stale_first, stale_last)) = slot.replace((first, last)) {
+                self.metadata_state.unpin_inflight(stale_first, stale_last);
+            }
         }
-        self.unsubmitted.push(request.id);
 
         match request.kind {
             RequestType::In => self.base.add_read(
@@ -202,16 +208,6 @@ impl LazyIoChannel {
         }
     }
 
-    /// Release the pins of everything handed to base since its last submit:
-    /// that submit failed, so base will never complete them.
-    fn release_unsubmitted(&mut self) -> Vec<usize> {
-        let ids = std::mem::take(&mut self.unsubmitted);
-        for id in &ids {
-            self.release_pin(*id);
-        }
-        ids
-    }
-
     fn start_stripe_fetches(&mut self, request: &mut RWRequest) -> Result<()> {
         for stripe_id in request.stripe_id_first..=request.stripe_id_last {
             if !self.metadata_state.stripe_fetched_if_needed(stripe_id)
@@ -227,6 +223,18 @@ impl LazyIoChannel {
             }
         }
         Ok(())
+    }
+
+    /// Forget the Fetches sent for this request's stripes, so the next request
+    /// on one of them asks again. Called whenever a request leaves the queue,
+    /// passed to base or failed. A stripe left in the set after a failure
+    /// would never be fetched again: `start_stripe_fetches` skips it and
+    /// `resend_fetches_if_due` leaves NotFetched alone, so the next request
+    /// on it would sit at the queue front forever.
+    fn forget_fetch_requests(&mut self, request: &RWRequest) {
+        for stripe_id in request.stripe_id_first..=request.stripe_id_last {
+            self.stripe_fetches_requested.remove(&stripe_id);
+        }
     }
 
     /// Re-send Fetch for every stripe of a Pending front that is Evicting or
@@ -278,7 +286,7 @@ impl LazyIoChannel {
     }
 
     fn process_queued_rw_requests(&mut self) {
-        let mut added_requests = 0;
+        let mut added_requests = Vec::new();
 
         while let Some(mut front) = self.queued_rw_requests.pop_front() {
             let gate = self.metadata_state.write_gate();
@@ -288,6 +296,7 @@ impl LazyIoChannel {
                     if gate == GATE_FAIL {
                         // Waiting on a stripe that is not here, under a gate
                         // that refuses to fetch it: fail rather than hang.
+                        self.forget_fetch_requests(&front);
                         self.finished_requests.push((front.id, false));
                         continue;
                     }
@@ -296,6 +305,7 @@ impl LazyIoChannel {
                     break;
                 }
                 StripesFetchStatus::Failed { stripe_id } => {
+                    self.forget_fetch_requests(&front);
                     self.finished_requests.push((front.id, false));
                     error!("Failed to fetch stripe: {stripe_id}");
                     continue;
@@ -303,6 +313,7 @@ impl LazyIoChannel {
             }
 
             if front.kind == RequestType::Out && gate == GATE_FAIL {
+                self.forget_fetch_requests(&front);
                 self.finished_requests.push((front.id, false));
                 continue;
             }
@@ -315,20 +326,23 @@ impl LazyIoChannel {
                 break;
             }
 
-            for stripe_id in front.stripe_id_first..=front.stripe_id_last {
-                self.stripe_fetches_requested.remove(&stripe_id);
-            }
-            added_requests += 1;
+            self.forget_fetch_requests(&front);
+            added_requests.push(front.id);
         }
 
-        if added_requests > 0 {
+        if !added_requests.is_empty() {
             if let Err(e) = self.base.submit() {
-                error!("Failed to submit {added_requests} queued requests: {e}");
-                for id in self.release_unsubmitted() {
+                error!(
+                    "Failed to submit {} queued requests: {}",
+                    added_requests.len(),
+                    e
+                );
+                // Fail them for the frontend, as before, but keep their pins:
+                // base may still carry them out (see `pinned_by_id`).
+                for id in added_requests {
                     self.finished_requests.push((id, false));
                 }
             }
-            self.unsubmitted.clear();
         }
     }
 }
@@ -450,12 +464,8 @@ impl IoChannel for LazyIoChannel {
         if let Some(image_channel) = &mut self.image {
             image_channel.submit()?;
         }
-        let result = self.base.submit();
-        if result.is_err() {
-            self.release_unsubmitted();
-        }
-        self.unsubmitted.clear();
-        result
+        // Pins stay across a failed submit; see `pinned_by_id`.
+        self.base.submit()
     }
 
     fn poll(&mut self) -> Vec<(usize, bool)> {

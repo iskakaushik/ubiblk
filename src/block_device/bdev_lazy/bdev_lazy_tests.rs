@@ -3,7 +3,8 @@ mod tests {
     use crate::backends::SECTOR_SIZE;
     use crate::block_device::{
         bdev_lazy::{
-            metadata::Fetched, BgWorker, LazyBlockDevice, SharedMetadataState, UbiMetadata,
+            metadata::{Failed, Fetched, NotFetched},
+            BgWorker, LazyBlockDevice, SharedMetadataState, UbiMetadata,
         },
         bdev_test::{TestBlockDevice, TestDeviceMetrics},
         metadata_flags, stripe_flags, BgWorkerRequest, BlockDevice, Evicted, Evicting, IoChannel,
@@ -748,41 +749,97 @@ mod tests {
         }
     }
 
+    /// io_uring keeps the SQEs a failed enter did not consume and enters them
+    /// on the next submit, so base may complete an id whose submit failed.
+    /// The pin therefore stays until that completion; unpinning at the
+    /// failure would let the evictor take a stripe with I/O still on the way.
     #[test]
-    fn inflight_is_released_on_submit_failure() {
+    fn inflight_stays_pinned_across_submit_failure_until_completion() {
+        let env = setup_channel_env(false);
+        env.metadata_state.mark_stripe_fetched(0);
+        env.metadata_state.mark_stripe_fetched(1);
+        env.target
+            .keep_requests_on_failed_submit
+            .store(true, Ordering::SeqCst);
+        env.target.hold_completions.store(true, Ordering::SeqCst);
+        let mut chan = env.lazy.create_channel().unwrap();
+
+        // Direct path: the frontend's submit fails after the pass-through and
+        // it keeps the request outstanding, as the vhost backend does.
+        chan.add_read(0, 1, shared_buffer(SECTOR_SIZE), 1);
+        env.target.fail_submit.store(true, Ordering::SeqCst);
+        assert!(chan.submit().is_err());
+        assert_eq!(env.metadata_state.stripe_inflight(0), 1);
+        assert!(chan.poll().is_empty());
+        assert_eq!(env.metadata_state.stripe_inflight(0), 1);
+        // The completion arrives later and releases the pin, exactly once.
+        env.target.hold_completions.store(false, Ordering::SeqCst);
+        assert_eq!(chan.poll(), vec![(1, true)]);
+        assert_eq!(env.metadata_state.stripe_inflight(0), 0);
+        assert!(chan.poll().is_empty());
+        assert_eq!(env.metadata_state.stripe_inflight(0), 0);
+
+        // Queued path: the submit inside poll fails. The request is reported
+        // failed, as before, but its stripe stays pinned until base is done.
+        env.target.hold_completions.store(true, Ordering::SeqCst);
+        env.metadata_state
+            .set_stripe_fetch_state_for_test(1, Evicting);
+        chan.add_read(STRIPE_SECTORS, 1, shared_buffer(SECTOR_SIZE), 2);
+        chan.submit().unwrap();
+        env.metadata_state
+            .set_stripe_fetch_state_for_test(1, Fetched);
+        env.target.fail_submit.store(true, Ordering::SeqCst);
+        assert_eq!(chan.poll(), vec![(2, false)]);
+        assert_eq!(env.metadata_state.stripe_inflight(1), 1);
+        env.target.hold_completions.store(false, Ordering::SeqCst);
+        assert_eq!(chan.poll(), vec![(2, true)]);
+        assert_eq!(env.metadata_state.stripe_inflight(1), 0);
+    }
+
+    /// A base that really dropped the requests (the test device without
+    /// `keep_requests_on_failed_submit`) never completes them. The pin is
+    /// then given back when the frontend hands out the same id again, and the
+    /// new request's pin is released exactly once: no leak, no underflow.
+    #[test]
+    fn stale_pin_is_reclaimed_when_the_id_is_reused() {
         let env = setup_channel_env(false);
         env.metadata_state.mark_stripe_fetched(0);
         env.metadata_state.mark_stripe_fetched(1);
         let mut chan = env.lazy.create_channel().unwrap();
 
-        // Direct path: the frontend's submit fails after the pass-through.
         chan.add_read(0, 1, shared_buffer(SECTOR_SIZE), 1);
-        assert_eq!(env.metadata_state.stripe_inflight(0), 1);
         env.target.fail_submit.store(true, Ordering::SeqCst);
         assert!(chan.submit().is_err());
-        assert_eq!(env.metadata_state.stripe_inflight(0), 0);
         assert!(chan.poll().is_empty());
-
-        // The id comes round again: the map was cleared, so the old pin is
-        // gone and the new one is released exactly once (no underflow).
-        chan.add_read(0, 1, shared_buffer(SECTOR_SIZE), 1);
-        chan.submit().unwrap();
         assert_eq!(env.metadata_state.stripe_inflight(0), 1);
+
+        // Same id on another stripe: the stale pin on stripe 0 goes, stripe 1
+        // is pinned, and the completion releases stripe 1 only.
+        chan.add_read(STRIPE_SECTORS, 1, shared_buffer(SECTOR_SIZE), 1);
+        assert_eq!(env.metadata_state.stripe_inflight(0), 0);
+        assert_eq!(env.metadata_state.stripe_inflight(1), 1);
+        chan.submit().unwrap();
         assert_eq!(chan.poll(), vec![(1, true)]);
         assert_eq!(env.metadata_state.stripe_inflight(0), 0);
+        assert_eq!(env.metadata_state.stripe_inflight(1), 0);
 
-        // Queued path: the submit inside poll fails; the request is failed
-        // and its stripe unpinned.
+        // Queued path: the request failed by the submit inside poll keeps its
+        // pin too, and the reuse of its id reclaims it.
         env.metadata_state
             .set_stripe_fetch_state_for_test(1, Evicting);
         chan.add_read(STRIPE_SECTORS, 1, shared_buffer(SECTOR_SIZE), 2);
         chan.submit().unwrap();
-        assert!(chan.busy());
         env.metadata_state
             .set_stripe_fetch_state_for_test(1, Fetched);
         env.target.fail_submit.store(true, Ordering::SeqCst);
         assert_eq!(chan.poll(), vec![(2, false)]);
+        assert_eq!(env.metadata_state.stripe_inflight(1), 1);
+        chan.add_read(0, 1, shared_buffer(SECTOR_SIZE), 2);
         assert_eq!(env.metadata_state.stripe_inflight(1), 0);
+        assert_eq!(env.metadata_state.stripe_inflight(0), 1);
+        chan.submit().unwrap();
+        assert_eq!(chan.poll(), vec![(2, true)]);
+        assert_eq!(env.metadata_state.stripe_inflight(0), 0);
         assert!(!chan.busy());
     }
 
@@ -1010,6 +1067,54 @@ mod tests {
         for stripe_id in 0..STRIPE_COUNT {
             assert_eq!(env.metadata_state.stripe_inflight(stripe_id), 0);
         }
+    }
+
+    /// A Pending front failed under GATE_FAIL leaves nothing behind in
+    /// `stripe_fetches_requested`: the coordinator refused that Fetch, so once
+    /// the gate opens the next request on the stripe must ask again, or it
+    /// would sit at the queue front forever.
+    #[test]
+    fn fail_gate_forgets_the_refused_fetch_so_a_later_read_asks_again() {
+        let env = setup_channel_env(false);
+        let mut chan = env.lazy.create_channel().unwrap();
+
+        env.metadata_state.set_write_gate(GATE_FAIL);
+        chan.add_read(STRIPE_SECTORS, 1, shared_buffer(SECTOR_SIZE), 1);
+        chan.submit().unwrap();
+        assert_eq!(env.fetch_ids(), vec![1]);
+        assert_eq!(chan.poll(), vec![(1, false)]);
+        assert!(!chan.busy());
+
+        env.metadata_state.set_write_gate(GATE_OPEN);
+        chan.add_read(STRIPE_SECTORS, 1, shared_buffer(SECTOR_SIZE), 2);
+        chan.submit().unwrap();
+        assert_eq!(env.fetch_ids(), vec![1]);
+        assert!(chan.busy());
+        // And it is served once the fetch lands.
+        env.metadata_state.mark_stripe_fetched(1);
+        assert_eq!(chan.poll(), vec![(2, true)]);
+        assert!(!chan.busy());
+        assert_eq!(env.reads(), 1);
+    }
+
+    /// The same for a front failed because its stripe's fetch failed: should
+    /// the stripe be offered again, a request on it sends a new Fetch.
+    #[test]
+    fn failed_front_forgets_its_fetch_request() {
+        let env = setup_channel_env(false);
+        let mut chan = env.lazy.create_channel().unwrap();
+
+        chan.add_read(STRIPE_SECTORS, 1, shared_buffer(SECTOR_SIZE), 1);
+        chan.submit().unwrap();
+        assert_eq!(env.fetch_ids(), vec![1]);
+        env.metadata_state
+            .set_stripe_fetch_state_for_test(1, Failed);
+        assert_eq!(chan.poll(), vec![(1, false)]);
+
+        env.metadata_state
+            .set_stripe_fetch_state_for_test(1, NotFetched);
+        chan.add_read(STRIPE_SECTORS, 1, shared_buffer(SECTOR_SIZE), 2);
+        assert_eq!(env.fetch_ids(), vec![1]);
     }
 
     /// The whole loop with a real coordinator and fetcher: a read of an

@@ -18,6 +18,7 @@ struct TestIoChannel {
     mem: Arc<RwLock<Vec<u8>>>,
     fail_next: Arc<AtomicBool>,
     fail_submit: Arc<AtomicBool>,
+    keep_requests_on_failed_submit: Arc<AtomicBool>,
     hold_completions: Arc<AtomicBool>,
     on_add_read: Arc<Mutex<Option<Box<ReadHook>>>>,
     finished_requests: Vec<(usize, bool)>,
@@ -94,7 +95,12 @@ impl IoChannel for TestIoChannel {
             .fail_submit
             .swap(false, std::sync::atomic::Ordering::SeqCst)
         {
-            self.finished_requests.clear();
+            if !self
+                .keep_requests_on_failed_submit
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                self.finished_requests.clear();
+            }
             return Err(crate::ubiblk_error!(IoError {
                 source: std::io::Error::other("injected submit failure"),
             }));
@@ -123,6 +129,10 @@ pub struct TestBlockDevice {
     pub metrics: Arc<RwLock<TestDeviceMetrics>>,
     pub fail_next: Arc<AtomicBool>,
     pub fail_submit: Arc<AtomicBool>,
+    /// While set, a failed submit leaves the requests already added in place
+    /// to complete on a later poll, as io_uring keeps the SQEs a failed enter
+    /// did not consume. Off by default: the requests are dropped.
+    pub keep_requests_on_failed_submit: Arc<AtomicBool>,
     /// While set, completions accumulate in the channel instead of being
     /// returned by `poll`, so a test can look at a request in flight.
     pub hold_completions: Arc<AtomicBool>,
@@ -150,6 +160,7 @@ impl TestBlockDevice {
             })),
             fail_next,
             fail_submit,
+            keep_requests_on_failed_submit: Arc::new(AtomicBool::new(false)),
             hold_completions: Arc::new(AtomicBool::new(false)),
             on_add_read: Arc::new(Mutex::new(None)),
         }
@@ -187,6 +198,7 @@ impl BlockDevice for TestBlockDevice {
             metrics: self.metrics.clone(),
             fail_next: self.fail_next.clone(),
             fail_submit: self.fail_submit.clone(),
+            keep_requests_on_failed_submit: self.keep_requests_on_failed_submit.clone(),
             hold_completions: self.hold_completions.clone(),
             on_add_read: self.on_add_read.clone(),
         }))
@@ -203,6 +215,7 @@ impl BlockDevice for TestBlockDevice {
             metrics: self.metrics.clone(),
             fail_next: self.fail_next.clone(),
             fail_submit: self.fail_submit.clone(),
+            keep_requests_on_failed_submit: self.keep_requests_on_failed_submit.clone(),
             hold_completions: self.hold_completions.clone(),
             on_add_read: self.on_add_read.clone(),
         })
