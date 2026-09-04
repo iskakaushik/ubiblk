@@ -224,6 +224,15 @@ impl StripeFetcher {
             return;
         }
 
+        if self.shared_metadata_state.stripe_fetch_state(stripe_id) == Evicting {
+            // The coordinator decides what happens to a stripe mid-eviction:
+            // it aborts or defers the demand itself, and the readahead behind
+            // it must not pull over data that is still local.
+            debug!("Stripe {stripe_id} is being evicted, leaving it to the coordinator");
+            return;
+        }
+        self.drop_stale_entry(stripe_id);
+
         if let Some(state) = self.stripe_states.get(&stripe_id).copied() {
             // Already asked for. If the sweep asked and a guest is now waiting,
             // it has to be promoted: left where it is, it sits behind however
@@ -264,21 +273,40 @@ impl StripeFetcher {
         if self
             .shared_metadata_state
             .stripe_fetched_if_needed(stripe_id)
-            || self.stripe_states.contains_key(&stripe_id)
+            || self.shared_metadata_state.stripe_fetch_state(stripe_id) == Evicting
         {
+            return;
+        }
+        self.drop_stale_entry(stripe_id);
+        if self.stripe_states.contains_key(&stripe_id) {
             return;
         }
         self.fetch_queue.push_back(stripe_id);
         self.stripe_states.insert(stripe_id, FetchState::Queued);
     }
 
-    /// Take a stripe the snapshot server pushed to us: the content this fork
-    /// must see, handed over just before prod overwrites it.
+    /// Forget a `Fetched` entry for a stripe the evictor has since dropped.
     ///
-    /// It is written to the target exactly like a fetched stripe, so the same
-    /// write/flush/mark-fetched path runs and the fork never pulls it later.
-    /// Tell the fetcher that this device subscribes to a snapshot, so stripes
-    /// its source refuses are coming over the push channel instead.
+    /// Entries are never removed on success, so without this a stripe fetched
+    /// in this process could never be fetched again: every request for it would
+    /// be taken as a repeat and the guest waiting on it would hang. Only
+    /// Evicted counts. A `Fetched` entry whose shared state is still NotFetched
+    /// is the normal gap between a worker's completion and the coordinator's
+    /// `mark_stripe_fetched`.
+    fn drop_stale_entry(&mut self, stripe_id: usize) {
+        if self.entry_is_stale(stripe_id) {
+            debug!("Stripe {stripe_id} was evicted since it was fetched, forgetting the old fetch");
+            self.stripe_states.remove(&stripe_id);
+        }
+    }
+
+    fn entry_is_stale(&self, stripe_id: usize) -> bool {
+        matches!(
+            self.stripe_states.get(&stripe_id),
+            Some(FetchState::Fetched)
+        ) && self.shared_metadata_state.stripe_fetch_state(stripe_id) == Evicted
+    }
+
     /// With spill, the source must stay: an evicted clean stripe is re-pulled
     /// from it. Guarding here covers the coordinator's and the pool workers'
     /// disconnect calls in one place.
@@ -286,10 +314,17 @@ impl StripeFetcher {
         self.never_disconnect = never;
     }
 
+    /// Tell the fetcher that this device subscribes to a snapshot, so stripes
+    /// its source refuses are coming over the push channel instead.
     pub fn set_expects_pushes(&mut self, expects_pushes: bool) {
         self.expects_pushes = expects_pushes;
     }
 
+    /// Take a stripe the snapshot server pushed to us: the content this fork
+    /// must see, handed over just before prod overwrites it.
+    ///
+    /// It is written to the target exactly like a fetched stripe, so the same
+    /// write/flush/mark-fetched path runs and the fork never pulls it later.
     pub fn accept_pushed_stripe(&mut self, stripe_id: usize, data: &[u8], permit: PushPermit) {
         if self
             .shared_metadata_state
@@ -447,6 +482,13 @@ impl StripeFetcher {
             let Some(stripe_id) = self.autofetch_queue.pop_front() else {
                 break;
             };
+            // A stripe the evictor holds or has dropped is left out of the
+            // sweep: fetching it back would refill the space just freed. It
+            // comes back only when a guest asks for it.
+            let state = self.shared_metadata_state.stripe_fetch_state(stripe_id);
+            if state == Evicting || state == Evicted {
+                continue;
+            }
             self.enqueue_autofetch(stripe_id);
         }
     }
@@ -1157,5 +1199,158 @@ mod tests {
         state.fetcher.set_never_disconnect(false);
         state.fetcher.disconnect_from_source_if_all_fetched();
         assert!(state.fetcher.disconnected);
+    }
+
+    /// A stripe fetched in this process keeps a `Fetched` entry for good, and a
+    /// repeat request is ignored on the strength of it. Once the evictor has
+    /// dropped the stripe that entry is a lie: honouring it would leave the
+    /// guest's request waiting for a fetch nobody will make.
+    #[test]
+    fn a_fetched_entry_is_stale_once_the_stripe_is_evicted() {
+        let mut state = prep(false);
+        state.fetcher.handle_fetch_request(0);
+        for _ in 0..10 {
+            state.fetcher.update();
+        }
+        assert_eq!(state.fetcher.take_finished_fetches(), vec![(0, true)]);
+        assert_eq!(state.source_dev.metrics.read().unwrap().reads, 1);
+        assert_eq!(
+            state.fetcher.stripe_states.get(&0),
+            Some(&FetchState::Fetched)
+        );
+
+        state
+            .fetcher
+            .shared_metadata_state
+            .set_stripe_fetch_state_for_test(0, Evicted);
+        state.fetcher.handle_fetch_request(0);
+        for _ in 0..10 {
+            state.fetcher.update();
+        }
+
+        assert_eq!(
+            state.source_dev.metrics.read().unwrap().reads,
+            2,
+            "the evicted stripe must be read from the source again"
+        );
+        assert_eq!(state.target_dev.metrics.read().unwrap().writes, 2);
+        assert_eq!(
+            state.fetcher.take_finished_fetches(),
+            vec![(0, true)],
+            "and reported as landed, so the coordinator can release it"
+        );
+    }
+
+    /// Only Evicted makes an entry stale. A guest asking for a stripe the
+    /// evictor is still working on is answered by the coordinator (abort or
+    /// defer), and the readahead behind that request must not pull over data
+    /// that is still on the disk.
+    #[test]
+    fn demand_for_evicting_stripe_is_dropped() {
+        let mut state = prep(true);
+        state
+            .fetcher
+            .shared_metadata_state
+            .set_stripe_fetch_state_for_test(3, Evicting);
+
+        // Stripe 3 is asked for directly and again as readahead behind 0.
+        state.fetcher.handle_fetch_request(3);
+        state.fetcher.handle_fetch_request(0);
+        assert!(
+            !state.fetcher.stripe_states.contains_key(&3),
+            "nothing may be queued for a stripe mid-eviction"
+        );
+        assert!(!state.fetcher.demand_stripes.contains(&3));
+
+        for _ in 0..10 {
+            state.fetcher.update();
+        }
+        let finished = state.fetcher.take_finished_fetches();
+        assert!(finished.contains(&(0, true)));
+        assert!(
+            finished.contains(&(4, true)),
+            "readahead past it still runs"
+        );
+        assert!(
+            !finished.iter().any(|(stripe_id, _)| *stripe_id == 3),
+            "the evicting stripe must not be fetched: {finished:?}"
+        );
+    }
+
+    /// The sweep exists to fill the disk with the source; a stripe the evictor
+    /// dropped to make room must not be swept straight back in.
+    #[test]
+    fn the_sweep_skips_evicting_and_evicted_stripes() {
+        let mut state = prep(true);
+        let source_stripe_count = state.fetcher.source_stripe_count() as usize;
+        state
+            .fetcher
+            .shared_metadata_state
+            .set_stripe_fetch_state_for_test(1, Evicting);
+        state
+            .fetcher
+            .shared_metadata_state
+            .set_stripe_fetch_state_for_test(2, Evicted);
+
+        for _ in 0..1000 {
+            state.fetcher.update();
+        }
+
+        let finished = state.fetcher.take_finished_fetches();
+        assert_eq!(finished.len(), source_stripe_count - 2);
+        assert!(finished
+            .iter()
+            .all(|(stripe_id, success)| *success && *stripe_id != 1 && *stripe_id != 2));
+        assert!(
+            state.fetcher.autofetch_queue.is_empty(),
+            "the sweep finished"
+        );
+        assert!(!state.fetcher.stripe_states.contains_key(&1));
+        assert!(!state.fetcher.stripe_states.contains_key(&2));
+        assert_eq!(
+            state.source_dev.metrics.read().unwrap().reads,
+            source_stripe_count - 2
+        );
+    }
+
+    /// The coordinator forwards a push for an evicted stripe when the push is
+    /// the only copy the fork can get. The fetcher sees a stripe that is not
+    /// local and writes it, exactly as for a stripe never fetched, even though
+    /// it still remembers fetching it once.
+    #[test]
+    fn a_push_for_an_evicted_stripe_is_written() {
+        let mut state = prep(false);
+        state.fetcher.handle_fetch_request(0);
+        for _ in 0..10 {
+            state.fetcher.update();
+        }
+        assert_eq!(state.fetcher.take_finished_fetches(), vec![(0, true)]);
+        state
+            .fetcher
+            .shared_metadata_state
+            .set_stripe_fetch_state_for_test(0, Evicted);
+        let writes_before = state.target_dev.metrics.read().unwrap().writes;
+        let pushed = vec![0x7E; (state.fetcher.stripe_sector_count as usize) * SECTOR_SIZE];
+
+        state
+            .fetcher
+            .accept_pushed_stripe(0, &pushed, PushPermit::unbounded());
+        for _ in 0..10 {
+            state.fetcher.update();
+        }
+
+        assert_eq!(
+            state.target_dev.metrics.read().unwrap().writes,
+            writes_before + 1
+        );
+        let mut written = vec![0u8; pushed.len()];
+        state.target_dev.read(0, &mut written, pushed.len());
+        assert_eq!(written, pushed);
+        assert_eq!(state.fetcher.take_finished_fetches(), vec![(0, true)]);
+        assert_eq!(
+            state.source_dev.metrics.read().unwrap().reads,
+            1,
+            "the push is the copy; nothing is pulled"
+        );
     }
 }
