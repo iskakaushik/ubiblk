@@ -185,7 +185,10 @@ mod tests {
             .delete_objects(&["a".to_string()])
             .unwrap_err()
             .to_string();
-        assert!(err.contains("delete is not supported by this store"), "{err}");
+        assert!(
+            err.contains("delete is not supported by this store"),
+            "{err}"
+        );
     }
 
     #[test]

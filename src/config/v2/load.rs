@@ -4,9 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use super::{
-    spill::SpillSection, tuning::TuningSection, Config, DeviceSection, EncryptionSection,
-};
+use super::{spill::SpillSection, tuning::TuningSection, Config, DeviceSection, EncryptionSection};
 use crate::{
     config::v2::{
         includes::resolve_includes,
@@ -46,12 +44,7 @@ impl Config {
         let mut spill: Option<SpillSection> = parse_optional_section(&merged, "spill")?;
         if let Some(spill) = &mut spill {
             spill.resolve_paths(config_dir);
-            spill.validate(
-                &device,
-                stripe_source.as_ref(),
-                &tuning,
-                &common.secrets,
-            )?;
+            spill.validate(&device, stripe_source.as_ref(), &tuning, &common.secrets)?;
         }
 
         if let Some(encryption) = &encryption {
@@ -424,10 +417,7 @@ mod tests {
             allow_unencrypted_disk = true
         "#;
         let err = parse_config(toml).unwrap_err().to_string();
-        assert!(
-            err.contains("spill needs track_written = true"),
-            "{err}"
-        );
+        assert!(err.contains("spill needs track_written = true"), "{err}");
     }
 
     #[test]

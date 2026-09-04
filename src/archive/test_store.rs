@@ -233,7 +233,11 @@ mod tests {
         assert!(store.put_started_at.iter().all(|(_, at)| *at >= before));
 
         store.release_puts();
-        let finished: Vec<String> = store.poll_puts().into_iter().map(|(name, _)| name).collect();
+        let finished: Vec<String> = store
+            .poll_puts()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
         assert_eq!(finished, vec!["dev/3", "dev/1", "dev/2"]);
     }
 
@@ -245,7 +249,9 @@ mod tests {
             .put_object("dev/1", b"one", Duration::from_secs(1))
             .unwrap();
         assert_eq!(
-            get_store.get_object("dev/1", Duration::from_secs(1)).unwrap(),
+            get_store
+                .get_object("dev/1", Duration::from_secs(1))
+                .unwrap(),
             b"one"
         );
     }

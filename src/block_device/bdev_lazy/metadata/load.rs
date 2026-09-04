@@ -95,7 +95,9 @@ mod tests {
         let device = TestBlockDevice::new(1024 * 1024);
         save_with_version(&device, 2, 2);
 
-        let err = UbiMetadata::load_from_bdev(&device).unwrap_err().to_string();
+        let err = UbiMetadata::load_from_bdev(&device)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("Metadata version mismatch"), "{err}");
         assert!(err.contains("Expected: 2.0..=2.1"), "{err}");
     }
@@ -105,7 +107,9 @@ mod tests {
         let device = TestBlockDevice::new(1024 * 1024);
         save_with_version(&device, 1, METADATA_VERSION_MINOR_MIN);
 
-        let err = UbiMetadata::load_from_bdev(&device).unwrap_err().to_string();
+        let err = UbiMetadata::load_from_bdev(&device)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("Metadata version mismatch"), "{err}");
     }
 
@@ -116,8 +120,13 @@ mod tests {
         metadata.set_stripe_header(5, metadata_flags::HAS_SOURCE | 0b0100_0000);
         metadata.save_to_bdev(&device).expect("save metadata");
 
-        let err = UbiMetadata::load_from_bdev(&device).unwrap_err().to_string();
-        assert!(err.contains("stripe header 5 has reserved bits set"), "{err}");
+        let err = UbiMetadata::load_from_bdev(&device)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("stripe header 5 has reserved bits set"),
+            "{err}"
+        );
     }
 
     #[test]

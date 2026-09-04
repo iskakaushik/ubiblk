@@ -59,6 +59,9 @@ pub struct IngestPoolConfig {
     pub workers: usize,
     pub connections: usize,
     pub completions: Sender<BgWorkerRequest>,
+    /// Keep the source once everything is fetched: with spill, an evicted
+    /// clean stripe is re-pulled from it.
+    pub never_disconnect: bool,
 }
 
 impl IngestPool {
@@ -96,6 +99,7 @@ impl IngestPool {
                 connections: per_worker_connections,
                 completions: config.completions.clone(),
                 requests: request_rx,
+                never_disconnect: config.never_disconnect,
             };
 
             let handle = std::thread::Builder::new()
@@ -174,6 +178,7 @@ struct IngestWorker {
     connections: usize,
     completions: Sender<BgWorkerRequest>,
     requests: Receiver<IngestRequest>,
+    never_disconnect: bool,
 }
 
 impl IngestWorker {
@@ -194,6 +199,7 @@ impl IngestWorker {
             self.autofetch,
         )?;
         fetcher.set_expects_pushes(self.expects_pushes);
+        fetcher.set_never_disconnect(self.never_disconnect);
         fetcher.restrict_autofetch_to(self.start, self.end);
         Ok((fetcher, source_sector_count))
     }

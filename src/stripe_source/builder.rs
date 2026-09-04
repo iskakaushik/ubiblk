@@ -6,7 +6,7 @@ use ubiblk_macros::error_context;
 use crate::{
     archive::{ArchiveStore, FileSystemStore, S3Store},
     backends::build_raw_image_device,
-    block_device::NullBlockDevice,
+    block_device::{spill::SpillRuntime, NullBlockDevice, SharedMetadataState},
     config::v2::{
         self,
         secrets::{get_resolved_secret, ResolvedSecret, SecretRef},
@@ -19,23 +19,36 @@ use crate::{
 
 use super::*;
 
+/// What a builder needs to wrap the base source in a `SpillingStripeSource`:
+/// the runtime the backend built from `[spill]`, and the state it routes by.
+#[derive(Clone)]
+pub struct SpillSourceParts {
+    pub runtime: SpillRuntime,
+    pub state: SharedMetadataState,
+}
+
 #[derive(Clone)]
 pub struct StripeSourceBuilder {
     device_config: v2::Config,
     stripe_sector_count: u64,
     has_fetched_all_stripes: bool,
+    spill: Option<SpillSourceParts>,
 }
 
 impl StripeSourceBuilder {
+    /// `has_fetched_all_stripes` must be passed as false when spill is on: the
+    /// null-source shortcut would leave clean re-pulls nowhere to go.
     pub fn new(
         device_config: v2::Config,
         stripe_sector_count: u64,
         has_fetched_all_stripes: bool,
+        spill: Option<SpillSourceParts>,
     ) -> Self {
         Self {
             device_config,
             stripe_sector_count,
             has_fetched_all_stripes,
+            spill,
         }
     }
 
@@ -46,9 +59,50 @@ impl StripeSourceBuilder {
 
     /// Build a source that opens `connections` connections instead of what the
     /// config asks for. Ingest workers share the configured budget rather than
-    /// each opening a full set.
+    /// each opening a full set. With spill configured the source is wrapped so
+    /// evicted stripes can be routed to the spill store.
     #[error_context("Failed to build stripe source")]
     pub fn build_with_connections(
+        &self,
+        connection_override: Option<usize>,
+    ) -> Result<Box<dyn StripeSource>> {
+        let base = self.build_base_source(connection_override)?;
+        let Some(parts) = &self.spill else {
+            return Ok(base);
+        };
+
+        let spill = match &parts.runtime.store_factory {
+            None => None,
+            Some(factory) => {
+                // Pool workers share the store's connection budget the way
+                // they share a remote source's.
+                let configured = match self
+                    .device_config
+                    .spill
+                    .as_ref()
+                    .and_then(|s| s.store.as_ref())
+                {
+                    Some(ArchiveStorageConfig::S3 { connections, .. }) => *connections,
+                    _ => 1,
+                };
+                let connections = connection_override.unwrap_or(configured).max(1);
+                Some(SpillStripeSource::new(
+                    factory(connections)?,
+                    parts.runtime.codec.clone(),
+                    parts.runtime.device_id.clone(),
+                    connections,
+                    &parts.state,
+                ))
+            }
+        };
+        Ok(Box::new(SpillingStripeSource::new(
+            base,
+            spill,
+            parts.state.clone(),
+        )))
+    }
+
+    fn build_base_source(
         &self,
         connection_override: Option<usize>,
     ) -> Result<Box<dyn StripeSource>> {
@@ -325,7 +379,7 @@ mod tests {
     #[test]
     fn test_build_defaults_to_null_device() {
         let config = create_test_config(None, None);
-        let builder = StripeSourceBuilder::new(config, 4096, false);
+        let builder = StripeSourceBuilder::new(config, 4096, false, None);
 
         let result = builder.build();
 
@@ -345,7 +399,7 @@ mod tests {
         f.set_len(1024 * 1024).unwrap();
 
         let config = create_test_config(None, Some(file_path));
-        let builder = StripeSourceBuilder::new(config, 4096, false);
+        let builder = StripeSourceBuilder::new(config, 4096, false, None);
 
         let result = builder.build();
         assert!(
@@ -358,7 +412,7 @@ mod tests {
     fn test_build_local_block_device_fails_on_missing_file() {
         let bad_path = PathBuf::from("/path/to/nonexistent/file.img");
         let config = create_test_config(None, Some(bad_path));
-        let builder = StripeSourceBuilder::new(config, 4096, false);
+        let builder = StripeSourceBuilder::new(config, 4096, false, None);
 
         let result = builder.build();
 
@@ -375,7 +429,7 @@ mod tests {
     #[test]
     fn test_connect_to_invalid_remote_server() {
         let config = create_test_config(Some("127.0.0.1:99999".to_string()), None);
-        let builder = StripeSourceBuilder::new(config, 4096, false);
+        let builder = StripeSourceBuilder::new(config, 4096, false, None);
 
         let result = builder.build();
 
@@ -388,7 +442,7 @@ mod tests {
     #[test]
     fn test_skips_building_real_source_when_all_stripes_fetched() {
         let config = create_test_config(None, None);
-        let builder = StripeSourceBuilder::new(config, 4096, true);
+        let builder = StripeSourceBuilder::new(config, 4096, true, None);
 
         let result = builder.build();
         assert!(
@@ -526,6 +580,67 @@ mod tests {
         assert!(result.is_ok());
         let creds = result.unwrap();
         assert!(creds.is_some());
+    }
+
+    #[test]
+    fn build_with_connections_wraps_base_when_spill_parts_given() {
+        use crate::{
+            archive::{ArchiveCompressionAlgorithm, TestObjectStore},
+            block_device::{
+                spill::{EvictorConfig, SpillCodec},
+                UbiMetadata,
+            },
+            config::v2::spill::OnFull,
+        };
+        use std::sync::{Arc, Mutex};
+
+        let state = SharedMetadataState::new(&UbiMetadata::new(3, 4, 4));
+        let factory_calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = factory_calls.clone();
+        let runtime = SpillRuntime {
+            cfg: EvictorConfig {
+                data_path: "/tmp/device.raw".into(),
+                stripe_sector_count: 8,
+                target_sector_count: 32,
+                max_local_bytes: 1 << 20,
+                low_water_bytes: 4096,
+                hard_margin_bytes: 4096,
+                min_free_bytes: 4096,
+                clean_eviction: false,
+                on_full: OnFull::Stall,
+                max_concurrent_evictions: 1,
+                sweep_batch: 4096,
+                alignment: 4096,
+            },
+            device_id: "fork-1".to_string(),
+            store_factory: Some(Arc::new(move |workers| {
+                recorded.lock().unwrap().push(workers);
+                Ok(Box::new(TestObjectStore::new()) as Box<dyn ArchiveStore>)
+            })),
+            codec: SpillCodec::new(ArchiveCompressionAlgorithm::None, None, 8),
+        };
+        let parts = SpillSourceParts {
+            runtime,
+            state: state.clone(),
+        };
+
+        let builder =
+            StripeSourceBuilder::new(create_test_config(None, None), 8, false, Some(parts));
+        let source = builder.build_with_connections(Some(3)).unwrap();
+        assert_eq!(*factory_calls.lock().unwrap(), vec![3]);
+        // Null base plus the three spill connections.
+        assert_eq!(source.max_concurrent_requests(), 1 + 3);
+        assert_eq!(source.sector_count(), 0);
+
+        // Without a store (clean-only) the base is still wrapped but no store
+        // is built.
+        let mut clean_only = builder.clone();
+        if let Some(parts) = &mut clean_only.spill {
+            parts.runtime.store_factory = None;
+        }
+        let source = clean_only.build().unwrap();
+        assert_eq!(*factory_calls.lock().unwrap(), vec![3]);
+        assert_eq!(source.max_concurrent_requests(), 1);
     }
 
     #[test]

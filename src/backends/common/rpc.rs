@@ -441,7 +441,7 @@ mod tests {
         metadata.stripe_headers[2] |= metadata_flags::FETCHED;
 
         let shared_state = SharedMetadataState::new(&metadata);
-        let reporter = StatusReporter::new(shared_state, 64 * 2048);
+        let reporter = StatusReporter::new(shared_state, 64 * 2048, None);
 
         let handle = wrapped_start_rpc_server(&path, Some(reporter), vec![])
             .expect("Failed to start RPC server");
@@ -456,6 +456,44 @@ mod tests {
         assert_eq!(stripes["fetched"], 2);
         assert_eq!(stripes["source"], 16);
         assert_eq!(stripes["total"], 64);
+        assert!(
+            status.get("spill").is_none(),
+            "no [spill], no spill record: {status}"
+        );
+    }
+
+    #[test]
+    fn test_rpc_status_with_spill() {
+        let path = test_socket_path("status_with_spill");
+        let mut metadata = UbiMetadata::new(DEFAULT_STRIPE_SECTOR_COUNT_SHIFT, 64, 16);
+        metadata.stripe_headers[0] |= metadata_flags::FETCHED;
+        metadata.stripe_headers[1] |= metadata_flags::EVICTED | metadata_flags::IN_S3;
+
+        let shared_state = SharedMetadataState::new(&metadata);
+        let reporter = StatusReporter::new(
+            shared_state,
+            64 * 2048,
+            Some(crate::block_device::SpillReportConfig {
+                max_local_bytes: 1 << 30,
+                clean_eviction: false,
+            }),
+        );
+
+        let handle = wrapped_start_rpc_server(&path, Some(reporter), vec![])
+            .expect("Failed to start RPC server");
+
+        let response = rpc_call(&path, "status");
+        handle.stop().expect("Failed to stop RPC server");
+
+        let spill = &response["status"]["spill"];
+        assert!(spill.is_object(), "{response}");
+        assert_eq!(spill["gate"], "open");
+        assert_eq!(spill["resident"], 1);
+        assert_eq!(spill["evicted"], 1);
+        assert_eq!(spill["in_s3"], 1);
+        assert_eq!(spill["max_local_bytes"], 1u64 << 30);
+        assert_eq!(spill["clean_eviction"], false);
+        assert_eq!(response["status"]["stripes"]["fetched"], 1);
     }
 
     #[test]

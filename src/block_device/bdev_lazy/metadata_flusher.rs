@@ -13,7 +13,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 const MAX_CONCURRENT_CHANGES: usize = 16;
 
 /// Header bits a request may set or clear. The rest of the byte is reserved.
-const UPDATABLE_MASK: u8 = metadata_flags::FETCHED | metadata_flags::WRITTEN | metadata_flags::SPILL_MASK;
+const UPDATABLE_MASK: u8 =
+    metadata_flags::FETCHED | metadata_flags::WRITTEN | metadata_flags::SPILL_MASK;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MetadataFlusherRequest {
@@ -728,7 +729,8 @@ mod tests {
         );
         wait_for_completion(&mut flusher);
 
-        let expected = (old | metadata_flags::EVICTED | metadata_flags::IN_S3) & !metadata_flags::FETCHED;
+        let expected =
+            (old | metadata_flags::EVICTED | metadata_flags::IN_S3) & !metadata_flags::FETCHED;
         assert_eq!(io_counts(&metadata_dev), (writes + 1, flushes + 1));
         assert_eq!(on_disk_header(&metadata_dev, 5), expected);
         assert_eq!(flusher.header(5), expected);
@@ -774,7 +776,8 @@ mod tests {
         flusher.set_stripe_fetched(5);
         flusher.set_stripe_written(5);
         wait_for_completion(&mut flusher);
-        let original = metadata_flags::FETCHED | metadata_flags::WRITTEN | metadata_flags::HAS_SOURCE;
+        let original =
+            metadata_flags::FETCHED | metadata_flags::WRITTEN | metadata_flags::HAS_SOURCE;
         assert_eq!(flusher.header(5), original);
 
         metadata_dev
@@ -823,14 +826,25 @@ mod tests {
             }]
         );
         let new = (old | metadata_flags::EVICTED) & !metadata_flags::FETCHED;
-        assert_eq!(flusher.header(5), new, "memory keeps the new byte for the retry");
-        assert_eq!(on_disk_header(&metadata_dev, 5), new, "the sector write did land");
+        assert_eq!(
+            flusher.header(5),
+            new,
+            "memory keeps the new byte for the retry"
+        );
+        assert_eq!(
+            on_disk_header(&metadata_dev, 5),
+            new,
+            "the sector write did land"
+        );
         assert!(!flusher.busy());
 
         // The retry rewrites the same byte and is durable.
         flusher.update_stripe_header(5, metadata_flags::EVICTED, metadata_flags::FETCHED, 5);
         wait_for_completion(&mut flusher);
-        assert_eq!(flusher.take_persist_outcomes()[0].result, PersistResult::Durable);
+        assert_eq!(
+            flusher.take_persist_outcomes()[0].result,
+            PersistResult::Durable
+        );
     }
 
     #[test]
@@ -849,7 +863,10 @@ mod tests {
         flusher.update_stripe_header(5, metadata_flags::FETCHED, 0, 9);
         wait_for_completion(&mut flusher);
         assert_eq!(io_counts(&metadata_dev), (writes + 1, flushes + 1));
-        assert_eq!(flusher.take_persist_outcomes()[0].result, PersistResult::Durable);
+        assert_eq!(
+            flusher.take_persist_outcomes()[0].result,
+            PersistResult::Durable
+        );
     }
 
     #[test]
@@ -878,22 +895,38 @@ mod tests {
         flusher.set_stripe_written(5);
         flusher.update_stripe_header(6, metadata_flags::EVICTED, metadata_flags::FETCHED, 1);
         flusher.start_writes();
-        assert_eq!(io_counts(&metadata_dev), (writes + 1, flushes), "one write at a time per sector");
+        assert_eq!(
+            io_counts(&metadata_dev),
+            (writes + 1, flushes),
+            "one write at a time per sector"
+        );
         assert!(flusher.take_persist_outcomes().is_empty());
 
         wait_for_completion(&mut flusher);
         assert_eq!(io_counts(&metadata_dev), (writes + 2, flushes + 2));
-        assert_eq!(flusher.take_persist_outcomes()[0].result, PersistResult::Durable);
+        assert_eq!(
+            flusher.take_persist_outcomes()[0].result,
+            PersistResult::Durable
+        );
         // The second write started from the sector image the first produced,
         // so neither update lost the other.
-        assert_ne!(on_disk_header(&metadata_dev, 5) & metadata_flags::WRITTEN, 0);
-        assert_ne!(on_disk_header(&metadata_dev, 6) & metadata_flags::EVICTED, 0);
+        assert_ne!(
+            on_disk_header(&metadata_dev, 5) & metadata_flags::WRITTEN,
+            0
+        );
+        assert_ne!(
+            on_disk_header(&metadata_dev, 6) & metadata_flags::EVICTED,
+            0
+        );
     }
 
     #[test]
     fn metadata_accessor_reflects_applied_updates() {
         let (_metadata_dev, _shared_state, mut flusher) = init_flusher();
-        assert_eq!(flusher.metadata().stripe_header(5) & metadata_flags::FETCHED, 0);
+        assert_eq!(
+            flusher.metadata().stripe_header(5) & metadata_flags::FETCHED,
+            0
+        );
 
         flusher.set_stripe_fetched(5);
         assert_eq!(
@@ -903,7 +936,10 @@ mod tests {
         );
 
         flusher.start_writes();
-        assert_ne!(flusher.metadata().stripe_header(5) & metadata_flags::FETCHED, 0);
+        assert_ne!(
+            flusher.metadata().stripe_header(5) & metadata_flags::FETCHED,
+            0
+        );
         assert_eq!(flusher.metadata().stripe_header(5), flusher.header(5));
         assert_eq!(flusher.metadata().evicted_stripe_ids(), Vec::<usize>::new());
         wait_for_completion(&mut flusher);

@@ -303,7 +303,11 @@ mod tests {
             allow_inline_plaintext_secrets: true,
             ..Default::default()
         };
-        resolve_secrets(&HashMap::from([("spill-kek".to_string(), def)]), &danger_zone).unwrap()
+        resolve_secrets(
+            &HashMap::from([("spill-kek".to_string(), def)]),
+            &danger_zone,
+        )
+        .unwrap()
     }
 
     fn validate(section: &SpillSection, device: &DeviceSection) -> Result<()> {
@@ -610,10 +614,7 @@ mod tests {
             ),
             "spill.kek secret must be exactly 32 bytes for AES-256-GCM (got 16 bytes)",
         );
-        rejects(
-            validate(&section, &device()),
-            "spill-kek",
-        );
+        rejects(validate(&section, &device()), "spill-kek");
         section
             .validate(
                 &device(),
@@ -632,12 +633,7 @@ mod tests {
             ..Default::default()
         };
         rejects(
-            section().validate(
-                &device(),
-                Some(&remote_source()),
-                &tuning,
-                &HashMap::new(),
-            ),
+            section().validate(&device(), Some(&remote_source()), &tuning, &HashMap::new()),
             "spill's per-stripe in-flight counter is 16 bits; reduce num_queues * queue_size",
         );
         let tuning = TuningSection {

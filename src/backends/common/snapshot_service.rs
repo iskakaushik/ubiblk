@@ -157,6 +157,7 @@ pub fn spawn_snapshot_subscriber(
     address: &str,
     compression: WireCompression,
     bgworker_ch: Sender<BgWorkerRequest>,
+    liveness: SharedMetadataState,
 ) -> Result<()> {
     let address = address.to_string();
     let gate = PushGate::new(MAX_QUEUED_PUSHES);
@@ -164,7 +165,7 @@ pub fn spawn_snapshot_subscriber(
     thread::Builder::new()
         .name("snapshot-subscriber".to_string())
         .spawn(move || loop {
-            match subscribe_once(&address, compression, &gate, &bgworker_ch) {
+            match subscribe_once(&address, compression, &gate, &bgworker_ch, &liveness) {
                 Ok(()) => info!("Snapshot ended; not resubscribing"),
                 Err(e) => {
                     warn!("Snapshot subscription to {address} ended: {e}");
@@ -183,11 +184,14 @@ pub fn spawn_snapshot_subscriber(
     Ok(())
 }
 
+/// `liveness` is where `source_live` is kept: set once this subscription is
+/// up and cleared for good when it ends, which lands with the subscriber work.
 fn subscribe_once(
     address: &str,
     compression: WireCompression,
     gate: &Arc<PushGate>,
     bgworker_ch: &Sender<BgWorkerRequest>,
+    _liveness: &SharedMetadataState,
 ) -> Result<()> {
     let stream = TcpStream::connect(address).map_err(|e| {
         crate::ubiblk_error!(InvalidParameter {

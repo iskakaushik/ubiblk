@@ -68,6 +68,7 @@ mod tests {
                 false,
                 metadata_state.clone(),
                 bgworker_rx,
+                None,
             )
             .unwrap();
             let lazy = LazyBlockDevice::new(
@@ -110,6 +111,7 @@ mod tests {
                 false,
                 metadata_state.clone(),
                 bgworker_rx,
+                None,
             )
             .unwrap();
             let lazy = LazyBlockDevice::new(

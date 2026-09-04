@@ -94,6 +94,9 @@ pub struct StripeFetcher {
     finished_fetches: Vec<(usize, bool)>,
     autofetch: bool,
     disconnected: bool,
+    /// Keep the source even once every stripe is fetched. With spill, an
+    /// evicted clean stripe is re-pulled from it.
+    never_disconnect: bool,
     /// How many stripes to keep in flight. Sized from the source: a fetcher
     /// that asks for one stripe at a time leaves every connection but one idle
     /// and turns each stripe's round trip into the whole cost of the transfer.
@@ -171,6 +174,7 @@ impl StripeFetcher {
             autofetch,
             autofetch_queue,
             disconnected: false,
+            never_disconnect: false,
             concurrency,
             awaiting_flush: Vec::new(),
             flushing_batch: Vec::new(),
@@ -275,6 +279,13 @@ impl StripeFetcher {
     /// write/flush/mark-fetched path runs and the fork never pulls it later.
     /// Tell the fetcher that this device subscribes to a snapshot, so stripes
     /// its source refuses are coming over the push channel instead.
+    /// With spill, the source must stay: an evicted clean stripe is re-pulled
+    /// from it. Guarding here covers the coordinator's and the pool workers'
+    /// disconnect calls in one place.
+    pub fn set_never_disconnect(&mut self, never: bool) {
+        self.never_disconnect = never;
+    }
+
     pub fn set_expects_pushes(&mut self, expects_pushes: bool) {
         self.expects_pushes = expects_pushes;
     }
@@ -380,6 +391,9 @@ impl StripeFetcher {
     }
 
     pub fn disconnect_from_source_if_all_fetched(&mut self) {
+        if self.never_disconnect {
+            return;
+        }
         if !self.disconnected
             && !self.busy()
             && self.shared_metadata_state.source_stripes()
@@ -1120,6 +1134,28 @@ mod tests {
         // Now should disconnect
         state.fetcher.disconnect_from_source_if_all_fetched();
         assert_eq!(state.fetcher.stripe_source.sector_count(), 0);
+        assert!(state.fetcher.disconnected);
+    }
+
+    #[test]
+    fn never_disconnect_keeps_the_source() {
+        let mut state = prep(false);
+        state.fetcher.set_never_disconnect(true);
+        let source_stripe_count = state.fetcher.source_stripe_count() as usize;
+        for stripe_id in 0..source_stripe_count {
+            state.fetcher.shared_metadata_state.set_stripe_header(
+                stripe_id,
+                metadata_flags::FETCHED | metadata_flags::HAS_SOURCE,
+            );
+        }
+
+        state.fetcher.disconnect_from_source_if_all_fetched();
+        assert_ne!(state.fetcher.stripe_source.sector_count(), 0);
+        assert!(!state.fetcher.disconnected);
+
+        // Turning it off again lets the disconnect happen as before.
+        state.fetcher.set_never_disconnect(false);
+        state.fetcher.disconnect_from_source_if_all_fetched();
         assert!(state.fetcher.disconnected);
     }
 }

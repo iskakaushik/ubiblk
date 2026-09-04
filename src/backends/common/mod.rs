@@ -13,8 +13,8 @@ use ubiblk_macros::error_context;
 
 use crate::{
     block_device::{
-        self, BgWorker, BgWorkerRequest, BlockDevice, SharedMetadataState, StatusReporter,
-        SyncBlockDevice, UbiMetadata, UringBlockDevice,
+        self, spill::SpillRuntime, BgWorker, BgWorkerRequest, BlockDevice, SharedMetadataState,
+        StatusReporter, SyncBlockDevice, UbiMetadata, UringBlockDevice,
     },
     config::v2,
     stripe_source::StripeSourceBuilder,
@@ -44,6 +44,9 @@ struct BgWorkerConfig {
     completions: Sender<BgWorkerRequest>,
     workers: usize,
     connections: usize,
+    /// Present when `[spill]` is configured. The evictor built from it arrives
+    /// with the backend wiring; until then the coordinator runs without one.
+    spill: Option<SpillRuntime>,
 }
 
 /// The snapshot layer's shared state plus what is needed to start its worker.
@@ -189,7 +192,9 @@ impl BackendEnv {
         }
 
         if let Some(address) = self.config.device.snapshot_source.clone() {
-            let Some(bgworker_sender) = self.bgworker_sender.clone() else {
+            let (Some(bgworker_sender), Some(snapshot)) =
+                (self.bgworker_sender.clone(), self.snapshot.as_ref())
+            else {
                 return Err(crate::ubiblk_error!(InvalidParameter {
                     description: "snapshot_source needs a device with metadata".to_string(),
                 }));
@@ -198,6 +203,7 @@ impl BackendEnv {
                 &address,
                 self.config.device.snapshot_compression,
                 bgworker_sender,
+                snapshot.live_state.clone(),
             )?;
         }
 
@@ -256,7 +262,8 @@ impl BackendEnv {
     ) -> Result<Self> {
         let metadata = UbiMetadata::load_from_bdev(metadata_device.as_ref())?;
         let shared_state = SharedMetadataState::new(&metadata);
-        let status_reporter = StatusReporter::new(shared_state.clone(), disk_device.sector_count());
+        let status_reporter =
+            StatusReporter::new(shared_state.clone(), disk_device.sector_count(), None);
 
         let (bgworker_sender, bgworker_receiver) = channel();
 
@@ -289,10 +296,14 @@ impl BackendEnv {
             source: snapshot_source,
         };
 
+        // With spill on, the null-source shortcut would leave a clean
+        // re-pull nowhere to go; the parts themselves arrive with the backend
+        // wiring.
         let stripe_source_builder = Box::new(StripeSourceBuilder::new(
             config.clone(),
             shared_state.stripe_sector_count(),
-            metadata.has_fetched_all_stripes(),
+            metadata.has_fetched_all_stripes() && config.spill.is_none(),
+            None,
         ));
 
         let bgworker_config = BgWorkerConfig {
@@ -315,6 +326,7 @@ impl BackendEnv {
                 .stripe_source
                 .as_ref()
                 .map_or(1, |stripe_source| stripe_source.connections()),
+            spill: None,
         };
 
         Ok(BackendEnv {
@@ -417,6 +429,7 @@ impl BackendEnv {
             completions,
             workers,
             connections,
+            spill: _spill,
         } = config;
 
         if workers > 1 {
@@ -432,6 +445,7 @@ impl BackendEnv {
                 completions,
                 workers,
                 connections,
+                None,
             );
         }
 
@@ -452,6 +466,7 @@ impl BackendEnv {
             expects_pushes,
             shared_state,
             receiver,
+            None,
         )
     }
 }
@@ -523,7 +538,7 @@ pub fn init_metadata(config: &v2::Config, stripe_sector_count_shift: u8) -> Resu
         UbiMetadata::new(stripe_sector_count_shift, base_stripe_count, 0)
     } else {
         let stripe_source =
-            StripeSourceBuilder::new(config.clone(), stripe_sector_count, false).build()?;
+            StripeSourceBuilder::new(config.clone(), stripe_sector_count, false, None).build()?;
         UbiMetadata::new_from_stripe_source(
             stripe_sector_count_shift,
             base_stripe_count,
@@ -860,6 +875,7 @@ mod tests {
             test_config(Path::new("/tmp/ubiblk-test-disk"), None, None),
             shared_state.stripe_sector_count(),
             loaded_metadata.has_fetched_all_stripes(),
+            None,
         ));
         let (sender, receiver) = channel();
 
@@ -876,6 +892,7 @@ mod tests {
                 completions: sender.clone(),
                 workers: 1,
                 connections: 1,
+                spill: None,
             },
             sender,
         )

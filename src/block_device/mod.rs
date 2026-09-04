@@ -55,11 +55,16 @@ pub use bdev_lazy::{
     device::LazyBlockDevice,
     metadata::{
         save::DEFAULT_STRIPE_SECTOR_COUNT_SHIFT,
-        shared_state::SharedMetadataState,
+        shared_state::{
+            stripe_flags, SharedMetadataState, SpillCounters, GATE_FAIL, GATE_HOLD, GATE_OPEN,
+        },
         types::{metadata_flags, UbiMetadata},
+        Evicted, Evicting,
     },
+    metadata_flusher::{PersistOutcome, PersistResult},
     push_gate::{PushGate, PushPermit, MAX_QUEUED_PUSHES},
-    status_report::{StatusReport, StatusReporter},
+    spill,
+    status_report::{SpillRecord, SpillReportConfig, StatusReport, StatusReporter},
 };
 
 pub use bdev_crypt::CryptBlockDevice;

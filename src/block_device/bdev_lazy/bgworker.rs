@@ -3,6 +3,7 @@ use super::{
     metadata::shared_state::SharedMetadataState,
     metadata_flusher::MetadataFlusher,
     push_gate::PushPermit,
+    spill::Evictor,
     stripe_fetcher::StripeFetcher,
 };
 
@@ -12,10 +13,19 @@ use crate::{
     Result,
 };
 use log::{error, info};
-use std::sync::{
-    mpsc::{Receiver, Sender, TryRecvError},
-    Arc,
+use std::{
+    collections::HashMap,
+    sync::{
+        mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError},
+        Arc,
+    },
+    time::Duration,
 };
+
+/// How long the coordinator waits for a request when an evictor exists and
+/// nothing is busy. The evictor has deadlines of its own (statfs refresh,
+/// upload backoff), so the loop must come round without a request.
+const EVICTOR_IDLE_WAIT: Duration = Duration::from_millis(250);
 
 pub enum BgWorkerRequest {
     Fetch {
@@ -50,11 +60,30 @@ enum Ingest {
     Pool(IngestPool),
 }
 
+/// A re-materialised stripe whose EVICTED-clearing header is in the flusher.
+/// The guest may not see it as resident before that header is durable: the
+/// startup pass punches every stripe whose header says EVICTED.
+#[allow(dead_code)]
+struct PendingRelease {
+    stripe_id: usize,
+    retries: u8,
+}
+
 pub struct BgWorker {
     ingest: Ingest,
     metadata_flusher: MetadataFlusher,
     req_receiver: Receiver<BgWorkerRequest>,
     metadata_state: SharedMetadataState,
+    /// Present when `[spill]` is configured.
+    evictor: Option<Evictor>,
+    // Driven by the coordinator logic that lands with the evictor body.
+    /// Evicted stripes whose data has landed and whose EVICTED-clearing header
+    /// is in the flusher, keyed by even token.
+    #[allow(dead_code)]
+    pending_release: HashMap<u64, PendingRelease>,
+    /// Even tokens are the coordinator's; odd ones the evictor's.
+    #[allow(dead_code)]
+    next_release_token: u64,
     done: bool,
 }
 
@@ -69,6 +98,7 @@ impl BgWorker {
         expects_pushes: bool,
         metadata_state: SharedMetadataState,
         req_receiver: Receiver<BgWorkerRequest>,
+        evictor: Option<Evictor>,
     ) -> Result<Self> {
         let source_sector_count = stripe_source.sector_count();
         let metadata_flusher =
@@ -82,12 +112,16 @@ impl BgWorker {
             autofetch,
         )?;
         stripe_fetcher.set_expects_pushes(expects_pushes);
+        stripe_fetcher.set_never_disconnect(evictor.is_some());
         Ok(BgWorker {
             ingest: Ingest::Inline(Box::new(stripe_fetcher)),
             metadata_flusher,
             req_receiver,
-            done: false,
             metadata_state,
+            evictor,
+            pending_release: HashMap::new(),
+            next_release_token: 2,
+            done: false,
         })
     }
 
@@ -107,6 +141,7 @@ impl BgWorker {
         completions: Sender<BgWorkerRequest>,
         workers: usize,
         connections: usize,
+        evictor: Option<Evictor>,
     ) -> Result<Self> {
         // Size the source before starting anything, so a device that cannot
         // hold its source is reported as that rather than as whichever worker
@@ -127,14 +162,18 @@ impl BgWorker {
             workers,
             connections,
             completions,
+            never_disconnect: evictor.is_some(),
         })?;
 
         Ok(BgWorker {
             ingest: Ingest::Pool(pool),
             metadata_flusher,
             req_receiver,
-            done: false,
             metadata_state,
+            evictor,
+            pending_release: HashMap::new(),
+            next_release_token: 2,
+            done: false,
         })
     }
 
@@ -193,6 +232,35 @@ impl BgWorker {
             }
         }
 
+        self.drain_requests();
+    }
+
+    /// `receive_requests` with a bound on the wait: `None` blocks as it does,
+    /// `Some(wait)` gives up after that long so the evictor's deadlines are met
+    /// even when no guest asks for anything.
+    pub fn receive_requests_for(&mut self, wait: Option<Duration>) {
+        let first = match wait {
+            None => self
+                .req_receiver
+                .recv()
+                .map_err(|_| RecvTimeoutError::Disconnected),
+            Some(wait) => self.req_receiver.recv_timeout(wait),
+        };
+        match first {
+            Ok(req) => self.process_request(req),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                error!("Request channel disconnected, stopping worker");
+                self.done = true;
+                return;
+            }
+        }
+
+        self.drain_requests();
+    }
+
+    /// Everything already queued, without waiting.
+    fn drain_requests(&mut self) {
         loop {
             match self.req_receiver.try_recv() {
                 Ok(req) => self.process_request(req),
@@ -233,8 +301,18 @@ impl BgWorker {
             let busy = match &self.ingest {
                 Ingest::Inline(fetcher) => fetcher.busy(),
                 Ingest::Pool(_) => false,
-            } || self.metadata_flusher.busy();
-            self.receive_requests(!busy);
+            } || self.metadata_flusher.busy()
+                || self.evictor.as_ref().is_some_and(Evictor::busy);
+            if self.evictor.is_some() {
+                let wait = if busy {
+                    Duration::ZERO
+                } else {
+                    EVICTOR_IDLE_WAIT
+                };
+                self.receive_requests_for(Some(wait));
+            } else {
+                self.receive_requests(!busy);
+            }
             self.update();
         }
 
@@ -281,10 +359,109 @@ mod tests {
                 false,
                 metadata_state,
                 rx,
+                None,
             )
             .unwrap(),
             tx,
         )
+    }
+
+    /// A coordinator with the stub evictor attached, so the evictor branches of
+    /// the run loop are exercised.
+    fn build_bg_worker_with_evictor() -> (BgWorker, std::sync::mpsc::Sender<BgWorkerRequest>) {
+        use crate::{
+            archive::ArchiveCompressionAlgorithm,
+            block_device::spill::{EvictorConfig, RecordingPuncher, SpillCodec},
+            config::v2::spill::OnFull,
+        };
+
+        let stripe_sector_count_shift = 11;
+        let stripe_sector_count = 1u64 << stripe_sector_count_shift;
+        let source_dev = TestBlockDevice::new(1024 * 1024);
+        let stripe_source = Box::new(
+            stripe_source::BlockDeviceStripeSource::new(source_dev.clone(), stripe_sector_count)
+                .unwrap(),
+        );
+        let target_dev = TestBlockDevice::new(1024 * 1024);
+        let metadata_dev = TestBlockDevice::new(1024 * 1024);
+        let metadata = UbiMetadata::new(stripe_sector_count_shift, 16, 16);
+        metadata.save_to_bdev(&metadata_dev).unwrap();
+        let metadata_state = {
+            let metadata = UbiMetadata::load_from_bdev(&metadata_dev).expect("load metadata");
+            SharedMetadataState::new(&metadata)
+        };
+        let evictor = Evictor::new(
+            EvictorConfig {
+                data_path: "/tmp/device.raw".into(),
+                stripe_sector_count,
+                target_sector_count: target_dev.sector_count(),
+                max_local_bytes: 1 << 20,
+                low_water_bytes: 4096,
+                hard_margin_bytes: 4096,
+                min_free_bytes: 4096,
+                clean_eviction: false,
+                on_full: OnFull::Stall,
+                max_concurrent_evictions: 1,
+                sweep_batch: 4096,
+                alignment: 4096,
+            },
+            target_dev.create_channel().unwrap(),
+            None,
+            SpillCodec::new(ArchiveCompressionAlgorithm::None, None, stripe_sector_count),
+            Box::new(RecordingPuncher::default()),
+            metadata_state.clone(),
+        )
+        .unwrap();
+
+        let (tx, rx) = channel();
+        (
+            BgWorker::new(
+                stripe_source,
+                &target_dev,
+                &metadata_dev,
+                4096,
+                false,
+                false,
+                metadata_state,
+                rx,
+                Some(evictor),
+            )
+            .unwrap(),
+            tx,
+        )
+    }
+
+    #[test]
+    fn receive_requests_for_returns_after_the_wait() {
+        let (mut bg_worker, sender) = build_bg_worker();
+
+        let start = std::time::Instant::now();
+        bg_worker.receive_requests_for(Some(Duration::from_millis(20)));
+        assert!(start.elapsed() >= Duration::from_millis(20));
+        assert!(!bg_worker.done);
+
+        sender.send(BgWorkerRequest::Shutdown).unwrap();
+        bg_worker.receive_requests_for(Some(Duration::from_secs(5)));
+        assert!(bg_worker.done);
+
+        // A dropped sender stops the worker rather than spinning on it.
+        let (mut bg_worker, sender) = build_bg_worker();
+        drop(sender);
+        bg_worker.receive_requests_for(None);
+        assert!(bg_worker.done);
+    }
+
+    #[test]
+    fn run_loop_with_evictor_waits_and_shuts_down() {
+        let (mut bg_worker, sender) = build_bg_worker_with_evictor();
+        assert!(bg_worker.evictor.is_some());
+        let stop = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            sender.send(BgWorkerRequest::Shutdown).unwrap();
+        });
+        bg_worker.run();
+        stop.join().unwrap();
+        assert!(bg_worker.done);
     }
 
     fn build_bg_worker() -> (BgWorker, std::sync::mpsc::Sender<BgWorkerRequest>) {
@@ -335,6 +512,7 @@ mod tests {
             false,
             metadata_state,
             rx,
+            None,
         )
         .expect("BgWorker should support null source device");
     }

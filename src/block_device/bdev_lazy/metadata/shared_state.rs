@@ -109,17 +109,16 @@ impl SharedMetadataState {
             } else {
                 NotWritten
             };
-            let fetch_state = if header & metadata_flags::EVICTED != 0
-                && header & metadata_flags::FETCHED == 0
-            {
-                Evicted
-            } else if header & metadata_flags::HAS_SOURCE == 0 {
-                NoSource
-            } else if header & metadata_flags::FETCHED != 0 {
-                Fetched
-            } else {
-                NotFetched
-            };
+            let fetch_state =
+                if header & metadata_flags::EVICTED != 0 && header & metadata_flags::FETCHED == 0 {
+                    Evicted
+                } else if header & metadata_flags::HAS_SOURCE == 0 {
+                    NoSource
+                } else if header & metadata_flags::FETCHED != 0 {
+                    Fetched
+                } else {
+                    NotFetched
+                };
             // No writer sets both. If both are read, the punch never happened
             // (it follows the header flush, which would have cleared FETCHED),
             // so the data is still local and FETCHED wins.
@@ -273,7 +272,10 @@ impl SharedMetadataState {
     pub fn pin_inflight(&self, first: usize, last: usize) {
         for stripe_id in first..=last {
             let prev = self.stripe_inflight[stripe_id].fetch_add(1, Ordering::SeqCst);
-            debug_assert!(prev < u16::MAX, "stripe {stripe_id} in-flight counter overflow");
+            debug_assert!(
+                prev < u16::MAX,
+                "stripe {stripe_id} in-flight counter overflow"
+            );
         }
     }
 
@@ -291,16 +293,20 @@ impl SharedMetadataState {
     // ---- landing (coordinator only)
 
     /// The state a landed stripe rests in: Fetched if the source holds it,
-    /// NoSource otherwise. Sets FETCHED_LIVE when the snapshot is live right
-    /// now, which is what makes a clean eviction of it safe later.
+    /// NoSource otherwise.
     fn landed_state(&self, stripe_id: usize) -> u8 {
-        if self.source_live() {
-            self.set_stripe_flags(stripe_id, stripe_flags::FETCHED_LIVE);
-        }
         if self.stripe_has_source(stripe_id) {
             Fetched
         } else {
             NoSource
+        }
+    }
+
+    /// A stripe that became resident while the snapshot is live may be evicted
+    /// clean later; one that landed after the snapshot ended may not.
+    fn record_landed_live(&self, stripe_id: usize) {
+        if self.source_live() {
+            self.set_stripe_flags(stripe_id, stripe_flags::FETCHED_LIVE);
         }
     }
 
@@ -333,6 +339,7 @@ impl SharedMetadataState {
                 Err(actual) => current = actual,
             }
         }
+        self.record_landed_live(stripe_id);
         if target == Fetched {
             self.fetched_stripes_count.fetch_add(1, Ordering::AcqRel);
         }
@@ -356,6 +363,7 @@ impl SharedMetadataState {
             self.spill.degraded_reasons.fetch_add(1, Ordering::Relaxed);
             return;
         }
+        self.record_landed_live(stripe_id);
         self.evicted_stripes_count.fetch_sub(1, Ordering::AcqRel);
         if self.stripe_in_s3(stripe_id) {
             self.in_s3_stripes_count.fetch_sub(1, Ordering::AcqRel);
@@ -637,7 +645,11 @@ mod tests {
         assert_eq!(state.stripe_fetch_state(0), Evicted);
         assert_eq!(state.stripe_fetch_state(1), Evicted);
         assert!(state.stripe_in_s3(1));
-        assert_eq!(state.stripe_fetch_state(2), Evicted, "EVICTED beats NoSource");
+        assert_eq!(
+            state.stripe_fetch_state(2),
+            Evicted,
+            "EVICTED beats NoSource"
+        );
         assert!(!state.stripe_has_source(2));
         assert!(state.stripe_written(2));
         assert_eq!(state.stripe_fetch_state(3), Fetched);
@@ -952,6 +964,17 @@ mod tests {
 
         state.set_source_live(false);
         state.set_stripe_fetch_state_for_test(0, Evicted);
+        state.mark_stripe_resident(0);
+        assert!(!state.stripe_fetched_live(0));
+
+        // A landing that changes nothing (stale completion on a claimed or
+        // already resident stripe) does not claim the stripe landed live.
+        state.set_source_live(true);
+        state.set_stripe_fetch_state_for_test(0, Evicting);
+        state.mark_stripe_fetched(0);
+        assert!(!state.stripe_fetched_live(0));
+        state.set_stripe_fetch_state_for_test(0, Fetched);
+        state.mark_stripe_fetched(0);
         state.mark_stripe_resident(0);
         assert!(!state.stripe_fetched_live(0));
     }

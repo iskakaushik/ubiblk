@@ -6,6 +6,7 @@ pub mod ingest_pool;
 pub mod metadata;
 pub mod metadata_flusher;
 pub mod push_gate;
+pub mod spill;
 pub mod status_report;
 pub mod stripe_fetcher;
 
