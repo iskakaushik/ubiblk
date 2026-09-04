@@ -210,6 +210,20 @@ impl StripeFetcher {
             .saturating_sub(1)
             .min(stripe_id + readahead);
         for ahead in (stripe_id..=last).rev() {
+            // Readahead never pulls an evicted stripe back. The coordinator
+            // vets the one stripe the guest asked for: it drops the request
+            // while a re-fetch of that stripe has landed and its header is
+            // still in flight, and only forwards it when a pull is really
+            // needed. Readahead skips that check, so a stripe it pulled could
+            // be written a second time after the coordinator has released it
+            // to the guest, and that second write would land on top of a
+            // guest write. The sweep keeps off evicted stripes for the same
+            // reason; they come back only when a guest asks for them.
+            if ahead != stripe_id && self.shared_metadata_state.stripe_fetch_state(ahead) == Evicted
+            {
+                debug!("Stripe {ahead} was evicted, leaving it out of the readahead");
+                continue;
+            }
             self.enqueue_demand(ahead);
         }
     }
@@ -293,6 +307,19 @@ impl StripeFetcher {
     /// Evicted counts. A `Fetched` entry whose shared state is still NotFetched
     /// is the normal gap between a worker's completion and the coordinator's
     /// `mark_stripe_fetched`.
+    ///
+    /// This leans on the coordinator. A stripe re-fetched while Evicted stays
+    /// Evicted until the header that clears EVICTED is durable, and in that
+    /// window the fetcher cannot tell "evicted, needs a pull" from "evicted,
+    /// my pull landed, release pending": both are a `Fetched` entry with the
+    /// shared state Evicted. A `Fetch` forwarded here in that window starts a
+    /// second pull whose write lands after the guest has the stripe back, on
+    /// top of whatever the guest wrote. The fetcher cannot latch "landed while
+    /// Evicted" either, because a release that fails for good leaves the
+    /// stripe Evicted and expects the next `Fetch` to pull again. So the
+    /// coordinator must not forward a `Fetch` for a stripe whose landing it
+    /// has not yet taken in, including a completion still queued behind the
+    /// request on the pool workers' channel, nor for one in pending release.
     fn drop_stale_entry(&mut self, stripe_id: usize) {
         if self.entry_is_stale(stripe_id) {
             debug!("Stripe {stripe_id} was evicted since it was fetched, forgetting the old fetch");
@@ -1274,6 +1301,66 @@ mod tests {
         assert!(
             !finished.iter().any(|(stripe_id, _)| *stripe_id == 3),
             "the evicting stripe must not be fetched: {finished:?}"
+        );
+    }
+
+    /// Readahead behind a guest's request must not pull an evicted stripe
+    /// back. Only the stripe the guest asked for went through the
+    /// coordinator, which drops a request for a stripe whose re-fetch has
+    /// landed and is waiting on its header; a readahead pull of that stripe
+    /// would be written a second time after the guest has it back.
+    #[test]
+    fn readahead_leaves_evicted_stripes_alone() {
+        let mut state = prep(true);
+        // Only demand and its readahead in this test, no sweep.
+        state.fetcher.autofetch_queue.clear();
+
+        // Stripe 1 is fetched once, as the guest's own request.
+        state.fetcher.handle_fetch_request(1);
+        for _ in 0..10 {
+            state.fetcher.update();
+        }
+        let finished = state.fetcher.take_finished_fetches();
+        assert!(finished.contains(&(1, true)));
+        assert_eq!(finished.len(), 1 + DEMAND_READAHEAD, "{finished:?}");
+        let reads_before = state.source_dev.metrics.read().unwrap().reads;
+
+        // Then evicted, and asked for again only as readahead behind 0.
+        state
+            .fetcher
+            .shared_metadata_state
+            .set_stripe_fetch_state_for_test(1, Evicted);
+        state.fetcher.handle_fetch_request(0);
+        assert!(
+            !state.fetcher.fetch_in_flight(1),
+            "readahead must not queue a pull for the evicted stripe"
+        );
+        assert!(!state.fetcher.demand_stripes.contains(&1));
+        for _ in 0..10 {
+            state.fetcher.update();
+        }
+
+        let finished = state.fetcher.take_finished_fetches();
+        assert_eq!(
+            finished,
+            vec![(0, true)],
+            "only the requested stripe is new"
+        );
+        assert_eq!(
+            state.source_dev.metrics.read().unwrap().reads,
+            reads_before + 1,
+            "stripe 1 must not be read from the source again"
+        );
+
+        // A direct request for it is the coordinator's call, and re-fetches.
+        state.fetcher.handle_fetch_request(1);
+        for _ in 0..10 {
+            state.fetcher.update();
+        }
+        assert_eq!(state.fetcher.take_finished_fetches(), vec![(1, true)]);
+        assert_eq!(
+            state.source_dev.metrics.read().unwrap().reads,
+            reads_before + 2
         );
     }
 
