@@ -654,6 +654,27 @@ impl StripeFetcher {
         }
     }
 
+    /// Whether a failed pull of `stripe_id` is beyond rescue by a push, so the
+    /// PUSH_WAIT is pointless. A stripe that is not local (Evicted, or Failed
+    /// with its header still saying EVICTED) is refused by the composite
+    /// source once it was pushed or the subscription is gone; that refusal is
+    /// decided by metadata and comes back the same way on every pass. PUSHED
+    /// means the push has been received already (it is parked here or was
+    /// written), and a dead subscription is never revived in this process, so
+    /// no push is on its way. An Evicting stripe is refused outright. Waiting
+    /// would hold the guest's I/O error for a minute while re-asking the
+    /// source on every pass. A NotFetched stripe still waits: its pull may
+    /// have lost the race with a push that is on the wire.
+    fn no_push_can_rescue(&self, stripe_id: usize) -> bool {
+        let state = self.shared_metadata_state.stripe_fetch_state(stripe_id);
+        if state == Evicting {
+            return true;
+        }
+        let flags = self.shared_metadata_state.stripe_flags(stripe_id);
+        (state == Evicted || flags & stripe_flags::WAS_EVICTED != 0)
+            && (flags & stripe_flags::PUSHED != 0 || !self.shared_metadata_state.source_live())
+    }
+
     fn fetch_completed(&mut self, stripe_id: usize, success: bool) {
         debug!("Fetch completed for stripe {stripe_id}, success={success}");
         self.demand_stripes.remove(&stripe_id);
@@ -678,15 +699,17 @@ impl StripeFetcher {
         }
 
         if self.expects_pushes {
-            let since = *self
-                .first_failure
-                .entry(stripe_id)
-                .or_insert_with(Instant::now);
-            if since.elapsed() < PUSH_WAIT {
-                debug!("Stripe {stripe_id} is not servable yet; waiting for its push");
-                self.fetch_queue.push_back(stripe_id);
-                self.stripe_states.remove(&stripe_id);
-                return;
+            if !self.no_push_can_rescue(stripe_id) {
+                let since = *self
+                    .first_failure
+                    .entry(stripe_id)
+                    .or_insert_with(Instant::now);
+                if since.elapsed() < PUSH_WAIT {
+                    debug!("Stripe {stripe_id} is not servable yet; waiting for its push");
+                    self.fetch_queue.push_back(stripe_id);
+                    self.stripe_states.remove(&stripe_id);
+                    return;
+                }
             }
 
             if self.pending_pushes.contains_key(&stripe_id) {
@@ -1438,6 +1461,124 @@ mod tests {
             state.source_dev.metrics.read().unwrap().reads,
             1,
             "the push is the copy; nothing is pulled"
+        );
+    }
+
+    /// On a fork a failed pull waits PUSH_WAIT for a push before its bounded
+    /// retries, re-asking the source on every pass. A stripe the composite
+    /// source refuses by metadata (evicted clean, subscription gone) is
+    /// refused the same way every time and no push is coming, so the wait is
+    /// skipped and the guest gets its error after the retries, not a minute
+    /// later; the refusal is counted once.
+    #[test]
+    fn a_final_refusal_skips_the_push_wait() {
+        use crate::stripe_source::SpillingStripeSource;
+        use std::sync::atomic::Ordering;
+
+        let stripe_sector_count_shift = 3;
+        let stripe_sector_count = 1u64 << stripe_sector_count_shift;
+        let source_dev = Box::new(TestBlockDevice::new(1024 * 1024));
+        let target_dev = Box::new(TestBlockDevice::new(2 * 1024 * 1024));
+        let mut metadata = UbiMetadata::new(
+            stripe_sector_count_shift,
+            target_dev.stripe_count(stripe_sector_count),
+            source_dev.stripe_count(stripe_sector_count),
+        );
+        metadata.set_stripe_header(2, metadata_flags::EVICTED | metadata_flags::HAS_SOURCE);
+        let shared_metadata_state = SharedMetadataState::new(&metadata);
+        assert_eq!(shared_metadata_state.stripe_fetch_state(2), Evicted);
+        assert!(!shared_metadata_state.source_live());
+
+        let base = Box::new(
+            BlockDeviceStripeSource::new(source_dev.clone(), stripe_sector_count).unwrap(),
+        );
+        let stripe_source = Box::new(SpillingStripeSource::new(
+            base,
+            None,
+            shared_metadata_state.clone(),
+        ));
+        let mut fetcher = StripeFetcher::new(
+            stripe_source,
+            &*target_dev,
+            stripe_sector_count,
+            shared_metadata_state.clone(),
+            SECTOR_SIZE,
+            false,
+        )
+        .unwrap();
+        fetcher.set_expects_pushes(true);
+
+        fetcher.handle_fetch_request(2);
+        // One refusal, then MAX_FETCH_RETRIES more: each is one pass.
+        for _ in 0..(2 + MAX_FETCH_RETRIES as usize) {
+            fetcher.update();
+        }
+
+        assert_eq!(fetcher.take_finished_fetches(), vec![(2, false)]);
+        assert_eq!(
+            shared_metadata_state.stripe_fetch_state(2),
+            super::super::metadata::Failed
+        );
+        assert_ne!(
+            shared_metadata_state.stripe_flags(2) & stripe_flags::WAS_EVICTED,
+            0
+        );
+        assert_eq!(
+            shared_metadata_state
+                .spill()
+                .clean_unrecoverable
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            source_dev.metrics.read().unwrap().reads,
+            0,
+            "the replica is never asked for post-snapshot data"
+        );
+    }
+
+    /// The wait is skipped only where no push can arrive; an evicted stripe
+    /// under a live subscription that was not pushed keeps waiting, as a
+    /// NotFetched one does.
+    #[test]
+    fn only_a_final_refusal_forgoes_the_push_wait() {
+        let state = prep(false);
+        let shared = state.fetcher.shared_metadata_state.clone();
+
+        assert!(!state.fetcher.no_push_can_rescue(0), "NotFetched waits");
+
+        shared.set_stripe_fetch_state_for_test(0, Evicted);
+        assert!(
+            state.fetcher.no_push_can_rescue(0),
+            "evicted, subscription gone"
+        );
+
+        shared.set_source_live(true);
+        assert!(
+            !state.fetcher.no_push_can_rescue(0),
+            "evicted, live, not pushed: waits"
+        );
+
+        shared.set_stripe_flags(0, stripe_flags::PUSHED);
+        assert!(state.fetcher.no_push_can_rescue(0), "evicted and pushed");
+        shared.clear_stripe_flags(0, stripe_flags::PUSHED);
+
+        shared.set_stripe_fetch_state_for_test(0, super::super::metadata::Failed);
+        assert!(
+            !state.fetcher.no_push_can_rescue(0),
+            "Failed without WAS_EVICTED waits"
+        );
+        shared.set_stripe_flags(0, stripe_flags::WAS_EVICTED);
+        shared.set_source_live(false);
+        assert!(
+            state.fetcher.no_push_can_rescue(0),
+            "Failed with WAS_EVICTED, gone"
+        );
+
+        shared.set_stripe_fetch_state_for_test(0, Evicting);
+        assert!(
+            state.fetcher.no_push_can_rescue(0),
+            "Evicting is refused outright"
         );
     }
 }
