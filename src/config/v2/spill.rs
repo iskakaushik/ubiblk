@@ -205,6 +205,16 @@ impl SpillSection {
                 "spill's per-stripe in-flight counter is 16 bits; reduce num_queues * queue_size",
             ));
         }
+        // A pool worker dequeues its requests on its own schedule: a push for
+        // a stripe can be written after the worker's own pull of that stripe
+        // has landed and the coordinator has released the stripe to the
+        // guest. That write is unpinned and lands over a guest write, in a
+        // window the coordinator cannot see from where it forwards.
+        if tuning.ingest_workers > 1 {
+            return Err(invalid(
+                "spill needs ingest_workers = 1: a pooled ingest can write a push after its own pull has been released",
+            ));
+        }
         Ok(())
     }
 
@@ -649,5 +659,26 @@ mod tests {
         section()
             .validate(&device(), Some(&remote_source()), &tuning, &HashMap::new())
             .expect("exactly u16::MAX outstanding requests fit");
+    }
+
+    #[test]
+    fn spill_rejects_ingest_workers_above_one() {
+        let tuning = TuningSection {
+            ingest_workers: 2,
+            ..Default::default()
+        };
+        rejects(
+            section().validate(&device(), Some(&remote_source()), &tuning, &HashMap::new()),
+            "spill needs ingest_workers = 1: a pooled ingest can write a push after its own pull has been released",
+        );
+        // The default of one is the inline ingest, which is fine.
+        section()
+            .validate(
+                &device(),
+                Some(&remote_source()),
+                &TuningSection::default(),
+                &HashMap::new(),
+            )
+            .expect("one ingest worker is valid");
     }
 }

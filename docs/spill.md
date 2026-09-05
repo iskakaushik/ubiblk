@@ -108,6 +108,15 @@ acknowledged, and a crash before the header reached the disk would restart
 the stripe as missing and fetch the base image over the write. The cost is one
 header write and fsync per landed stripe before the guest sees it.
 
+Stripes are taken in on the background worker's own thread only: a `[spill]`
+section is refused with `tuning.ingest_workers > 1`. A pool worker dequeues
+its requests on its own schedule, so a pushed pre-image can be written after
+the worker's own pull of the same stripe has landed and the stripe has been
+released to the guest. That write is unpinned and lands over whatever the
+guest wrote meanwhile, or is uploaded as the fork's data. The coordinator sees
+a push only when it forwards it and cannot close that window, so the
+configuration is refused instead.
+
 ### Crash points
 
 | Crash between | On restart |

@@ -342,6 +342,11 @@ impl BgWorker {
         self.note_landing(stripe_id);
         match &mut self.ingest {
             Ingest::Inline(fetcher) => fetcher.accept_pushed_stripe(stripe_id, &data, permit),
+            // Never with an evictor: SpillSection::validate refuses
+            // ingest_workers > 1. The worker dequeues this push on its own
+            // schedule and may write it after its own pull of the stripe has
+            // landed and this thread has released the stripe to the guest,
+            // unpinned, over a guest write; nothing here sees that window.
             Ingest::Pool(pool) => pool.send(
                 stripe_id,
                 IngestRequest::Pushed {
