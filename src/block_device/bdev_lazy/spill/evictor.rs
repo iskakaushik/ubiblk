@@ -1172,9 +1172,12 @@ impl Evictor {
 
     /// True while an eviction is in progress, something released waits to be
     /// routed, or the device is over its ceiling and a sweep could still find
-    /// a victim.
+    /// a victim. An aborted record only waits for a completion it is owed,
+    /// which the idle tick's poll collects as well; spinning for it would
+    /// hold a core for as long as a failed read submit keeps failing, or an
+    /// aborted PUT takes to time out.
     pub fn busy(&self) -> bool {
-        !self.in_progress.is_empty()
+        self.in_progress.values().any(|e| !e.aborted)
             || !self.released_fetches.is_empty()
             || !self.released_pushes.is_empty()
             || (self.under_pressure && self.sweep_may_progress())

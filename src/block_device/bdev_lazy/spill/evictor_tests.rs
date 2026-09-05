@@ -2010,6 +2010,44 @@ fn clean_stripe_written_during_drain_aborts_without_store() {
     assert_eq!(rig.fetch_state(0), Fetched);
     assert_eq!(rig.counter(|c| &c.evictions_aborted), 1);
     // Dirty for good and nowhere to put it: never claimed again.
+/// The owed completion is collected by the idle tick's poll as well, so an
+/// aborted record must not keep the coordinator spinning for it: with a read
+/// submit that keeps failing, or an aborted PUT that takes its time, that
+/// would hold a core for the duration.
+#[test]
+fn aborted_record_awaiting_its_completion_does_not_keep_the_evictor_busy() {
+    let mut rig = Rig::dirty(1, 0);
+    rig.state.pin_inflight(0, 0);
+    assert!(rig.run_until(5, |r| r.stage(0) == Some(Stage::Draining)));
+    assert!(rig.evictor.busy(), "an eviction is in progress");
+    rig.target_dev
+        .keep_requests_on_failed_submit
+        .store(true, Ordering::SeqCst);
+    rig.target_dev.fail_submit.store(true, Ordering::SeqCst);
+    rig.target_dev
+        .hold_completions
+        .store(true, Ordering::SeqCst);
+    rig.state.unpin_inflight(0, 0);
+
+    rig.tick();
+    assert_eq!(rig.stage(0), None, "aborted");
+    assert_eq!(rig.fetch_state(0), Fetched);
+    assert_eq!(
+        rig.evictor.records_for_test(),
+        1,
+        "the record waits for the read"
+    );
+    assert!(!rig.evictor.busy(), "nothing to spin for");
+
+    // The completion still drains the record on an ordinary tick.
+    rig.target_dev
+        .hold_completions
+        .store(false, Ordering::SeqCst);
+    rig.tick();
+    assert_eq!(rig.evictor.records_for_test(), 0);
+    assert_eq!(rig.fetch_state(0), Fetched);
+}
+
     rig.evictor.advance_time_for_test(Duration::from_secs(2));
     rig.ticks(5);
     assert_eq!(rig.evictor.records_for_test(), 0);
