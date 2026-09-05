@@ -27,9 +27,9 @@ use crate::{
     archive::{ArchiveCompressionAlgorithm, ArchiveStore, TestObjectStore},
     backends::SECTOR_SIZE,
     block_device::{
-        bdev_test::TestBlockDevice, metadata_flags, stripe_flags, BgWorker, BgWorkerRequest,
-        BlockDevice, IoChannel, PushGate, PushPermit, SharedBuffer, SharedMetadataState,
-        UbiMetadata, GATE_FAIL, GATE_HOLD, GATE_OPEN,
+        bdev_test::TestBlockDevice, metadata_flags, shared_buffer, stripe_flags, BgWorker,
+        BgWorkerRequest, BlockDevice, IoChannel, LazyBlockDevice, PushGate, PushPermit,
+        SharedBuffer, SharedMetadataState, UbiMetadata, GATE_FAIL, GATE_HOLD, GATE_OPEN,
     },
     config::v2::spill::OnFull,
     stripe_source::BlockDeviceStripeSource,
@@ -1234,9 +1234,12 @@ fn fetch_for_stripe_in_pending_release_is_dropped() {
     assert_eq!(rig.source_reads(), 1);
 }
 
-/// The coordinator's side of the FAIL-gate rule: a Fetch refused under
-/// GATE_FAIL reaches the ingest once the gate opens, so a read the channel
-/// queued under the closed gate and polled after the reopen is still served.
+/// The coordinator's side of the FAIL-gate rule, with a channel in the loop.
+/// A read queued on a missing stripe under GATE_FAIL sends a Fetch the
+/// coordinator refuses. When the gate reopens before the channel polls, the
+/// channel finds the gate open and its front Pending on a NotFetched stripe,
+/// which it never asks for again; only the coordinator's replay of the
+/// refused Fetch lands the stripe and lets the read complete.
 #[test]
 fn refused_fetch_is_routed_once_the_gate_reopens() {
     let headers: Vec<(usize, u8)> = (0..STRIPES - 1).map(|s| (s, DIRTY)).collect();
@@ -1250,7 +1253,22 @@ fn refused_fetch_is_routed_once_the_gate_reopens() {
     rig.worker.update();
     assert_eq!(rig.state.write_gate(), GATE_FAIL);
 
-    rig.fetch(unfetched);
+    // The guest reads the missing stripe: the channel queues the read and
+    // asks for the stripe, and the coordinator refuses. The channel is not
+    // polled while the gate is closed, so it never fails the read itself.
+    let lazy = LazyBlockDevice::new(
+        BlockDevice::clone(&rig.target_dev),
+        None,
+        rig.sender.clone(),
+        rig.state.clone(),
+        true,
+    )
+    .unwrap();
+    let mut chan = lazy.create_channel().unwrap();
+    let buf = shared_buffer(SECTOR_SIZE);
+    chan.add_read(unfetched as u64 * STRIPE_SECTORS, 1, buf.clone(), 7);
+    chan.submit().unwrap();
+    rig.worker.receive_requests(false);
     rig.run_until(3, |_| false);
     assert_eq!(
         rig.source_reads(),
@@ -1261,9 +1279,31 @@ fn refused_fetch_is_routed_once_the_gate_reopens() {
     rig.store.lock().unwrap().hold_puts = false;
     rig.store.lock().unwrap().release_puts();
     assert!(rig.run_until(60, |r| r.state.write_gate() == GATE_OPEN));
+    // Polled only now, the channel waits on a stripe it will not ask for
+    // again.
+    assert!(chan.poll().is_empty());
+    assert!(chan.busy());
+
     assert!(rig.run_until(30, |r| r.source_reads() == 1), "replayed");
     assert!(rig.run_until(30, |r| r.target_stripe(unfetched)
         == vec![0x80 | pattern(unfetched); STRIPE_BYTES as usize]));
+    // Served once the replayed fetch has landed. The stripe may be claimed
+    // by the evictor the moment it is resident, in which case the channel's
+    // request aborts that eviction and is served on the poll after.
+    let mut served = Vec::new();
+    for _ in 0..30 {
+        served = chan.poll();
+        if !served.is_empty() {
+            break;
+        }
+        rig.worker.receive_requests(false);
+        rig.worker.update();
+    }
+    assert_eq!(served, vec![(7, true)], "the queued read is served");
+    assert_eq!(
+        buf.borrow().as_slice()[..SECTOR_SIZE],
+        vec![0x80 | pattern(unfetched); SECTOR_SIZE][..]
+    );
     rig.run_until(5, |_| false);
     assert_eq!(rig.source_reads(), 1, "pulled once");
 }
@@ -1970,6 +2010,44 @@ fn failed_read_submit_keeps_the_record_until_the_completion_lands() {
     assert_eq!(rig.decode_object(0), written);
 }
 
+/// The owed completion is collected by the idle tick's poll as well, so an
+/// aborted record must not keep the coordinator spinning for it: with a read
+/// submit that keeps failing, or an aborted PUT that takes its time, that
+/// would hold a core for the duration.
+#[test]
+fn aborted_record_awaiting_its_completion_does_not_keep_the_evictor_busy() {
+    let mut rig = Rig::dirty(1, 0);
+    rig.state.pin_inflight(0, 0);
+    assert!(rig.run_until(5, |r| r.stage(0) == Some(Stage::Draining)));
+    assert!(rig.evictor.busy(), "an eviction is in progress");
+    rig.target_dev
+        .keep_requests_on_failed_submit
+        .store(true, Ordering::SeqCst);
+    rig.target_dev.fail_submit.store(true, Ordering::SeqCst);
+    rig.target_dev
+        .hold_completions
+        .store(true, Ordering::SeqCst);
+    rig.state.unpin_inflight(0, 0);
+
+    rig.tick();
+    assert_eq!(rig.stage(0), None, "aborted");
+    assert_eq!(rig.fetch_state(0), Fetched);
+    assert_eq!(
+        rig.evictor.records_for_test(),
+        1,
+        "the record waits for the read"
+    );
+    assert!(!rig.evictor.busy(), "nothing to spin for");
+
+    // The completion still drains the record on an ordinary tick.
+    rig.target_dev
+        .hold_completions
+        .store(false, Ordering::SeqCst);
+    rig.tick();
+    assert_eq!(rig.evictor.records_for_test(), 0);
+    assert_eq!(rig.fetch_state(0), Fetched);
+}
+
 #[test]
 fn clean_stripe_written_during_drain_is_converted_to_dirty() {
     let mut rig = Rig::build(&[(0, CLEAN)], true, |cfg| {
@@ -2010,44 +2088,6 @@ fn clean_stripe_written_during_drain_aborts_without_store() {
     assert_eq!(rig.fetch_state(0), Fetched);
     assert_eq!(rig.counter(|c| &c.evictions_aborted), 1);
     // Dirty for good and nowhere to put it: never claimed again.
-/// The owed completion is collected by the idle tick's poll as well, so an
-/// aborted record must not keep the coordinator spinning for it: with a read
-/// submit that keeps failing, or an aborted PUT that takes its time, that
-/// would hold a core for the duration.
-#[test]
-fn aborted_record_awaiting_its_completion_does_not_keep_the_evictor_busy() {
-    let mut rig = Rig::dirty(1, 0);
-    rig.state.pin_inflight(0, 0);
-    assert!(rig.run_until(5, |r| r.stage(0) == Some(Stage::Draining)));
-    assert!(rig.evictor.busy(), "an eviction is in progress");
-    rig.target_dev
-        .keep_requests_on_failed_submit
-        .store(true, Ordering::SeqCst);
-    rig.target_dev.fail_submit.store(true, Ordering::SeqCst);
-    rig.target_dev
-        .hold_completions
-        .store(true, Ordering::SeqCst);
-    rig.state.unpin_inflight(0, 0);
-
-    rig.tick();
-    assert_eq!(rig.stage(0), None, "aborted");
-    assert_eq!(rig.fetch_state(0), Fetched);
-    assert_eq!(
-        rig.evictor.records_for_test(),
-        1,
-        "the record waits for the read"
-    );
-    assert!(!rig.evictor.busy(), "nothing to spin for");
-
-    // The completion still drains the record on an ordinary tick.
-    rig.target_dev
-        .hold_completions
-        .store(false, Ordering::SeqCst);
-    rig.tick();
-    assert_eq!(rig.evictor.records_for_test(), 0);
-    assert_eq!(rig.fetch_state(0), Fetched);
-}
-
     rig.evictor.advance_time_for_test(Duration::from_secs(2));
     rig.ticks(5);
     assert_eq!(rig.evictor.records_for_test(), 0);

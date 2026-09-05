@@ -993,14 +993,15 @@ mod tests {
 
     /// A Fetch for a stripe that is resident by the time this thread sees it
     /// (the channel asked before the landing) is dropped rather than
-    /// forwarded when spill is on. Forwarded to a pool worker it sits on that
-    /// worker's queue while this thread may evict the stripe; the worker then
-    /// finds a Fetched entry under an Evicted stripe, drops it as stale and
-    /// pulls, a landing noted nowhere here, whose write can follow the
-    /// guest's once a real re-fetch has released the stripe. Observed through
-    /// the readahead a forwarded Fetch queues on a sweeping fetcher: the sweep
-    /// is confined to stripes 4..8, so anything pulled below 4 came from the
-    /// Fetch.
+    /// forwarded when spill is on, and forwarded as before without it. This
+    /// checks that decision and nothing more. A forwarded Fetch for a
+    /// resident stripe is a no-op on the fetcher unless it sweeps, when it
+    /// queues the stripes ahead of the one asked for: with the sweep confined
+    /// to stripes 4..8, anything pulled below 4 came from the Fetch. The
+    /// sweep is not a supported spill configuration and serves only as that
+    /// observable. The pool race the drop guards against (the Fetch sitting
+    /// on a worker's queue while this thread evicts the stripe) is not
+    /// exercised here; [spill] refuses ingest_workers > 1 at config load.
     #[test]
     fn fetch_for_a_resident_stripe_is_dropped_at_the_coordinator() {
         let resident = crate::block_device::metadata_flags::FETCHED
