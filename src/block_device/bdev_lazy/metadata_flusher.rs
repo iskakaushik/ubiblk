@@ -51,13 +51,12 @@ struct HeaderUpdateStatus {
 pub enum PersistResult {
     /// Sector write and fsync both completed. The byte is on disk.
     Durable,
-    /// The write (or its submit) failed. The disk still holds `previous`; the
-    /// in-memory byte was restored to `previous`.
+    /// The write failed. The disk still holds `previous`; the in-memory byte
+    /// was restored to `previous`.
     NotWritten,
-    /// The write completed but the fsync failed (or its submit failed). The
-    /// disk may hold either byte. The in-memory byte is left at the new value
-    /// so a retry rewrites it. Callers must not act as if the old byte is on
-    /// disk.
+    /// The write completed but the fsync failed. The disk may hold either
+    /// byte. The in-memory byte is left at the new value so a retry rewrites
+    /// it. Callers must not act as if the old byte is on disk.
     Uncertain,
 }
 
@@ -83,6 +82,12 @@ pub struct MetadataFlusher {
     buffer_pool: AlignedBufferPool,
     /// Outcomes of tokened requests, in completion order, until taken.
     persist_outcomes: Vec<PersistOutcome>,
+    /// A submit failed with requests in the ring. io_uring keeps the SQEs a
+    /// failed enter did not consume and enters them on the next submit
+    /// (`bdev_uring::submit`), so their completions are still owed: the
+    /// statuses, buffers and sectors stay as they are, and the channel is
+    /// asked to submit again each update until one succeeds.
+    resubmit_needed: bool,
 }
 
 impl MetadataFlusher {
@@ -115,6 +120,7 @@ impl MetadataFlusher {
             buffer_pool: AlignedBufferPool::new(4096, MAX_CONCURRENT_CHANGES, SECTOR_SIZE),
             header_updates: HashMap::new(),
             persist_outcomes: Vec::new(),
+            resubmit_needed: false,
         })
     }
 
@@ -181,8 +187,21 @@ impl MetadataFlusher {
     }
 
     pub fn update(&mut self) {
+        self.resubmit();
         self.start_writes();
         self.poll_channel();
+    }
+
+    /// Enter the SQEs of a failed submit, so their completions can arrive. A
+    /// bare submit is enough: the ring still holds them.
+    fn resubmit(&mut self) {
+        if !self.resubmit_needed {
+            return;
+        }
+        match self.channel.submit() {
+            Ok(()) => self.resubmit_needed = false,
+            Err(e) => debug!("Re-submitting metadata requests still fails: {e}"),
+        }
     }
 
     /// The disk provably still holds the old byte: put memory back to match and
@@ -214,24 +233,9 @@ impl MetadataFlusher {
         }
     }
 
-    fn cleanup_failed_submission(&mut self, stripe_ids: &[usize], return_buffer: bool) {
-        for stripe_id in stripe_ids {
-            if let Some(status) = self.header_updates.remove(stripe_id) {
-                match status.stage {
-                    RequestStage::Writing => self.fail_not_written(&status),
-                    RequestStage::Flushing => self.fail_uncertain(&status),
-                }
-                if return_buffer {
-                    self.buffer_pool.return_buffer(&status.buffer);
-                }
-                self.sectors_being_updated.remove(&status.sector);
-            }
-        }
-    }
-
     fn poll_channel(&mut self) {
         let mut finished_stripes = Vec::new();
-        let mut newly_flushing = Vec::new();
+        let mut newly_flushing = false;
 
         for (stripe_id, success) in self.channel.poll() {
             let maybe_status = self.header_updates.get_mut(&stripe_id);
@@ -261,7 +265,7 @@ impl MetadataFlusher {
                         self.buffer_pool.return_buffer(&status.buffer);
                         self.channel.add_flush(stripe_id);
                         status.stage = RequestStage::Flushing;
-                        newly_flushing.push(stripe_id);
+                        newly_flushing = true;
                     }
                     RequestStage::Flushing => {
                         self.sectors_being_updated.remove(&(status.sector));
@@ -284,22 +288,22 @@ impl MetadataFlusher {
             }
         }
 
-        if newly_flushing.is_empty() {
+        if !newly_flushing {
             return;
         }
 
         // submit flushes, if any
         if let Err(e) = self.channel.submit() {
+            // The flush SQEs are still in the ring and their completions
+            // still owed, as for writes below: the statuses stay in Flushing
+            // and hear the outcome when it lands.
             error!("Failed to submit metadata flushes: {e}");
-            // The kernel never received the flush SQEs. Clean up entries
-            // that just transitioned to Flushing to avoid permanently
-            // blocking the affected sectors.
-            self.cleanup_failed_submission(&newly_flushing, false);
+            self.resubmit_needed = true;
         }
     }
 
     fn start_writes(&mut self) {
-        let mut newly_added = Vec::new();
+        let mut newly_added = false;
 
         while !self.queued_requests.is_empty() && self.buffer_pool.has_available() {
             let req = *self.queued_requests.front().unwrap();
@@ -344,20 +348,23 @@ impl MetadataFlusher {
                     sector,
                 },
             );
-            newly_added.push(req.stripe_id);
+            newly_added = true;
         }
 
-        if newly_added.is_empty() {
+        if !newly_added {
             return;
         }
 
         // submit writes, if any
         if let Err(e) = self.channel.submit() {
+            // The SQEs stay in the ring and a later submit enters them, so
+            // the writes may yet happen and their completions are owed.
+            // Told NotWritten now, a caller would act on a byte the disk may
+            // still take; a buffer returned now could hold another sector's
+            // image by the time the kernel reads it. Everything waits for
+            // the completion, and `resubmit` keeps asking for it.
             error!("Failed to submit metadata writes: {e}");
-            // The kernel never received the SQEs, so no completions will
-            // arrive. Revert all entries we just added to avoid permanently
-            // blocking the affected sectors.
-            self.cleanup_failed_submission(&newly_added, true);
+            self.resubmit_needed = true;
         }
     }
 }
@@ -563,8 +570,12 @@ mod tests {
         assert_eq!(metrics.flushes - start_flushes, 2);
     }
 
+    /// A failed submit leaves the SQE in the ring for the next submit to
+    /// enter, so the write may still happen. The request stays where it is
+    /// and lands when its completion does.
     #[test]
-    fn test_submit_failure_in_start_writes_allows_retry() {
+    fn write_submit_failure_waits_for_the_completion() {
+        use std::sync::atomic::Ordering::SeqCst;
         let metadata_dev = init_metadata_device();
         let shared_state = {
             let metadata = UbiMetadata::load_from_bdev(&metadata_dev).expect("load metadata");
@@ -572,27 +583,35 @@ mod tests {
         };
         let mut metadata_flusher =
             MetadataFlusher::new(&metadata_dev, 8 * 1024, shared_state.clone()).unwrap();
+        let (writes, flushes) = io_counts(&metadata_dev);
 
-        // Queue a request and make submit() fail
-        metadata_flusher.set_stripe_fetched(5);
+        // The request survives the failed submit, as io_uring's do, and its
+        // completion is held back until the test lets it through.
         metadata_dev
-            .fail_submit
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-
-        // start_writes will add_write then fail on submit
+            .keep_requests_on_failed_submit
+            .store(true, SeqCst);
+        metadata_dev.hold_completions.store(true, SeqCst);
+        metadata_dev.fail_submit.store(true, SeqCst);
+        metadata_flusher.set_stripe_fetched(5);
         metadata_flusher.update();
 
-        // Stripe 5 should NOT be marked fetched in shared state
         assert!(!shared_state.stripe_fetched(5));
-        // Flusher should not be busy (submit failure was cleaned up)
-        assert!(!metadata_flusher.busy());
+        assert!(metadata_flusher.busy(), "the write is still owed");
+        assert_ne!(
+            metadata_flusher.header(5) & metadata_flags::FETCHED,
+            0,
+            "memory keeps the byte the write carries"
+        );
+        // Ticks with the completion owed neither re-issue nor give up.
+        metadata_flusher.update();
+        assert_eq!(io_counts(&metadata_dev), (writes + 1, flushes));
+        assert!(metadata_flusher.busy());
 
-        // Retry: queue the same request again - should NOT be blocked
-        metadata_flusher.set_stripe_fetched(5);
+        metadata_dev.hold_completions.store(false, SeqCst);
         wait_for_completion(&mut metadata_flusher);
-
-        // Now it should succeed
         assert!(shared_state.stripe_fetched(5));
+        assert!(!metadata_flusher.busy());
+        assert_eq!(io_counts(&metadata_dev), (writes + 1, flushes + 1));
     }
 
     #[test]
@@ -664,8 +683,11 @@ mod tests {
         assert!(shared_state.stripe_fetched(5));
     }
 
+    /// The same for a flush: its SQE stays in the ring, the request stays in
+    /// Flushing, and the stripe lands when the fsync completes.
     #[test]
-    fn test_submit_failure_in_poll_channel_allows_retry() {
+    fn flush_submit_failure_waits_for_the_completion() {
+        use std::sync::atomic::Ordering::SeqCst;
         let metadata_dev = init_metadata_device();
         let shared_state = {
             let metadata = UbiMetadata::load_from_bdev(&metadata_dev).expect("load metadata");
@@ -674,28 +696,28 @@ mod tests {
         let mut metadata_flusher =
             MetadataFlusher::new(&metadata_dev, 8 * 1024, shared_state.clone()).unwrap();
 
-        // Queue a request and let the write succeed
         metadata_flusher.set_stripe_fetched(5);
         metadata_flusher.start_writes();
-
-        // Poll should see the write completion and enqueue a flush.
-        // Make submit fail so the flush SQE is never submitted.
+        // The write completes; the flush it triggers is added, and its
+        // submit fails with the SQE left in the ring.
         metadata_dev
-            .fail_submit
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+            .keep_requests_on_failed_submit
+            .store(true, SeqCst);
+        metadata_dev.fail_submit.store(true, SeqCst);
         metadata_flusher.poll_channel();
-
-        // Stripe 5 should NOT be marked fetched (flush never reached kernel)
         assert!(!shared_state.stripe_fetched(5));
-        // Flusher should not be busy (submit failure was cleaned up)
-        assert!(!metadata_flusher.busy());
+        assert!(metadata_flusher.busy(), "the flush is still owed");
 
-        // Retry: queue the same request again - should NOT be blocked
-        metadata_flusher.set_stripe_fetched(5);
+        // Its completion held back, a tick changes nothing.
+        metadata_dev.hold_completions.store(true, SeqCst);
+        metadata_flusher.update();
+        assert!(!shared_state.stripe_fetched(5));
+        assert!(metadata_flusher.busy());
+
+        metadata_dev.hold_completions.store(false, SeqCst);
         wait_for_completion(&mut metadata_flusher);
-
-        // Now it should succeed
         assert!(shared_state.stripe_fetched(5));
+        assert!(!metadata_flusher.busy());
     }
 
     fn init_flusher() -> (TestBlockDevice, SharedMetadataState, MetadataFlusher) {
@@ -854,22 +876,118 @@ mod tests {
         );
     }
 
+    /// Every spare buffer in the pool, so a test can count what is on offer.
+    fn spare_buffers(flusher: &mut MetadataFlusher) -> usize {
+        let mut spare = Vec::new();
+        while let Some(buf) = flusher.buffer_pool.get_buffer() {
+            spare.push(buf);
+        }
+        for buf in &spare {
+            flusher.buffer_pool.return_buffer(buf);
+        }
+        spare.len()
+    }
+
+    /// A tokened write whose submit failed may still land: the SQE is in the
+    /// ring for the next submit. NotWritten now would have the evictor abort
+    /// an eviction whose EVICTED header the disk may yet take, and a buffer
+    /// returned now could hold another update's sector image by the time the
+    /// kernel reads it. Status and buffer stay until the completion arrives,
+    /// and the outcome is whatever it says.
     #[test]
-    fn masked_update_write_submit_failure_reports_not_written_and_restores_previous_byte() {
+    fn write_submit_failure_holds_status_and_buffer_until_the_completion_lands() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (metadata_dev, _shared_state, mut flusher) = init_flusher();
+        flusher.set_stripe_fetched(5);
+        wait_for_completion(&mut flusher);
+        let old = flusher.header(5);
+        let (writes, flushes) = io_counts(&metadata_dev);
+        assert_eq!(spare_buffers(&mut flusher), MAX_CONCURRENT_CHANGES);
+
+        metadata_dev
+            .keep_requests_on_failed_submit
+            .store(true, SeqCst);
+        metadata_dev.hold_completions.store(true, SeqCst);
+        metadata_dev.fail_submit.store(true, SeqCst);
+        flusher.update_stripe_header(5, metadata_flags::EVICTED, metadata_flags::FETCHED, 3);
+        flusher.update();
+
+        let new = (old | metadata_flags::EVICTED) & !metadata_flags::FETCHED;
+        assert!(
+            flusher.take_persist_outcomes().is_empty(),
+            "nothing reported early"
+        );
+        assert!(flusher.busy());
+        assert_eq!(
+            flusher.header(5),
+            new,
+            "memory keeps the byte the write carries"
+        );
+        assert_eq!(
+            spare_buffers(&mut flusher),
+            MAX_CONCURRENT_CHANGES - 1,
+            "the write's buffer is not on offer"
+        );
+
+        // Ticks with the completion owed neither re-issue the write nor
+        // give up on it.
+        flusher.update();
+        flusher.update();
+        assert!(flusher.take_persist_outcomes().is_empty());
+        assert_eq!(io_counts(&metadata_dev), (writes + 1, flushes));
+        assert!(flusher.busy());
+
+        // The late completion: the write landed, the flush follows, and the
+        // outcome is Durable, once.
+        metadata_dev.hold_completions.store(false, SeqCst);
+        wait_for_completion(&mut flusher);
+        assert_eq!(
+            flusher.take_persist_outcomes(),
+            vec![PersistOutcome {
+                stripe_id: 5,
+                token: 3,
+                result: PersistResult::Durable,
+            }]
+        );
+        assert_eq!(on_disk_header(&metadata_dev, 5), new);
+        assert_eq!(io_counts(&metadata_dev), (writes + 1, flushes + 1));
+        assert!(!flusher.busy());
+        assert_eq!(
+            spare_buffers(&mut flusher),
+            MAX_CONCURRENT_CHANGES,
+            "the buffer came back with the completion"
+        );
+    }
+
+    /// The completion a failed submit still owes may itself be a failure;
+    /// NotWritten is reported then, and the byte restored then, not at the
+    /// failed submit.
+    #[test]
+    fn write_submit_failure_reports_not_written_only_when_the_failed_completion_lands() {
+        use std::sync::atomic::Ordering::SeqCst;
         let (metadata_dev, _shared_state, mut flusher) = init_flusher();
         flusher.set_stripe_fetched(5);
         wait_for_completion(&mut flusher);
         let original = flusher.header(5);
 
-        // The write SQE never reaches the kernel: the disk provably still
-        // holds the old byte, so the caller must hear NotWritten rather than
-        // wait forever for an outcome that would otherwise be dropped.
         metadata_dev
-            .fail_submit
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+            .keep_requests_on_failed_submit
+            .store(true, SeqCst);
+        metadata_dev.hold_completions.store(true, SeqCst);
+        metadata_dev.fail_next.store(true, SeqCst);
+        metadata_dev.fail_submit.store(true, SeqCst);
         flusher.update_stripe_header(5, metadata_flags::EVICTED, metadata_flags::FETCHED, 3);
         flusher.update();
+        assert!(flusher.take_persist_outcomes().is_empty(), "not yet");
+        assert!(flusher.busy());
+        assert_ne!(
+            flusher.header(5),
+            original,
+            "not restored before the disk has answered"
+        );
 
+        metadata_dev.hold_completions.store(false, SeqCst);
+        flusher.update();
         assert_eq!(
             flusher.take_persist_outcomes(),
             vec![PersistOutcome {
@@ -878,15 +996,16 @@ mod tests {
                 result: PersistResult::NotWritten,
             }]
         );
-        // The test device applies a write at add time, so its memory is not
-        // consulted here: what a failed submit guarantees is the flusher's
-        // own byte, which the next write starts from.
         assert_eq!(flusher.header(5), original);
+        assert_eq!(on_disk_header(&metadata_dev, 5), original);
         assert!(!flusher.busy());
     }
 
+    /// A flush whose submit failed is owed as well: the request stays in
+    /// Flushing and is Durable, not Uncertain, once the fsync completes.
     #[test]
-    fn masked_update_flush_submit_failure_reports_uncertain_and_keeps_new_byte() {
+    fn flush_submit_failure_holds_the_request_until_the_completion_lands() {
+        use std::sync::atomic::Ordering::SeqCst;
         let (metadata_dev, _shared_state, mut flusher) = init_flusher();
         flusher.set_stripe_fetched(5);
         wait_for_completion(&mut flusher);
@@ -894,26 +1013,36 @@ mod tests {
 
         flusher.update_stripe_header(5, metadata_flags::EVICTED, metadata_flags::FETCHED, 3);
         flusher.start_writes();
-        // The sector write has completed; the flush SQE it triggers is never
-        // submitted, so the disk may hold either byte.
+        // The sector write has completed; the flush it triggers is added and
+        // its submit fails with the SQE left in the ring.
         metadata_dev
-            .fail_submit
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+            .keep_requests_on_failed_submit
+            .store(true, SeqCst);
+        metadata_dev.fail_submit.store(true, SeqCst);
         flusher.poll_channel();
+        assert!(
+            flusher.take_persist_outcomes().is_empty(),
+            "nothing reported early"
+        );
+        assert!(flusher.busy());
+        let new = (old | metadata_flags::EVICTED) & !metadata_flags::FETCHED;
+        assert_eq!(flusher.header(5), new);
 
+        // Its completion held back, a tick changes nothing.
+        metadata_dev.hold_completions.store(true, SeqCst);
+        flusher.update();
+        assert!(flusher.take_persist_outcomes().is_empty());
+        assert!(flusher.busy());
+
+        metadata_dev.hold_completions.store(false, SeqCst);
+        wait_for_completion(&mut flusher);
         assert_eq!(
             flusher.take_persist_outcomes(),
             vec![PersistOutcome {
                 stripe_id: 5,
                 token: 3,
-                result: PersistResult::Uncertain,
+                result: PersistResult::Durable,
             }]
-        );
-        let new = (old | metadata_flags::EVICTED) & !metadata_flags::FETCHED;
-        assert_eq!(
-            flusher.header(5),
-            new,
-            "memory keeps the new byte for the retry"
         );
         assert_eq!(on_disk_header(&metadata_dev, 5), new);
         assert!(!flusher.busy());
