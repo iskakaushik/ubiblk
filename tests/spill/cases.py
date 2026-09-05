@@ -203,11 +203,20 @@ class Guest:
         self.errors = 0
         self.last_error = None
         self.ops = 0
+        self.stuck = False
 
     def close(self):
         if self.fd is None:
             return
-        self.buf.close()
+        try:
+            self.buf.close()
+        except BufferError:
+            # A pread/pwrite on another thread still holds a view of the
+            # buffer: that I/O never completed. The thread is in the kernel
+            # waiting on the bio, so closing the descriptor under it would
+            # free nothing; leave both to it and say so.
+            self.stuck = True
+            return
         os.close(self.fd)
         self.fd = None
 
@@ -422,13 +431,18 @@ class Backend:
             self.fx.dev_link.unlink()
         return self.proc.returncode
 
-    def kill(self):
+    def kill(self, timeout=30.0):
+        """SIGKILL. Returns False if the process is still there after
+        ``timeout`` seconds: its exit is stuck in the kernel behind a guest
+        I/O it never completed."""
+        exited = True
         if self.alive():
             self.proc.kill()
-            self.proc.wait()
+            exited = self.wait(timeout) is not None
         if self._log:
             self._log.close()
             self._log = None
+        return exited
 
     def log_text(self):
         try:
@@ -447,8 +461,20 @@ class Cases(Suite):
         self.model = None
         self.backend = None
         self.case_name = None
+        # Name of the case whose guest I/O never completed. From then on no
+        # ublk device is created: the stuck one cannot be torn down, and a
+        # new one would hang on the driver's control mutex behind it.
+        self.wedged = None
         self._guests = []
         self._writers = []
+
+    def start_case(self, name):
+        """Name the case, or skip it once an earlier one wedged ublk."""
+        self.case_name = name
+        if self.wedged:
+            self.skip(name, f"ublk wedged by {self.wedged}")
+            return False
+        return True
 
     def track(self, writer):
         self._writers.append(writer)
@@ -475,6 +501,8 @@ class Cases(Suite):
                 g.close()
             except OSError:
                 pass
+            if g.stuck:
+                clean = False
         self._writers = []
         self._guests = []
         return clean
@@ -617,7 +645,13 @@ class Cases(Suite):
             # A writer would not stop (a held write we could not release), so a
             # bio may still be in flight: SIGKILL, which ublk aborts the queue
             # for, rather than the del_gendisk path that would wedge.
-            self.backend.kill()
+            exited = self.backend.kill()
+            self.wedged = self.case_name
+            print(
+                f"     {self.case_name}: a guest I/O never completed; backend SIGKILLed"
+                f"{'' if exited else ', and it has not exited in 30 s'}; "
+                "no further ublk device will be created"
+            )
         self.backend = None
 
     def guest(self):
@@ -904,7 +938,8 @@ class Cases(Suite):
         what "steady state" means here; ``burst_stalls`` covers the unpaced
         case where the gate is expected to close.
         """
-        self.case_name = name
+        if not self.start_case(name):
+            return
         problems, notes = [], []
         self.fresh_device(seed=1, s3_keys=s3_keys)
         monitor = AllocMonitor(self.fx.device_raw)
@@ -979,7 +1014,8 @@ class Cases(Suite):
         byte still verifies. The ceiling gets one stripe of slack per writer
         thread: each can have a stripe in flight past the gate."""
         name = "burst_stalls"
-        self.case_name = name
+        if not self.start_case(name):
+            return
         problems, notes = [], []
         threads = 8
         self.fresh_device(seed=2, max_concurrent_evictions=1)
@@ -1030,7 +1066,8 @@ class Cases(Suite):
         ``point``, restart, check the startup pass left no EVICTED stripe with
         allocated blocks, and re-verify every acknowledged byte."""
         name = name or f"crash_{point}"
-        self.case_name = name
+        if not self.start_case(name):
+            return
         problems, notes = [], []
         self.fresh_device(seed=3 + CRASH_POINTS.index(point), s3_keys=s3_keys)
         try:
@@ -1175,7 +1212,8 @@ class Cases(Suite):
         completes, nothing errors, I/O resumes within 5 s of the store coming
         back."""
         name = "degraded_store_stall"
-        self.case_name = name
+        if not self.start_case(name):
+            return
         problems, notes = [], []
         self.fresh_device(seed=7, on_full="stall")
         try:
@@ -1280,7 +1318,8 @@ class Cases(Suite):
         store is down, no acknowledged byte is lost across a restart, and
         nothing was punched without an object."""
         name = "degraded_store_fail"
-        self.case_name = name
+        if not self.start_case(name):
+            return
         problems, notes = [], []
         self.fresh_device(seed=8, on_full="fail")
         try:
