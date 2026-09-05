@@ -342,6 +342,11 @@ impl BgWorker {
         self.note_landing(stripe_id);
         match &mut self.ingest {
             Ingest::Inline(fetcher) => fetcher.accept_pushed_stripe(stripe_id, &data, permit),
+            // Never with an evictor: SpillSection::validate refuses
+            // ingest_workers > 1. The worker dequeues this push on its own
+            // schedule and may write it after its own pull of the stripe has
+            // landed and this thread has released the stripe to the guest,
+            // unpinned, over a guest write; nothing here sees that window.
             Ingest::Pool(pool) => pool.send(
                 stripe_id,
                 IngestRequest::Pushed {
@@ -988,14 +993,15 @@ mod tests {
 
     /// A Fetch for a stripe that is resident by the time this thread sees it
     /// (the channel asked before the landing) is dropped rather than
-    /// forwarded when spill is on. Forwarded to a pool worker it sits on that
-    /// worker's queue while this thread may evict the stripe; the worker then
-    /// finds a Fetched entry under an Evicted stripe, drops it as stale and
-    /// pulls, a landing noted nowhere here, whose write can follow the
-    /// guest's once a real re-fetch has released the stripe. Observed through
-    /// the readahead a forwarded Fetch queues on a sweeping fetcher: the sweep
-    /// is confined to stripes 4..8, so anything pulled below 4 came from the
-    /// Fetch.
+    /// forwarded when spill is on, and forwarded as before without it. This
+    /// checks that decision and nothing more. A forwarded Fetch for a
+    /// resident stripe is a no-op on the fetcher unless it sweeps, when it
+    /// queues the stripes ahead of the one asked for: with the sweep confined
+    /// to stripes 4..8, anything pulled below 4 came from the Fetch. The
+    /// sweep is not a supported spill configuration and serves only as that
+    /// observable. The pool race the drop guards against (the Fetch sitting
+    /// on a worker's queue while this thread evicts the stripe) is not
+    /// exercised here; [spill] refuses ingest_workers > 1 at config load.
     #[test]
     fn fetch_for_a_resident_stripe_is_dropped_at_the_coordinator() {
         let resident = crate::block_device::metadata_flags::FETCHED
@@ -1532,6 +1538,43 @@ mod tests {
         });
         assert_eq!(plain.shared_state().stripe_fetch_state(0), Fetched);
         assert!(plain.pending_release.is_empty());
+    }
+
+    /// Landings that arrive together share the header write and fsync they
+    /// wait for: the flusher carries every queued request for a metadata
+    /// sector in one write, so a burst of neighbouring demand fetches does
+    /// not pay one fsync each.
+    #[test]
+    fn adjacent_landings_share_one_header_write_and_fsync() {
+        use crate::block_device::metadata_flags;
+
+        let headers: Vec<(usize, u8)> = (0..4).map(|s| (s, metadata_flags::HAS_SOURCE)).collect();
+        let mut rig = build_bg_worker_with_evictor(&headers, 1 << 30);
+        let io = |rig: &EvictorRig| {
+            let metrics = rig.metadata_dev.metrics.read().unwrap();
+            (metrics.writes, metrics.flushes)
+        };
+        let (writes, flushes) = io(&rig);
+
+        for stripe_id in 0..4 {
+            rig.worker.process_request(BgWorkerRequest::FetchCompleted {
+                stripe_id,
+                success: true,
+            });
+        }
+        assert_eq!(rig.worker.pending_release.len(), 4);
+        for _ in 0..6 {
+            rig.worker.update();
+        }
+        for stripe_id in 0..4 {
+            assert_eq!(rig.state.stripe_fetch_state(stripe_id), Fetched);
+        }
+        assert!(rig.worker.pending_release.is_empty());
+        assert_eq!(
+            io(&rig),
+            (writes + 1, flushes + 1),
+            "four landings, one write and one fsync"
+        );
     }
 
     /// When the FETCHED header cannot be made durable the written stripe is

@@ -404,6 +404,11 @@ Every rule below is rejected when the config is loaded:
 - `low_water_bytes < max_local_bytes`; `1 <= max_concurrent_evictions <= 64`.
 - `kek` must resolve to exactly 32 bytes.
 - `tuning.num_queues * tuning.queue_size` must not exceed 65535.
+- `tuning.ingest_workers` must be 1. The pooled ingest has a
+  push-after-own-pull race the spill coordinator cannot close: a worker
+  dequeues a pushed pre-image on its own schedule and can write it after its
+  own pull of the same stripe has landed and the stripe has been released to
+  the guest, unpinned, over whatever the guest wrote meanwhile.
 
 At startup the backend additionally refuses a `data_path` that is not a
 regular file (a block device has nothing to punch), and `init-metadata`

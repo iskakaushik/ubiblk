@@ -106,7 +106,19 @@ waits for its `FETCHED` header the same way. Without that, a guest write to a
 stripe that is resident in memory while its header is still queued would be
 acknowledged, and a crash before the header reached the disk would restart
 the stripe as missing and fetch the base image over the write. The cost is one
-header write and fsync per landed stripe before the guest sees it.
+header write and fsync per landed stripe before the guest sees it, shared
+between landings that queue while a write for the same metadata sector is in
+flight: 508 stripes share a sector, so a burst of neighbouring demand fetches
+pays for one or two rather than one each.
+
+Stripes are taken in on the background worker's own thread only: a `[spill]`
+section is refused with `tuning.ingest_workers > 1`. A pool worker dequeues
+its requests on its own schedule, so a pushed pre-image can be written after
+the worker's own pull of the same stripe has landed and the stripe has been
+released to the guest. That write is unpinned and lands over whatever the
+guest wrote meanwhile, or is uploaded as the fork's data. The coordinator sees
+a push only when it forwards it and cannot close that window, so the
+configuration is refused instead.
 
 ### Crash points
 
