@@ -1539,6 +1539,43 @@ mod tests {
         assert!(plain.pending_release.is_empty());
     }
 
+    /// Landings that arrive together share the header write and fsync they
+    /// wait for: the flusher carries every queued request for a metadata
+    /// sector in one write, so a burst of neighbouring demand fetches does
+    /// not pay one fsync each.
+    #[test]
+    fn adjacent_landings_share_one_header_write_and_fsync() {
+        use crate::block_device::metadata_flags;
+
+        let headers: Vec<(usize, u8)> = (0..4).map(|s| (s, metadata_flags::HAS_SOURCE)).collect();
+        let mut rig = build_bg_worker_with_evictor(&headers, 1 << 30);
+        let io = |rig: &EvictorRig| {
+            let metrics = rig.metadata_dev.metrics.read().unwrap();
+            (metrics.writes, metrics.flushes)
+        };
+        let (writes, flushes) = io(&rig);
+
+        for stripe_id in 0..4 {
+            rig.worker.process_request(BgWorkerRequest::FetchCompleted {
+                stripe_id,
+                success: true,
+            });
+        }
+        assert_eq!(rig.worker.pending_release.len(), 4);
+        for _ in 0..6 {
+            rig.worker.update();
+        }
+        for stripe_id in 0..4 {
+            assert_eq!(rig.state.stripe_fetch_state(stripe_id), Fetched);
+        }
+        assert!(rig.worker.pending_release.is_empty());
+        assert_eq!(
+            io(&rig),
+            (writes + 1, flushes + 1),
+            "four landings, one write and one fsync"
+        );
+    }
+
     /// When the FETCHED header cannot be made durable the written stripe is
     /// still released, the way every stripe was released before, rather than
     /// holding the guest's write for good; the exposure is counted.

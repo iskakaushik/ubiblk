@@ -106,7 +106,10 @@ waits for its `FETCHED` header the same way. Without that, a guest write to a
 stripe that is resident in memory while its header is still queued would be
 acknowledged, and a crash before the header reached the disk would restart
 the stripe as missing and fetch the base image over the write. The cost is one
-header write and fsync per landed stripe before the guest sees it.
+header write and fsync per landed stripe before the guest sees it, shared
+between landings that queue while a write for the same metadata sector is in
+flight: 508 stripes share a sector, so a burst of neighbouring demand fetches
+pays for one or two rather than one each.
 
 Stripes are taken in on the background worker's own thread only: a `[spill]`
 section is refused with `tuning.ingest_workers > 1`. A pool worker dequeues
