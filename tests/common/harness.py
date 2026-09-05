@@ -62,6 +62,7 @@ class Suite:
 
     def __init__(self):
         self.results = []
+        self.skipped = []
         self._n = 0
 
     def ok(self, name):
@@ -72,6 +73,15 @@ class Suite:
         print(f"FAIL - {name} ({detail})")
         self.results.append(False)
 
+    def skip(self, name, reason):
+        """Record a case that could not run here (a missing dependency, say).
+
+        Skips are reported but do not fail the run, so a suite can carry
+        optional cases without every environment having to satisfy them.
+        """
+        print(f"skip - {name} ({reason})")
+        self.skipped.append(name)
+
     def uid(self, tag):
         """Return a short unique id (a per-suite counter plus randomness)."""
         self._n += 1
@@ -80,14 +90,19 @@ class Suite:
     def setup(self):
         pass
 
-    def run(self):
+    def run(self, only=None):
+        """Run the cases, or with ``only`` (a list of substrings) just those
+        whose method name contains one of them."""
         self.setup()
         for case in self.CASES:
+            if only and not any(part in case.__name__ for part in only):
+                continue
             try:
                 case(self)
             except Exception as e:  # a case that raises counts as a failure
                 self.notok(case.__name__, f"raised {type(e).__name__}: {e}")
         passed = sum(self.results)
         failed = len(self.results) - passed
-        print(f"\n# {passed} passed, {failed} failed")
+        skipped = f", {len(self.skipped)} skipped" if self.skipped else ""
+        print(f"\n# {passed} passed, {failed} failed{skipped}")
         return 1 if failed else 0

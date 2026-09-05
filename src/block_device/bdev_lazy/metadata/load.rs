@@ -37,10 +37,124 @@ impl UbiMetadata {
 #[cfg(test)]
 mod tests {
     use crate::block_device::{
-        bdev_lazy::metadata::types::METADATA_VERSION_MINOR, bdev_test::TestBlockDevice,
+        bdev_lazy::metadata::types::{
+            METADATA_VERSION_MAJOR, METADATA_VERSION_MINOR, METADATA_VERSION_MINOR_MIN,
+        },
+        bdev_test::TestBlockDevice,
+        metadata_flags,
     };
 
     use super::*;
+
+    /// A saved metadata file claiming version `major.minor`, with a few
+    /// distinctive header bytes so a loader can be checked for keeping them.
+    fn save_with_version(device: &TestBlockDevice, major: u16, minor: u16) -> Box<UbiMetadata> {
+        let mut metadata = UbiMetadata::new(11, 16, 16);
+        metadata.set_stripe_header(1, metadata_flags::FETCHED | metadata_flags::HAS_SOURCE);
+        metadata.set_stripe_header(
+            2,
+            metadata_flags::WRITTEN | metadata_flags::FETCHED | metadata_flags::HAS_SOURCE,
+        );
+        metadata.version_major = major.to_le_bytes();
+        metadata.version_minor = minor.to_le_bytes();
+        metadata.save_to_bdev(device).expect("save metadata");
+        metadata
+    }
+
+    #[test]
+    fn loads_2_0() {
+        let device = TestBlockDevice::new(1024 * 1024);
+        let saved = save_with_version(&device, 2, 0);
+
+        let loaded = UbiMetadata::load_from_bdev(&device).expect("2.0 must load");
+        assert_eq!(loaded.version_major_u16(), 2);
+        assert_eq!(loaded.version_minor_u16(), 0);
+        assert_eq!(loaded.stripe_headers, saved.stripe_headers);
+    }
+
+    #[test]
+    fn loads_2_1() {
+        let device = TestBlockDevice::new(1024 * 1024);
+        let mut metadata = UbiMetadata::new(11, 16, 16);
+        assert_eq!(metadata.version_minor_u16(), METADATA_VERSION_MINOR);
+        metadata.set_stripe_header(
+            3,
+            metadata_flags::EVICTED | metadata_flags::IN_S3 | metadata_flags::HAS_SOURCE,
+        );
+        metadata.set_stripe_header(4, metadata_flags::PUSHED | metadata_flags::HAS_SOURCE);
+        metadata.save_to_bdev(&device).expect("save metadata");
+
+        let loaded = UbiMetadata::load_from_bdev(&device).expect("2.1 must load");
+        assert_eq!(loaded.version_minor_u16(), 1);
+        assert_eq!(loaded.stripe_headers, metadata.stripe_headers);
+        assert_eq!(loaded.evicted_stripe_ids(), vec![3]);
+    }
+
+    #[test]
+    fn rejects_2_2() {
+        let device = TestBlockDevice::new(1024 * 1024);
+        save_with_version(&device, 2, 2);
+
+        let err = UbiMetadata::load_from_bdev(&device)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Metadata version mismatch"), "{err}");
+        assert!(err.contains("Expected: 2.0..=2.1"), "{err}");
+    }
+
+    #[test]
+    fn rejects_1_x() {
+        let device = TestBlockDevice::new(1024 * 1024);
+        save_with_version(&device, 1, METADATA_VERSION_MINOR_MIN);
+
+        let err = UbiMetadata::load_from_bdev(&device)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Metadata version mismatch"), "{err}");
+    }
+
+    #[test]
+    fn rejects_reserved_bits() {
+        let device = TestBlockDevice::new(1024 * 1024);
+        let mut metadata = UbiMetadata::new(11, 16, 16);
+        metadata.set_stripe_header(5, metadata_flags::HAS_SOURCE | 0b0100_0000);
+        metadata.save_to_bdev(&device).expect("save metadata");
+
+        let err = UbiMetadata::load_from_bdev(&device)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("stripe header 5 has reserved bits set"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn upgrade_version_sector_rewrites_only_sector_0() {
+        let device = TestBlockDevice::new(1024 * 1024);
+        let saved = save_with_version(&device, METADATA_VERSION_MAJOR, 0);
+        let header_sectors_before = device.mem.read().unwrap()[SECTOR_SIZE..].to_vec();
+        let writes_before = device.metrics.read().unwrap().writes;
+        let flushes_before = device.metrics.read().unwrap().flushes;
+
+        assert!(UbiMetadata::upgrade_version_sector(&device).expect("upgrade"));
+
+        let loaded = UbiMetadata::load_from_bdev(&device).expect("load upgraded");
+        assert_eq!(loaded.version_major_u16(), METADATA_VERSION_MAJOR);
+        assert_eq!(loaded.version_minor_u16(), METADATA_VERSION_MINOR);
+        assert_eq!(loaded.stripe_headers, saved.stripe_headers);
+        assert_eq!(
+            device.mem.read().unwrap()[SECTOR_SIZE..].to_vec(),
+            header_sectors_before,
+            "header sectors must not be touched"
+        );
+        assert_eq!(device.metrics.read().unwrap().writes, writes_before + 1);
+        assert_eq!(device.metrics.read().unwrap().flushes, flushes_before + 1);
+
+        // Already current: nothing to do, nothing written.
+        assert!(!UbiMetadata::upgrade_version_sector(&device).expect("upgrade"));
+        assert_eq!(device.metrics.read().unwrap().writes, writes_before + 1);
+    }
 
     #[test]
     fn test_loads_metadata() {

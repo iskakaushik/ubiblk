@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use super::{tuning::TuningSection, Config, DeviceSection, EncryptionSection};
+use super::{spill::SpillSection, tuning::TuningSection, Config, DeviceSection, EncryptionSection};
 use crate::{
     config::v2::{
         includes::resolve_includes,
@@ -41,6 +41,12 @@ impl Config {
             stripe_source.validate(&common.danger_zone, &common.secrets)?;
         }
 
+        let mut spill: Option<SpillSection> = parse_optional_section(&merged, "spill")?;
+        if let Some(spill) = &mut spill {
+            spill.resolve_paths(config_dir);
+            spill.validate(&device, stripe_source.as_ref(), &tuning, &common.secrets)?;
+        }
+
         if let Some(encryption) = &encryption {
             encryption.validate_secrets(&common.secrets)?;
         } else if !(common.danger_zone.enabled && common.danger_zone.allow_unencrypted_disk) {
@@ -55,17 +61,19 @@ impl Config {
             encryption,
             danger_zone: common.danger_zone,
             stripe_source,
+            spill,
             secrets: common.secrets,
         })
     }
 
-    fn allowed_top_level_keys() -> [&'static str; 6] {
+    fn allowed_top_level_keys() -> [&'static str; 7] {
         [
             "device",
             "tuning",
             "encryption",
             "danger_zone",
             "stripe_source",
+            "spill",
             "secrets",
         ]
     }
@@ -345,6 +353,71 @@ mod tests {
         assert!(config.encryption.is_some());
         assert_eq!(config.secrets.len(), 1);
         assert!(config.secrets.contains_key("my_xts_key"));
+    }
+
+    #[test]
+    fn config_without_spill_has_none() {
+        let toml = r#"
+            [device]
+            data_path = "/dev/ubiblk0"
+            [danger_zone]
+            enabled = true
+            allow_unencrypted_disk = true
+        "#;
+        let config = parse_config(toml).expect("Failed to load config");
+        assert!(config.spill.is_none());
+    }
+
+    #[test]
+    fn loads_spill_section_and_resolves_store_path() {
+        let toml = r#"
+            [device]
+            data_path = "device.raw"
+            metadata_path = "device.meta"
+            device_id = "fork-1"
+            track_written = true
+            [stripe_source]
+            type = "remote"
+            address = "10.0.0.1:9400"
+            [spill]
+            max_local_bytes = 1073741824
+            [spill.store]
+            storage = "filesystem"
+            path = "spill"
+            [danger_zone]
+            enabled = true
+            allow_unencrypted_disk = true
+            allow_unencrypted_connection = true
+        "#;
+        let value: toml::Value = toml::from_str(toml).unwrap();
+        let config =
+            Config::load_from_value(value, Path::new("/etc/ubiblk")).expect("Failed to load");
+        let spill = config.spill.expect("spill section");
+        assert_eq!(spill.max_local_bytes, 1073741824);
+        assert_eq!(
+            spill.store_path(),
+            Some(&PathBuf::from("/etc/ubiblk/spill"))
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_spill_section() {
+        let toml = r#"
+            [device]
+            data_path = "/dev/ubiblk0"
+            metadata_path = "/dev/ubiblk0.meta"
+            device_id = "fork-1"
+            [spill]
+            max_local_bytes = 1073741824
+            [spill.store]
+            storage = "filesystem"
+            path = "/mnt/spill"
+            [danger_zone]
+            enabled = true
+            allow_unencrypted_disk = true
+        "#;
+        let err = parse_config(toml).unwrap_err().to_string();
+        assert!(err.contains("spill needs track_written = true"), "{err}");
     }
 
     #[test]

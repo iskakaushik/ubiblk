@@ -107,6 +107,7 @@ fn run() -> Result<()> {
         config.clone(),
         stripe_sector_count,
         metadata.has_fetched_all_stripes(),
+        None,
     )
     .build()?;
 

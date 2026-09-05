@@ -73,6 +73,8 @@ aws-sdk-s3 = { version = "1.120.0", default-features = false, features = ["sigv4
 
 [features]
 default = []
+# Crash hooks for the spill end-to-end tests (UBIBLK_SPILL_CRASH_AT).
+fault-injection = []
 
 [workspace]
 members = [".", "crates/ubiblk-macros"]

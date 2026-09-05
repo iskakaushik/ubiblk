@@ -703,6 +703,7 @@ mod tests {
                 autofetch: false,
                 copy_on_read: false,
             }),
+            spill: None,
             secrets: HashMap::new(),
         };
 
@@ -712,7 +713,7 @@ mod tests {
             false,
         )?);
         let builder =
-            StripeSourceBuilder::new(config.clone(), metadata.stripe_sector_count(), false);
+            StripeSourceBuilder::new(config.clone(), metadata.stripe_sector_count(), false, None);
         let server = StripeServer::new(overlay, metadata, Some(builder));
 
         let (server_stream, client_stream) = UnixStream::pair().unwrap();

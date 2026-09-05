@@ -7,6 +7,8 @@ NOT intended for production use.
 Usage:
   ubiblk-init                  # interactive wizard
   ubiblk-init --size 1G        # non-interactive defaults
+  ubiblk-init --size 256M --base base.img --spill-dir /mnt/b/spill \
+      --spill-max-local 32M --spill-min-free 8M   # local disk as a cache
 """
 
 import argparse
@@ -153,7 +155,12 @@ def parse_size(s):
 
 # --- Config generation ---
 
-def make_config(*, use_kek, tuning, encrypted_xts_b64=None, base_image=None):
+def make_config(*, use_kek, tuning, encrypted_xts_b64=None, base_image=None,
+                spill=None):
+    """spill: None, or a dict with dir, max_local, min_free (bytes or None)
+    and device_id. Spill needs an explicit device_id (it names the objects),
+    track_written (to tell dirty stripes from clean) and copy_on_read (a read
+    of an evicted stripe must come back through the fetch path)."""
     c = f"""\
 # WARNING: This configuration is for DEVELOPMENT use only.
 # All secrets are stored as local plaintext files.
@@ -167,7 +174,12 @@ def make_config(*, use_kek, tuning, encrypted_xts_b64=None, base_image=None):
 data_path = "disk.raw"
 metadata_path = "metadata"
 vhost_socket = "vhost.sock"
-
+"""
+    if spill:
+        c += f"""device_id = "{spill["device_id"]}"
+track_written = true
+"""
+    c += """
 [encryption]
 xts_key.ref = "xts_key"
 """
@@ -215,15 +227,41 @@ write_through = {str(tuning["write_through"]).lower()}
 type = "raw"
 image_path = "{base_image}"
 """
+        if spill:
+            c += "copy_on_read = true\n"
+    if spill:
+        # Small test devices need watermarks well under the 512 MiB defaults.
+        step = max(spill["max_local"] // 8, 1)
+        c += f"""
+[spill]
+max_local_bytes = {spill["max_local"]}
+low_water_bytes = {step}
+hard_margin_bytes = {step}
+"""
+        if spill["min_free"] is not None:
+            c += f'min_free_bytes = {spill["min_free"]}\n'
+        c += f"""
+[spill.store]
+storage = "filesystem"
+path = "{spill["dir"]}"
+"""
     return c
 
 
 # --- Core init ---
 
 def run_init(*, size_str, size_bytes, target_dir,
-             stripe_shift, use_kek, tuning, base_image=None, force=False):
+             stripe_shift, use_kek, tuning, base_image=None, force=False,
+             spill=None):
     target_dir = os.path.abspath(target_dir)
     os.makedirs(target_dir, exist_ok=True)
+
+    if spill:
+        spill = dict(spill)
+        spill["dir"] = os.path.abspath(spill["dir"])
+        if spill.get("device_id") is None:
+            spill["device_id"] = os.path.basename(target_dir) or "ubiblk-dev"
+        os.makedirs(spill["dir"], exist_ok=True)
 
     if not shutil.which("init-metadata"):
         die("init-metadata not found on PATH")
@@ -275,8 +313,11 @@ def run_init(*, size_str, size_bytes, target_dir,
     atomic_write(config_path, make_config(
         use_kek=use_kek,
         tuning=tuning,
-        encrypted_xts_b64=encrypted_xts_b64, base_image=base_image))
+        encrypted_xts_b64=encrypted_xts_b64, base_image=base_image,
+        spill=spill))
     info("config.toml")
+    if spill:
+        info(f"spill store at {spill['dir']} (device_id {spill['device_id']})")
 
     # 4. Metadata
     subprocess.run(["init-metadata", "--config", config_path,
@@ -399,8 +440,34 @@ def main():
     p.add_argument("--write-through", action="store_true",
                     default=DEFAULT_TUNING["write_through"],
                     help="enable write-through mode")
+    p.add_argument("--spill-dir",
+                    help=("emit a [spill] section with a filesystem store at "
+                          "this directory (put it on a different filesystem "
+                          "than disk.raw); requires --spill-max-local"))
+    p.add_argument("--spill-max-local",
+                    help=("spill ceiling on resident stripe bytes, e.g. 32M; "
+                          "low water and hard margin are set to an eighth of it"))
+    p.add_argument("--spill-min-free",
+                    help="spill free-space watermark on disk.raw's filesystem, e.g. 8M")
+    p.add_argument("--device-id",
+                    help=("device_id for the config; with --spill-dir it names "
+                          "the objects (default: the target directory's name)"))
     p.add_argument("--force", action="store_true")
     args = p.parse_args()
+
+    spill = None
+    if args.spill_dir:
+        if not args.spill_max_local:
+            die("--spill-dir requires --spill-max-local")
+        try:
+            _, max_local = parse_size(args.spill_max_local)
+            min_free = parse_size(args.spill_min_free)[1] if args.spill_min_free else None
+        except ValueError as e:
+            die(str(e))
+        spill = {"dir": args.spill_dir, "max_local": max_local,
+                 "min_free": min_free, "device_id": args.device_id}
+    elif args.spill_max_local or args.spill_min_free:
+        die("--spill-max-local and --spill-min-free need --spill-dir")
 
     for field in ("num_queues", "queue_size", "seg_size_max", "seg_count_max", "poll_timeout_us"):
         if getattr(args, field) <= 0:
@@ -429,7 +496,7 @@ def main():
         run_init(size_str=size_str, size_bytes=size_bytes, target_dir=args.dir,
                  stripe_shift=STRIPE_CHOICES[args.stripe_size],
                  use_kek=args.kek, tuning=tuning,
-                 base_image=args.base, force=args.force)
+                 base_image=args.base, force=args.force, spill=spill)
 
 
 if __name__ == "__main__":

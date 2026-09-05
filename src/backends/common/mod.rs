@@ -13,11 +13,13 @@ use ubiblk_macros::error_context;
 
 use crate::{
     block_device::{
-        self, BgWorker, BgWorkerRequest, BlockDevice, SharedMetadataState, StatusReporter,
-        SyncBlockDevice, UbiMetadata, UringBlockDevice,
+        self,
+        spill::{Evictor, FilePuncher, HolePuncher, SpillRuntime},
+        BgWorker, BgWorkerRequest, BlockDevice, SharedMetadataState, SpillReportConfig,
+        StatusReporter, SyncBlockDevice, UbiMetadata, UringBlockDevice,
     },
     config::v2,
-    stripe_source::StripeSourceBuilder,
+    stripe_source::{SpillSourceParts, StripeSourceBuilder},
     utils::aligned_buffer::BUFFER_ALIGNMENT,
     Result, ResultExt,
 };
@@ -25,6 +27,7 @@ use crate::{
 pub mod io_tracking;
 pub mod rpc;
 pub mod snapshot_service;
+mod spill_setup;
 
 use std::sync::Arc;
 
@@ -44,6 +47,9 @@ struct BgWorkerConfig {
     completions: Sender<BgWorkerRequest>,
     workers: usize,
     connections: usize,
+    /// Present when `[spill]` is configured. The evictor built from it arrives
+    /// with the backend wiring; until then the coordinator runs without one.
+    spill: Option<SpillRuntime>,
 }
 
 /// The snapshot layer's shared state plus what is needed to start its worker.
@@ -189,7 +195,9 @@ impl BackendEnv {
         }
 
         if let Some(address) = self.config.device.snapshot_source.clone() {
-            let Some(bgworker_sender) = self.bgworker_sender.clone() else {
+            let (Some(bgworker_sender), Some(snapshot)) =
+                (self.bgworker_sender.clone(), self.snapshot.as_ref())
+            else {
                 return Err(crate::ubiblk_error!(InvalidParameter {
                     description: "snapshot_source needs a device with metadata".to_string(),
                 }));
@@ -198,6 +206,7 @@ impl BackendEnv {
                 &address,
                 self.config.device.snapshot_compression,
                 bgworker_sender,
+                snapshot.live_state.clone(),
             )?;
         }
 
@@ -256,7 +265,49 @@ impl BackendEnv {
     ) -> Result<Self> {
         let metadata = UbiMetadata::load_from_bdev(metadata_device.as_ref())?;
         let shared_state = SharedMetadataState::new(&metadata);
-        let status_reporter = StatusReporter::new(shared_state.clone(), disk_device.sector_count());
+
+        // Everything spill needs that may block (the key GET) or fail loudly
+        // happens here on the main thread, before any device is offered.
+        let spill_runtime = match &config.spill {
+            None => {
+                // An evicted stripe's only copy is in the store (or, evicted
+                // clean, behind a re-pull the composite source routes). Without
+                // the section the plain source would fetch the base image over
+                // the punched hole and the release would clear EVICTED: the
+                // fork's data replaced with the snapshot's, silently.
+                let evicted = metadata.evicted_stripe_ids().len();
+                if evicted > 0 {
+                    return Err(crate::ubiblk_error!(InvalidParameter {
+                        description: format!(
+                            "metadata has {evicted} evicted stripe(s) but the config has no \
+                             [spill] section; restore the section this device was evicting \
+                             under before starting it"
+                        ),
+                    }));
+                }
+                None
+            }
+            Some(section) => {
+                spill_setup::check_spill_preconditions(config)?;
+                let runtime = spill_setup::build_spill_runtime(
+                    config,
+                    section,
+                    shared_state.stripe_sector_count(),
+                    disk_device.sector_count(),
+                    alignment,
+                )?;
+                info!("spill: {}", spill_setup::spill_summary(section));
+                Some(runtime)
+            }
+        };
+        let status_reporter = StatusReporter::new(
+            shared_state.clone(),
+            disk_device.sector_count(),
+            config.spill.as_ref().map(|section| SpillReportConfig {
+                max_local_bytes: section.max_local_bytes,
+                clean_eviction: section.clean_eviction,
+            }),
+        );
 
         let (bgworker_sender, bgworker_receiver) = channel();
 
@@ -289,10 +340,16 @@ impl BackendEnv {
             source: snapshot_source,
         };
 
+        // With spill on, the null-source shortcut would leave a clean
+        // re-pull nowhere to go.
         let stripe_source_builder = Box::new(StripeSourceBuilder::new(
             config.clone(),
             shared_state.stripe_sector_count(),
-            metadata.has_fetched_all_stripes(),
+            metadata.has_fetched_all_stripes() && config.spill.is_none(),
+            spill_runtime.clone().map(|runtime| SpillSourceParts {
+                runtime,
+                state: shared_state.clone(),
+            }),
         ));
 
         let bgworker_config = BgWorkerConfig {
@@ -315,6 +372,7 @@ impl BackendEnv {
                 .stripe_source
                 .as_ref()
                 .map_or(1, |stripe_source| stripe_source.connections()),
+            spill: spill_runtime,
         };
 
         Ok(BackendEnv {
@@ -417,7 +475,16 @@ impl BackendEnv {
             completions,
             workers,
             connections,
+            spill,
         } = config;
+
+        // Built before the coordinator so the startup ack implies the version
+        // rewrite and the punch pass are done.
+        let evictor = spill
+            .map(|runtime| {
+                Self::build_evictor(runtime, &*target_dev, &*metadata_dev, shared_state.clone())
+            })
+            .transpose()?;
 
         if workers > 1 {
             return BgWorker::with_ingest_pool(
@@ -432,6 +499,7 @@ impl BackendEnv {
                 completions,
                 workers,
                 connections,
+                evictor,
             );
         }
 
@@ -452,7 +520,53 @@ impl BackendEnv {
             expects_pushes,
             shared_state,
             receiver,
+            evictor,
         )
+    }
+
+    /// The evictor, on the bgworker thread: the metadata file is labelled 2.1
+    /// first, so a pre-spill binary refuses it once header bytes may carry
+    /// EVICTED, then every stripe already evicted on disk is punched again
+    /// (a crash between the header flush and the punch leaves its blocks
+    /// allocated).
+    #[error_context("Failed to build the evictor")]
+    fn build_evictor(
+        runtime: SpillRuntime,
+        target_dev: &dyn BlockDevice,
+        metadata_dev: &dyn BlockDevice,
+        shared_state: SharedMetadataState,
+    ) -> Result<Evictor> {
+        UbiMetadata::upgrade_version_sector(metadata_dev)?;
+
+        // The factory clamps to the store's connection budget, so this is
+        // min(connections, max_concurrent_evictions) PUT workers.
+        let store = runtime
+            .store_factory
+            .as_ref()
+            .map(|factory| factory(runtime.cfg.max_concurrent_evictions))
+            .transpose()?;
+        let puncher = Self::open_puncher(&runtime)?;
+        let mut evictor = Evictor::new(
+            runtime.cfg.clone(),
+            target_dev.create_channel()?,
+            store,
+            runtime.codec.clone(),
+            puncher,
+            shared_state,
+        )?;
+
+        let metadata = UbiMetadata::load_from_bdev(metadata_dev)?;
+        let punched = evictor.punch_all_evicted(&metadata)?;
+        info!("spill: startup punch pass covered {punched} evicted stripe(s)");
+        Ok(evictor)
+    }
+
+    fn open_puncher(runtime: &SpillRuntime) -> Result<Box<dyn HolePuncher>> {
+        #[cfg(test)]
+        if let Some(factory) = &runtime.puncher_factory {
+            return Ok(factory());
+        }
+        Ok(Box::new(FilePuncher::open(&runtime.cfg.data_path)?))
     }
 }
 
@@ -523,7 +637,7 @@ pub fn init_metadata(config: &v2::Config, stripe_sector_count_shift: u8) -> Resu
         UbiMetadata::new(stripe_sector_count_shift, base_stripe_count, 0)
     } else {
         let stripe_source =
-            StripeSourceBuilder::new(config.clone(), stripe_sector_count, false).build()?;
+            StripeSourceBuilder::new(config.clone(), stripe_sector_count, false, None).build()?;
         UbiMetadata::new_from_stripe_source(
             stripe_sector_count_shift,
             base_stripe_count,
@@ -532,6 +646,11 @@ pub fn init_metadata(config: &v2::Config, stripe_sector_count_shift: u8) -> Resu
     };
 
     ensure_metadata_file(metadata_path, metadata.metadata_size())?;
+    if let Some(section) = &config.spill {
+        // The header write that records an eviction must never meet ENOSPC.
+        spill_setup::preallocate_metadata_file(metadata_path, metadata.metadata_size())?;
+        spill_setup::init_spill_key(config, section)?;
+    }
 
     let metadata_bdev = build_block_device(metadata_path, config, false)
         .context("Failed to build metadata block device")?;
@@ -739,6 +858,7 @@ mod tests {
                 allow_env_secrets: false,
             },
             stripe_source,
+            spill: None,
             secrets: std::collections::HashMap::new(),
         }
     }
@@ -859,6 +979,7 @@ mod tests {
             test_config(Path::new("/tmp/ubiblk-test-disk"), None, None),
             shared_state.stripe_sector_count(),
             loaded_metadata.has_fetched_all_stripes(),
+            None,
         ));
         let (sender, receiver) = channel();
 
@@ -875,6 +996,7 @@ mod tests {
                 completions: sender.clone(),
                 workers: 1,
                 connections: 1,
+                spill: None,
             },
             sender,
         )
@@ -1163,6 +1285,326 @@ mod tests {
         let mut env = BackendEnv::build(&config).unwrap();
         // No bgworker_config, so this is a no-op
         env.run_bgworker_thread().unwrap();
+    }
+
+    /// A clean-only `[spill]` section small enough for a test device.
+    fn test_spill_section(
+        store: Option<v2::stripe_source::ArchiveStorageConfig>,
+    ) -> v2::spill::SpillSection {
+        v2::spill::SpillSection {
+            max_local_bytes: 2 << 20,
+            low_water_bytes: 1 << 20,
+            hard_margin_bytes: 1 << 20,
+            min_free_bytes: 1 << 20,
+            on_full: v2::spill::OnFull::Stall,
+            clean_eviction: store.is_none(),
+            max_concurrent_evictions: 1,
+            compression: crate::archive::ArchiveCompressionAlgorithm::None,
+            kek: None,
+            store,
+        }
+    }
+
+    /// `build_bgworker` over a 2.0 metadata file whose stripes 2 and 3 carry
+    /// EVICTED, with a `RecordingPuncher` injected through the test seam on
+    /// `SpillRuntime`, plus everything the tests read back afterwards.
+    struct EvictedStartup {
+        stripe_size: u64,
+        metadata_handle: Box<dyn BlockDevice>,
+        loaded_metadata: Box<UbiMetadata>,
+        shared_state: SharedMetadataState,
+        punches: Arc<std::sync::Mutex<Vec<(u64, u64)>>>,
+        factory_calls: Arc<AtomicUsize>,
+        worker: BgWorker,
+    }
+
+    fn build_bgworker_with_evicted_stripes_2_and_3() -> EvictedStartup {
+        use crate::archive::ArchiveCompressionAlgorithm;
+        use crate::block_device::{
+            metadata_flags,
+            spill::{EvictorConfig, RecordingPuncher, SpillCodec},
+        };
+        use std::sync::Mutex;
+
+        let stripe_sector_count_shift = 11;
+        let stripe_size = 1u64 << (stripe_sector_count_shift + 9);
+        let target_dev = TestBlockDevice::new(1024 * 1024);
+        let metadata_dev = TestBlockDevice::new(1024 * 1024);
+        let metadata_handle = BlockDevice::clone(&metadata_dev);
+
+        // A 2.0 file whose header sectors gained EVICTED bits: what a crash
+        // between an eviction's header flush and its punch leaves behind.
+        let mut metadata = UbiMetadata::new(stripe_sector_count_shift, 16, 0);
+        metadata.version_minor = 0u16.to_le_bytes();
+        metadata.set_stripe_header(2, metadata_flags::EVICTED);
+        metadata.set_stripe_header(3, metadata_flags::EVICTED | metadata_flags::IN_S3);
+        metadata.save_to_bdev(&metadata_dev).unwrap();
+        let loaded_metadata = UbiMetadata::load_from_bdev(&metadata_dev).unwrap();
+        assert_eq!(loaded_metadata.version_minor_u16(), 0);
+        let shared_state = SharedMetadataState::new(&loaded_metadata);
+
+        let punches = Arc::new(Mutex::new(Vec::new()));
+        let factory_calls = Arc::new(AtomicUsize::new(0));
+        let (recorded, calls) = (punches.clone(), factory_calls.clone());
+        let runtime = SpillRuntime {
+            cfg: EvictorConfig {
+                // Not a regular file: proves the puncher seam is what is used.
+                data_path: "/dev/null".into(),
+                device_id: "fork-1".to_string(),
+                stripe_sector_count: 1 << stripe_sector_count_shift,
+                target_sector_count: 16 << stripe_sector_count_shift,
+                max_local_bytes: 1 << 30,
+                low_water_bytes: 1 << 20,
+                hard_margin_bytes: 1 << 20,
+                min_free_bytes: 1 << 20,
+                clean_eviction: true,
+                on_full: v2::spill::OnFull::Stall,
+                max_concurrent_evictions: 1,
+                sweep_batch: 4096,
+                alignment: 4096,
+            },
+            device_id: "fork-1".to_string(),
+            store_factory: None,
+            codec: SpillCodec::new(
+                ArchiveCompressionAlgorithm::None,
+                None,
+                1 << stripe_sector_count_shift,
+            ),
+            puncher_factory: Some(Arc::new(move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Box::new(RecordingPuncher {
+                    punches: recorded.clone(),
+                    ..Default::default()
+                })
+            })),
+        };
+        let stripe_source_builder = Box::new(StripeSourceBuilder::new(
+            test_config(Path::new("/tmp/ubiblk-test-disk"), None, None),
+            shared_state.stripe_sector_count(),
+            true,
+            None,
+        ));
+        let (sender, receiver) = channel();
+        let config = BgWorkerConfig {
+            expects_pushes: false,
+            target_dev: Arc::new(target_dev),
+            stripe_source_builder,
+            metadata_dev: Box::new(metadata_dev),
+            alignment: 4096,
+            autofetch: false,
+            shared_state: shared_state.clone(),
+            receiver,
+            completions: sender.clone(),
+            workers: 1,
+            connections: 1,
+            spill: Some(runtime),
+        };
+
+        // Queued before the worker exists so `run()` returns at once; the
+        // startup work under test happens inside `build_bgworker` itself.
+        sender.send(BgWorkerRequest::Shutdown).unwrap();
+        let worker = BackendEnv::build_bgworker(config).unwrap();
+
+        EvictedStartup {
+            stripe_size,
+            metadata_handle,
+            loaded_metadata,
+            shared_state,
+            punches,
+            factory_calls,
+            worker,
+        }
+    }
+
+    #[test]
+    fn build_bgworker_upgrades_version_sector_and_opens_puncher_before_returning() {
+        let mut startup = build_bgworker_with_evicted_stripes_2_and_3();
+
+        // Version sector rewritten, header sectors untouched.
+        let upgraded = UbiMetadata::load_from_bdev(&*startup.metadata_handle).unwrap();
+        assert_eq!(upgraded.version_minor_u16(), 1);
+        assert_eq!(
+            upgraded.stripe_headers,
+            startup.loaded_metadata.stripe_headers
+        );
+        assert_eq!(upgraded.evicted_stripe_ids(), vec![2, 3]);
+
+        // The evictor was built with the injected puncher, not FilePuncher
+        // over /dev/null, which would have refused to open.
+        assert_eq!(startup.factory_calls.load(Ordering::SeqCst), 1);
+
+        // Whatever the startup pass punched lies over stripes 2 and 3 only;
+        // a hole anywhere else would free blocks the state says are local.
+        let stripe_size = startup.stripe_size;
+        for (offset, len) in startup.punches.lock().unwrap().iter() {
+            assert_eq!((*offset, *len), (2 * stripe_size, 2 * stripe_size));
+        }
+
+        startup.worker.run();
+    }
+
+    #[test]
+    fn build_bgworker_runs_upgrade_and_punch_pass_before_returning() {
+        let mut startup = build_bgworker_with_evicted_stripes_2_and_3();
+
+        let upgraded = UbiMetadata::load_from_bdev(&*startup.metadata_handle).unwrap();
+        assert_eq!(upgraded.version_minor_u16(), 1);
+        assert_eq!(upgraded.evicted_stripe_ids(), vec![2, 3]);
+
+        // The startup pass ran inside build_bgworker, hence before the ack:
+        // the two consecutive EVICTED stripes became a single punch, and the
+        // counter reports runs, matching the `startup_punches` row in
+        // docs/rpc.md.
+        let stripe_size = startup.stripe_size;
+        assert_eq!(
+            startup
+                .shared_state
+                .spill()
+                .startup_punches
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            startup.punches.lock().unwrap().clone(),
+            vec![(2 * stripe_size, 2 * stripe_size)]
+        );
+
+        startup.worker.run();
+    }
+
+    #[test]
+    fn status_report_includes_spill_when_configured() {
+        let disk_file = tempfile::NamedTempFile::new().unwrap();
+        disk_file.as_file().set_len(4 * 1024 * 1024).unwrap();
+        let metadata_file = tempfile::NamedTempFile::new().unwrap();
+        metadata_file.as_file().set_len(1024 * 1024).unwrap();
+
+        let mut config = test_config(disk_file.path(), Some(metadata_file.path()), None);
+        config.device.device_id = "fork-1".to_string();
+        config.device.track_written = true;
+        config.spill = Some(test_spill_section(None));
+        init_metadata(&config, 11).unwrap();
+
+        let mut env = BackendEnv::build(&config).unwrap();
+        let report = env.status_reporter().unwrap().report();
+        let spill = report.spill().expect("spill is configured");
+        assert_eq!(spill.max_local_bytes, 2 << 20);
+        assert!(spill.clean_eviction);
+        assert_eq!(spill.gate, "open");
+        assert_eq!(spill.evicted, 0);
+
+        // The bgworker builds the evictor against the real data file and the
+        // metadata file on disk, then answers the startup ack.
+        env.run_bgworker_thread().unwrap();
+        env.stop_bgworker_thread();
+    }
+
+    #[test]
+    fn build_backend_env_refuses_spill_on_a_non_regular_data_path() {
+        let metadata_file = tempfile::NamedTempFile::new().unwrap();
+        metadata_file.as_file().set_len(1024 * 1024).unwrap();
+        let disk_file = tempfile::NamedTempFile::new().unwrap();
+        disk_file.as_file().set_len(4 * 1024 * 1024).unwrap();
+
+        let mut config = test_config(disk_file.path(), Some(metadata_file.path()), None);
+        config.device.device_id = "fork-1".to_string();
+        config.device.track_written = true;
+        config.spill = Some(test_spill_section(None));
+        init_metadata(&config, 11).unwrap();
+
+        // Same metadata, but the data path is now a device node.
+        config.device.data_path = PathBuf::from("/dev/null");
+        let err = BackendEnv::build(&config).err().unwrap().to_string();
+        assert!(err.contains("regular file"), "{err}");
+    }
+
+    /// A 2.1 metadata file with EVICTED stripes started without `[spill]`
+    /// would have the plain source pull the base image over the punched
+    /// holes, replacing the fork's spilled data; the build refuses instead.
+    #[test]
+    fn build_backend_env_refuses_evicted_stripes_without_spill() {
+        use crate::block_device::metadata_flags;
+
+        let metadata_file = tempfile::NamedTempFile::new().unwrap();
+        metadata_file.as_file().set_len(1024 * 1024).unwrap();
+        let disk_file = tempfile::NamedTempFile::new().unwrap();
+        disk_file.as_file().set_len(4 * 1024 * 1024).unwrap();
+
+        let mut config = test_config(disk_file.path(), Some(metadata_file.path()), None);
+        config.device.device_id = "fork-1".to_string();
+        config.device.track_written = true;
+        config.spill = Some(test_spill_section(None));
+        init_metadata(&config, 11).unwrap();
+
+        // What a run under [spill] leaves behind: two evicted stripes, one
+        // of them in the store.
+        let metadata_dev = build_block_device(metadata_file.path(), &config, false).unwrap();
+        let mut metadata = UbiMetadata::load_from_bdev(&*metadata_dev).unwrap();
+        metadata.set_stripe_header(1, metadata_flags::EVICTED | metadata_flags::HAS_SOURCE);
+        metadata.set_stripe_header(
+            2,
+            metadata_flags::EVICTED | metadata_flags::IN_S3 | metadata_flags::HAS_SOURCE,
+        );
+        metadata.save_to_bdev(&*metadata_dev).unwrap();
+        drop(metadata_dev);
+
+        config.spill = None;
+        let err = BackendEnv::build(&config).err().unwrap().to_string();
+        assert!(err.contains("2 evicted stripe(s)"), "{err}");
+        assert!(err.contains("[spill]"), "{err}");
+
+        // With the section back the same file starts.
+        config.spill = Some(test_spill_section(None));
+        BackendEnv::build(&config).expect("starts under [spill]");
+    }
+
+    #[test]
+    fn init_metadata_with_spill_writes_the_spill_key() {
+        let _umask_guard = UMASK_LOCK.lock().unwrap();
+        use crate::block_device::spill::codec::{spill_kek, unwrap_spill_key};
+        use crate::config::v2::secrets::{
+            resolve_secrets, SecretDef, SecretEncoding, SecretRef, SecretSource,
+        };
+        use base64::Engine;
+        use std::collections::HashMap;
+
+        let disk_file = tempfile::NamedTempFile::new().unwrap();
+        disk_file.as_file().set_len(4 * 1024 * 1024).unwrap();
+        let metadata_file = tempfile::NamedTempFile::new().unwrap();
+        let store_dir = tempfile::tempdir().unwrap();
+
+        let kek = [3u8; 32];
+        let secret_defs = HashMap::from([(
+            "spill-kek".to_string(),
+            SecretDef {
+                source: SecretSource::Inline(base64::engine::general_purpose::STANDARD.encode(kek)),
+                encrypted_by: None,
+                encoding: SecretEncoding::Base64,
+            },
+        )]);
+        let mut config = test_config(disk_file.path(), Some(metadata_file.path()), None);
+        config.secrets = resolve_secrets(&secret_defs, &config.danger_zone).unwrap();
+        config.device.device_id = "fork-1".to_string();
+        config.device.track_written = true;
+        let mut section =
+            test_spill_section(Some(v2::stripe_source::ArchiveStorageConfig::Filesystem {
+                path: store_dir.path().to_path_buf(),
+                archive_kek: None,
+                autofetch: false,
+            }));
+        section.kek = Some(SecretRef::Ref("spill-kek".to_string()));
+        config.spill = Some(section);
+
+        init_metadata(&config, 11).unwrap();
+
+        let wrapped = std::fs::read(store_dir.path().join("fork-1").join("spill-key")).unwrap();
+        unwrap_spill_key(&spill_kek(&kek), &wrapped).expect("wrapped under spill.kek");
+        let metadata_len = std::fs::metadata(metadata_file.path()).unwrap().len();
+        assert!(metadata_len >= SECTOR_SIZE as u64);
+        UbiMetadata::load_from_bdev(
+            &*build_block_device(metadata_file.path(), &config, true).unwrap(),
+        )
+        .expect("metadata written after the key");
     }
 
     #[test]

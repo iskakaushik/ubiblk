@@ -59,6 +59,9 @@ pub struct IngestPoolConfig {
     pub workers: usize,
     pub connections: usize,
     pub completions: Sender<BgWorkerRequest>,
+    /// Keep the source once everything is fetched: with spill, an evicted
+    /// clean stripe is re-pulled from it.
+    pub never_disconnect: bool,
 }
 
 impl IngestPool {
@@ -96,6 +99,7 @@ impl IngestPool {
                 connections: per_worker_connections,
                 completions: config.completions.clone(),
                 requests: request_rx,
+                never_disconnect: config.never_disconnect,
             };
 
             let handle = std::thread::Builder::new()
@@ -174,6 +178,7 @@ struct IngestWorker {
     connections: usize,
     completions: Sender<BgWorkerRequest>,
     requests: Receiver<IngestRequest>,
+    never_disconnect: bool,
 }
 
 impl IngestWorker {
@@ -194,6 +199,7 @@ impl IngestWorker {
             self.autofetch,
         )?;
         fetcher.set_expects_pushes(self.expects_pushes);
+        fetcher.set_never_disconnect(self.never_disconnect);
         fetcher.restrict_autofetch_to(self.start, self.end);
         Ok((fetcher, source_sector_count))
     }
@@ -258,6 +264,13 @@ impl IngestWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{io::Write, time::Duration};
+
+    use crate::{
+        backends::SECTOR_SIZE,
+        block_device::{bdev_test::TestBlockDevice, metadata_flags, Evicted, UbiMetadata},
+        config::v2::{self, stripe_source::StripeSourceConfig, tuning::IoEngine},
+    };
 
     /// Every stripe belongs to exactly one worker, and the ranges are
     /// contiguous — two workers asking for the same stripe would each fetch it,
@@ -294,5 +307,151 @@ mod tests {
     fn a_stripe_past_the_end_lands_on_the_last_worker() {
         let starts = vec![0, 50, 100];
         assert_eq!(worker_for(&starts, 10_000), 2);
+    }
+
+    const STRIPE_SHIFT: u8 = 3;
+    const STRIPE_SECTORS: u64 = 1 << STRIPE_SHIFT;
+    const STRIPE_BYTES: usize = STRIPE_SECTORS as usize * SECTOR_SIZE;
+    const STRIPES: usize = 4;
+
+    fn image_byte(stripe_id: usize) -> u8 {
+        0xA0 + stripe_id as u8
+    }
+
+    /// A raw image the pool's workers read with O_DIRECT, so it lives under
+    /// `target/` rather than a `/tmp` that may be tmpfs.
+    fn raw_image() -> tempfile::NamedTempFile {
+        let dir = std::env::current_dir().unwrap().join("target");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = tempfile::NamedTempFile::new_in(dir).unwrap();
+        for stripe_id in 0..STRIPES {
+            file.as_file()
+                .write_all(&vec![image_byte(stripe_id); STRIPE_BYTES])
+                .unwrap();
+        }
+        file.as_file().sync_all().unwrap();
+        file
+    }
+
+    fn raw_image_config(image: &tempfile::NamedTempFile) -> v2::Config {
+        v2::Config {
+            device: v2::DeviceSection {
+                snapshot_server: None,
+                snapshot_source: None,
+                snapshot_compression: Default::default(),
+                data_path: "/tmp/non-existent-disk".into(),
+                metadata_path: None,
+                vhost_socket: None,
+                rpc_socket: None,
+                device_id: "ubiblk".to_string(),
+                track_written: false,
+            },
+            tuning: v2::tuning::TuningSection {
+                io_engine: IoEngine::Sync,
+                ..Default::default()
+            },
+            encryption: None,
+            danger_zone: v2::DangerZone {
+                enabled: true,
+                allow_unencrypted_disk: true,
+                allow_inline_plaintext_secrets: true,
+                allow_secret_over_regular_file: true,
+                allow_unencrypted_connection: true,
+                allow_env_secrets: false,
+            },
+            stripe_source: Some(StripeSourceConfig::Raw {
+                image_path: image.path().to_path_buf(),
+                autofetch: true,
+                copy_on_read: true,
+            }),
+            spill: None,
+            secrets: std::collections::HashMap::new(),
+        }
+    }
+
+    fn next_completion(finished: &Receiver<BgWorkerRequest>) -> (usize, bool) {
+        match finished.recv_timeout(Duration::from_secs(10)) {
+            Ok(BgWorkerRequest::FetchCompleted { stripe_id, success }) => (stripe_id, success),
+            Ok(_) => panic!("the pool reported something other than a fetch completion"),
+            Err(e) => panic!("no fetch completion from the pool: {e}"),
+        }
+    }
+
+    /// A worker disconnects from its source once every source stripe is
+    /// fetched, and from then on a re-fetch fails. With spill, an evicted
+    /// stripe is re-fetched from that source, so the pool's flag has to reach
+    /// every worker's fetcher.
+    #[test]
+    fn pool_workers_honour_never_disconnect() {
+        for never_disconnect in [false, true] {
+            let image = raw_image();
+            let target = TestBlockDevice::new((STRIPES * STRIPE_BYTES) as u64);
+            let shared =
+                SharedMetadataState::new(&UbiMetadata::new(STRIPE_SHIFT, STRIPES, STRIPES));
+            for stripe_id in 0..STRIPES {
+                shared.set_stripe_header(
+                    stripe_id,
+                    metadata_flags::FETCHED | metadata_flags::HAS_SOURCE,
+                );
+            }
+            let (completions, finished) = channel();
+            let (mut pool, source_sector_count) = IngestPool::new(IngestPoolConfig {
+                target_dev: Arc::from(BlockDevice::clone(&target)),
+                stripe_source_builder: StripeSourceBuilder::new(
+                    raw_image_config(&image),
+                    STRIPE_SECTORS,
+                    false,
+                    None,
+                ),
+                alignment: 4096,
+                // The worker's sweep queue is filled whether or not it sweeps,
+                // and only a sweep drains it; a fetcher that never drains it is
+                // never idle, so it would never reach the disconnect at all.
+                autofetch: true,
+                expects_pushes: false,
+                shared_state: shared.clone(),
+                workers: 1,
+                connections: 1,
+                completions,
+                never_disconnect,
+            })
+            .unwrap();
+            assert_eq!(source_sector_count, STRIPES as u64 * STRIPE_SECTORS);
+
+            // The raw state pokes leave the counters alone, so as far as the
+            // worker can tell every source stripe stays fetched: that is what
+            // makes it disconnect, and a real eviction here would race the
+            // worker's check by lowering the fetched count first.
+            //
+            // A push for an evicted stripe is written without the source, so
+            // its completion says nothing about the flag; it says the worker
+            // has finished a pass, disconnect check included, before it takes
+            // the next request.
+            shared.set_stripe_fetch_state_for_test(0, Evicted);
+            pool.send(
+                0,
+                IngestRequest::Pushed {
+                    stripe_id: 0,
+                    data: vec![0xEE; STRIPE_BYTES],
+                    permit: PushPermit::unbounded(),
+                },
+            );
+            assert_eq!(next_completion(&finished), (0, true));
+
+            // A re-fetch needs the source: gone unless the flag kept it.
+            shared.set_stripe_fetch_state_for_test(1, Evicted);
+            pool.send(1, IngestRequest::Fetch { stripe_id: 1 });
+            assert_eq!(
+                next_completion(&finished),
+                (1, never_disconnect),
+                "never_disconnect = {never_disconnect}"
+            );
+            if never_disconnect {
+                let mut written = vec![0u8; STRIPE_BYTES];
+                target.read(STRIPE_BYTES, &mut written, STRIPE_BYTES);
+                assert!(written.iter().all(|byte| *byte == image_byte(1)));
+            }
+            pool.shutdown();
+        }
     }
 }

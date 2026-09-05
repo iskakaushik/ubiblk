@@ -50,6 +50,7 @@ pub fn prepare_stripe_server(config: &v2::Config) -> Result<Arc<StripeServer>> {
                 config.clone(),
                 metadata.stripe_sector_count(),
                 all_fetched,
+                None,
             );
             if !config.device.track_written {
                 mark_no_source_stripes_written(&mut metadata);
@@ -111,6 +112,7 @@ mod tests {
                 allow_env_secrets: false,
             },
             stripe_source: None,
+            spill: None,
             secrets: std::collections::HashMap::new(),
         }
     }
